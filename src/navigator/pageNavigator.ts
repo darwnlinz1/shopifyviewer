@@ -10,10 +10,11 @@
  * The Behaviour Engine consumes observations from here and never queries the
  * DOM itself, which keeps the state machine testable and theme-agnostic.
  */
-import type { BrowserContext, Page, Response } from "playwright-core";
+import type { BrowserContext, Locator, Page, Response } from "playwright-core";
 import type { SimulatorConfig } from "../config.js";
 import type { Logger } from "../logging/logger.js";
 import { Rng, sleep } from "../util/random.js";
+import type { Pacing } from "../behavior/timing.js";
 import { buildSelectors, type SelectorSet } from "./selectors.js";
 import type {
   DiscoveredLink,
@@ -45,11 +46,22 @@ export class PageNavigator {
   private consoleErrors = 0;
   private failedRequests = 0;
 
+  /**
+   * Last geometry read by `observe()`. Scroll gestures estimate their position
+   * from this plus how far they have wheeled, instead of running a
+   * `page.evaluate` after every single step.
+   */
+  private geometry = { scrollHeight: 0, viewportHeight: 0, scrollY: 0 };
+
+  /** Where the virtual cursor currently is, in viewport coordinates. */
+  private cursor: { x: number; y: number } | null = null;
+
   constructor(
     private readonly page: Page,
     private readonly config: SimulatorConfig,
     private readonly logger: Logger,
     private readonly rng: Rng,
+    private readonly pacing: Pacing,
   ) {
     this.selectors = buildSelectors(config.selectorOverrides);
     this.attachDiagnostics();
@@ -308,6 +320,8 @@ export class PageNavigator {
       hasMainContent: hasMain,
     };
 
+    this.geometry = geometry;
+
     this.logger.debug("observe", `${pageType} · ${title.slice(0, 60)}`, {
       url,
       data: {
@@ -438,6 +452,15 @@ export class PageNavigator {
   /**
    * Scroll the page in a few uneven steps with varying pauses, the way a
    * person skims rather than a script jumping to the bottom.
+   *
+   * This drives `mouse.wheel`, not `window.scrollBy`. The distinction matters:
+   * `page.evaluate(() => window.scrollBy(...))` moves the viewport without
+   * dispatching a single `wheel` event, so nothing on the page can observe the
+   * input that supposedly caused it — and CloakBrowser's human-input layer,
+   * which patches interaction methods rather than anything reached through
+   * `evaluate`, never sees the gesture at all. Since scrolling is by far the
+   * most frequent action in a session, routing it through the real input path
+   * is the single highest-value correction in this file.
    */
   async scroll(direction?: "down" | "up"): Promise<number> {
     const behavior = this.config.behavior;
@@ -445,42 +468,101 @@ export class PageNavigator {
     // something — drawn from the seeded RNG so sessions stay reproducible.
     const dir = direction ?? (this.rng.chance(0.15) ? "up" : "down");
     const steps = this.rng.range(behavior.scrollSteps);
+
+    // A wheel event goes to whatever sits under the pointer. A cursor that has
+    // never moved is at (0, 0) — over the header, or over nothing — so put it
+    // somewhere in the content first.
+    await this.ensureCursor();
+
+    const viewportHeight =
+      this.geometry.viewportHeight || this.page.viewportSize()?.height || 900;
+    const maxScroll = Math.max(0, this.geometry.scrollHeight - viewportHeight);
+    let position = this.geometry.scrollY;
     let travelled = 0;
 
     for (let i = 0; i < steps; i++) {
       const fraction = this.rng.rangeFloat(behavior.scrollFraction);
-      const delta = await this.page
-        .evaluate(
-          ({ frac, dir }) => {
-            const distance = Math.round(window.innerHeight * frac) * (dir === "up" ? -1 : 1);
-            const before = window.scrollY;
-            window.scrollBy({ top: distance, behavior: "smooth" });
-            return { before, distance };
-          },
-          { frac: fraction, dir },
-        )
-        .catch(() => null);
+      const distance = Math.round(viewportHeight * fraction) * (dir === "up" ? -1 : 1);
 
-      if (!delta) break;
-      travelled += Math.abs(delta.distance);
-      await sleep(this.rng.range(behavior.scrollPause));
+      try {
+        await this.page.mouse.wheel(0, distance);
+      } catch {
+        // A navigation mid-gesture detaches the page; the session loop will
+        // re-observe and carry on.
+        break;
+      }
 
-      // Stop early if we've hit the end of the document.
-      const atEnd = await this.page
-        .evaluate(
-          () =>
-            window.scrollY + window.innerHeight >=
-            (document.documentElement?.scrollHeight ?? 0) - 4,
-        )
-        .catch(() => false);
-      if (atEnd && dir === "down") break;
+      travelled += Math.abs(distance);
+      position = Math.min(maxScroll, Math.max(0, position + distance));
+      await sleep(this.pacing.scrollPause());
+
+      // Estimated rather than re-read: one `evaluate` per scroll step, several
+      // steps per gesture, hundreds of gestures per session is a lot of
+      // instrumentation for a value `observe()` refreshes on the next turn
+      // anyway.
+      if (dir === "down" && maxScroll > 0 && position >= maxScroll - 4) break;
+      if (dir === "up" && position <= 0) break;
     }
+
+    this.geometry.scrollY = position;
 
     this.logger.info("scroll", `${dir} ~${travelled}px in ${steps} steps`, {
       url: this.safeUrl(),
-      data: { direction: dir, steps, travelledPx: travelled },
+      data: { direction: dir, steps, travelledPx: travelled, scrollY: position },
     });
     return travelled;
+  }
+
+  /**
+   * Put the virtual cursor somewhere sensible in the content area if it has
+   * not moved yet, so wheel events and hovers land on the page rather than at
+   * the viewport origin.
+   */
+  private async ensureCursor(): Promise<void> {
+    if (this.cursor) return;
+    const size = this.page.viewportSize() ?? { width: 1440, height: 900 };
+    const target = {
+      x: Math.round(size.width * this.rng.float(0.3, 0.7)),
+      y: Math.round(size.height * this.rng.float(0.35, 0.65)),
+    };
+    await this.page.mouse.move(target.x, target.y).catch(() => undefined);
+    this.cursor = target;
+  }
+
+  /**
+   * Wait, but not perfectly still.
+   *
+   * A real pointer drifts by a few pixels while its owner reads; a frozen
+   * cursor for fifteen minutes is not something a hand does. The drift is
+   * small and infrequent — this is idling, not fidgeting.
+   */
+  private async idle(totalMs: number): Promise<void> {
+    await this.ensureCursor();
+    const cursor = this.cursor;
+    if (!cursor) {
+      await sleep(totalMs);
+      return;
+    }
+
+    const size = this.page.viewportSize() ?? { width: 1440, height: 900 };
+    let remaining = totalMs;
+
+    while (remaining > 0) {
+      // Drift roughly every 0.4–1.4s, so a short dwell may not drift at all.
+      const slice = Math.min(remaining, this.rng.int(400, 1400));
+      await sleep(slice);
+      remaining -= slice;
+
+      if (remaining <= 0 || !this.rng.chance(0.6)) continue;
+
+      const next = {
+        x: clamp(cursor.x + this.rng.int(-9, 9), 2, size.width - 2),
+        y: clamp(cursor.y + this.rng.int(-7, 7), 2, size.height - 2),
+      };
+      await this.page.mouse.move(next.x, next.y).catch(() => undefined);
+      cursor.x = next.x;
+      cursor.y = next.y;
+    }
   }
 
   /**
@@ -488,7 +570,6 @@ export class PageNavigator {
    * a couple of thumbnails, dwelling on each.
    */
   async viewMedia(): Promise<number> {
-    const behavior = this.config.behavior;
     const gallery = await this.firstMatchingLocator(this.selectors.productMedia);
     if (!gallery) {
       this.logger.debug("view_media_skip", "no gallery found", { url: this.safeUrl() });
@@ -496,7 +577,7 @@ export class PageNavigator {
     }
 
     await gallery.first().scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-    await sleep(this.rng.range(behavior.mediaDwell));
+    await this.idle(this.pacing.mediaDwell());
     let viewed = 1;
 
     const thumbs = await this.firstMatchingLocator(this.selectors.productMediaThumb);
@@ -508,7 +589,7 @@ export class PageNavigator {
         const visible = await thumb.isVisible().catch(() => false);
         if (!visible) continue;
         await thumb.click({ timeout: 4_000 }).catch(() => undefined);
-        await sleep(this.rng.range(behavior.mediaDwell));
+        await this.idle(this.pacing.mediaDwell());
         viewed++;
       }
     }
@@ -526,7 +607,6 @@ export class PageNavigator {
    * no accordions.
    */
   async readSection(): Promise<boolean> {
-    const behavior = this.config.behavior;
     const sections = await this.firstMatchingLocator(this.selectors.collapsibleSection);
 
     if (sections) {
@@ -538,10 +618,14 @@ export class PageNavigator {
         const summary = section.locator("summary").first();
         const target = (await summary.count().catch(() => 0)) > 0 ? summary : section;
         await target.click({ timeout: 4_000 }).catch(() => undefined);
-        await sleep(this.rng.range(behavior.sectionDwell));
+        // Time the read against the section that was actually opened, not a
+        // fixed range: a shipping blurb and an ingredient list are not the
+        // same amount of reading.
+        const readMs = await this.readingTimeFor(section);
+        await this.idle(readMs);
         this.logger.info("read_section", `opened section #${index + 1}/${total}`, {
           url: this.safeUrl(),
-          data: { index, total },
+          data: { index, total, readMs },
         });
         return true;
       }
@@ -550,9 +634,14 @@ export class PageNavigator {
     // No accordions — dwell on the description instead.
     const description = await this.firstMatchingLocator(this.selectors.productDescription);
     if (description) {
-      await description.first().scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
-      await sleep(this.rng.range(behavior.sectionDwell));
-      this.logger.info("read_section", "read description block", { url: this.safeUrl() });
+      const block = description.first();
+      await block.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+      const readMs = await this.readingTimeFor(block);
+      await this.idle(readMs);
+      this.logger.info("read_section", "read description block", {
+        url: this.safeUrl(),
+        data: { readMs },
+      });
       return true;
     }
 
@@ -563,14 +652,13 @@ export class PageNavigator {
       const total = await content.count().catch(() => 0);
       if (total > 0) {
         const index = this.rng.int(0, total - 1);
-        await content
-          .nth(index)
-          .scrollIntoViewIfNeeded({ timeout: 5_000 })
-          .catch(() => undefined);
-        await sleep(this.rng.range(behavior.sectionDwell));
+        const block = content.nth(index);
+        await block.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+        const readMs = await this.readingTimeFor(block);
+        await this.idle(readMs);
         this.logger.info("read_section", `viewed content section #${index + 1}/${total}`, {
           url: this.safeUrl(),
-          data: { index, total },
+          data: { index, total, readMs },
         });
         return true;
       }
@@ -610,7 +698,7 @@ export class PageNavigator {
       });
     }
 
-    await sleep(this.rng.range(this.config.behavior.sectionDwell));
+    await this.idle(this.pacing.sectionDwell());
     return { title, price, hasDescription };
   }
 
@@ -633,6 +721,8 @@ export class PageNavigator {
       const visible = await option.isVisible().catch(() => false);
       if (!visible) continue;
       await option.hover({ timeout: 3_000 }).catch(() => undefined);
+      // A hover moves the real cursor, so keep our idea of where it is honest.
+      this.cursor = null;
       await sleep(this.rng.int(400, 1400));
       hovered++;
     }
@@ -646,19 +736,25 @@ export class PageNavigator {
 
   /** An idle pause — a real visitor reading, not a script firing. */
   async dwell(ms?: number): Promise<void> {
-    const duration = ms ?? this.rng.range(this.config.behavior.sectionDwell);
-    this.logger.debug("dwell", `${duration}ms`, { url: this.safeUrl() });
-    await sleep(duration);
+    const duration = ms ?? this.pacing.sectionDwell();
+    this.logger.debug("dwell", `${duration}ms`, {
+      url: this.safeUrl(),
+      data: { tempo: this.pacing.currentTempo },
+    });
+    await this.idle(duration);
   }
 
   /** Pause between two actions. */
   async actionPause(): Promise<void> {
-    await sleep(this.rng.range(this.config.behavior.actionPause));
+    await sleep(this.pacing.actionPause());
   }
 
   /** Settle pause after arriving on a new page. */
   async pageSettlePause(): Promise<void> {
-    await sleep(this.rng.range(this.config.behavior.pageSettle));
+    // The cursor belongs to the page that just unloaded; drop it so the next
+    // gesture re-seats it inside the new document.
+    this.cursor = null;
+    await sleep(this.pacing.pageSettle());
   }
 
   // ---------------------------------------------------------------------
@@ -675,6 +771,16 @@ export class PageNavigator {
     return null;
   }
 
+  /**
+   * How long this block would take to read. Falls back to the configured dwell
+   * range when the text cannot be measured.
+   */
+  private async readingTimeFor(locator: Locator): Promise<number> {
+    const text = await locator.textContent().catch(() => null);
+    if (!text) return this.pacing.sectionDwell();
+    return this.pacing.readingTime(text.replace(/\s+/g, " ").trim().length);
+  }
+
   private async firstText(candidates: string[]): Promise<string | null> {
     for (const selector of candidates) {
       const locator = this.page.locator(selector).first();
@@ -685,6 +791,11 @@ export class PageNavigator {
     }
     return null;
   }
+}
+
+/** Constrain a value to an inclusive range. */
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 /** Round a possibly-null millisecond reading to whole ms. */

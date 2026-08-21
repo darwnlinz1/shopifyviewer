@@ -14,11 +14,11 @@ export type SessionPhase = "early" | "mid" | "late" | "expired";
 
 export class SessionTimer {
   readonly startedAt: number;
-  /** Target end time, including per-session jitter. */
-  readonly deadline: number;
+  /** Target end time, including per-session jitter. Moves when extended. */
+  deadline: number;
   /** Absolute ceiling; a session is aborted if it somehow runs past this. */
-  readonly hardDeadline: number;
-  readonly plannedDurationMs: number;
+  hardDeadline: number;
+  plannedDurationMs: number;
 
   constructor(config: SessionConfig, rng: Rng) {
     this.startedAt = Date.now();
@@ -65,6 +65,23 @@ export class SessionTimer {
    */
   hasRoomFor(estimatedMs: number): boolean {
     return this.remainingMs() > estimatedMs;
+  }
+
+  /**
+   * Give the session more time.
+   *
+   * Both deadlines move together: extending only the soft deadline would let
+   * the hard timeout fire first and kill the very session the operator just
+   * asked to keep going.
+   */
+  extend(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    // A session extended after its deadline has already passed should get the
+    // full extra time from now, not from a deadline in the past.
+    const base = Math.max(Date.now(), this.deadline);
+    this.deadline = base + ms;
+    this.plannedDurationMs = this.deadline - this.startedAt;
+    this.hardDeadline = Math.max(this.hardDeadline, this.deadline + 60_000);
   }
 
   /** Human-readable remaining time, for log lines. */

@@ -11,6 +11,7 @@ import type { Page } from "playwright-core";
 import type { SimulatorConfig } from "../config.js";
 import { Logger } from "../logging/logger.js";
 import { Rng, randomSeed } from "../util/random.js";
+import { Pacing } from "../behavior/timing.js";
 import { launchBrowser } from "../browser/cloak.js";
 import { PageNavigator, openSessionPage } from "./pageNavigator.js";
 import { buildSelectors, type SelectorSet } from "./selectors.js";
@@ -84,7 +85,10 @@ export async function probeStorefront(
   try {
     const page: Page = await openSessionPage(browser.context);
     page.setDefaultTimeout(config.session.navigationTimeoutMs);
-    const navigator = new PageNavigator(page, config, logger, rng);
+    // The probe only loads pages and counts selectors, so its pacing needs no
+    // session arc — a flat progress function is enough.
+    const pacing = new Pacing(rng, config.behavior);
+    const navigator = new PageNavigator(page, config, logger, rng, pacing);
 
     // 1. Homepage.
     const home = await probeOne(page, navigator, selectors, config.storefront);
