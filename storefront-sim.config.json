@@ -1,0 +1,49 @@
+{
+  "storefront": "https://aiju-cosmetique.fr",
+  "seedCollections": ["/collections/all"],
+  "browser": {
+    "headless": true,
+    "profileDir": "./profiles",
+    "persistProfiles": true,
+    "proxies": [],
+    "geoip": false,
+    "humanize": true,
+    "humanPreset": "default",
+    "timezone": "Europe/Paris",
+    "locale": "fr-FR",
+    "viewports": [
+      { "width": 1440, "height": 900 },
+      { "width": 1536, "height": 864 },
+      { "width": 1920, "height": 1080 },
+      { "width": 1366, "height": 768 }
+    ],
+    "allowFallbackBrowser": false
+  },
+  "session": {
+    "durationMs": 900000,
+    "durationJitterMs": 60000,
+    "count": 1,
+    "concurrency": 1,
+    "hardTimeoutMs": 1200000,
+    "navigationTimeoutMs": 45000
+  },
+  "safety": {
+    "allowedHosts": [],
+    "allowCart": false,
+    "blockedPathFragments": [
+      "/checkout",
+      "/cart/checkout",
+      "/account",
+      "/admin",
+      "/orders",
+      "/apps/",
+      "/tools/"
+    ]
+  },
+  "logging": {
+    "dir": "./logs",
+    "level": "info",
+    "jsonl": true,
+    "console": true
+  }
+}
