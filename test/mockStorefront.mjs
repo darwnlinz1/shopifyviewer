@@ -44,6 +44,11 @@ const productCard = (p) => `
   </div>
 </div>`;
 
+/** Shopify themes wrap every content block in a .shopify-section element. */
+function section(id, inner) {
+  return `<section id="shopify-section-${id}" class="shopify-section">${inner}</section>`;
+}
+
 function page(title, pageType, body) {
   return `<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <title>${title}</title>
@@ -59,31 +64,35 @@ ${shopifyGlobals(pageType)}</head>
 
 const routes = {
   home: () =>
-    page("Accueil — Mock Shop", "index", `
-      <h1>Bienvenue</h1>
-      <div class="collection-list">
-        ${COLLECTIONS.map((c) => `<a class="card-wrapper" href="/collections/${c.handle}">${c.title}</a>`).join("")}
-      </div>
-      <h2>Produits vedettes</h2>
-      <div id="product-grid" class="grid product-grid">
-        ${PRODUCTS.slice(0, 4).map(productCard).join("")}
-      </div>`),
+    page("Accueil — Mock Shop", "index",
+      section("hero", "<h1>Bienvenue</h1>") +
+      section("collection-list", `
+        <div class="collection-list">
+          ${COLLECTIONS.map((c) => `<a class="card-wrapper" href="/collections/${c.handle}">${c.title}</a>`).join("")}
+        </div>`) +
+      section("featured-products", `
+        <h2>Produits vedettes</h2>
+        <div id="product-grid" class="grid product-grid">
+          ${PRODUCTS.slice(0, 4).map(productCard).join("")}
+        </div>`)),
 
   collection: (handle) => {
     const collection = COLLECTIONS.find((c) => c.handle === handle);
     if (!collection) return null;
     const items = handle === "all" ? PRODUCTS : PRODUCTS.filter((p) => p.collection === handle);
-    return page(`${collection.title} — Mock Shop`, "collection", `
-      <h1 class="collection-hero__title">${collection.title}</h1>
-      <div id="product-grid" class="grid product-grid">${items.map(productCard).join("")}</div>
-      <nav class="pagination"><a href="/collections/${handle}?page=2" rel="next">Suivant</a></nav>`);
+    return page(`${collection.title} — Mock Shop`, "collection",
+      section("collection-banner", `<h1 class="collection-hero__title">${collection.title}</h1>`) +
+      section("collection-product-grid", `
+        <div id="product-grid" class="grid product-grid">${items.map(productCard).join("")}</div>
+        <nav class="pagination"><a href="/collections/${handle}?page=2" rel="next">Suivant</a></nav>`));
   },
 
   product: (handle) => {
     const product = PRODUCTS.find((p) => p.handle === handle);
     if (!product) return null;
     const related = PRODUCTS.filter((p) => p.handle !== handle).slice(0, 4);
-    return page(`${product.title} — Mock Shop`, "product", `
+    return page(`${product.title} — Mock Shop`, "product",
+      section("main-product", `
       <div class="product">
         <media-gallery class="product__media-wrapper">
           ${[1, 2, 3].map((n) => `<div class="product__media-item" data-media-id="${n}">Image ${n}</div>`).join("")}
@@ -108,8 +117,10 @@ const routes = {
           </form>
         </div>
       </div>
-      <h2>Vous aimerez aussi</h2>
-      <div class="grid product-grid">${related.map(productCard).join("")}</div>`);
+      `) +
+      section("related-products", `
+        <h2>Vous aimerez aussi</h2>
+        <div class="grid product-grid">${related.map(productCard).join("")}</div>`));
   },
 };
 
