@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storefront Simulator — Profiles</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="bar__title">
+    <h1>Storefront Simulator</h1>
+    <span class="bar__storefront" id="storefront"></span>
+  </div>
+  <div class="bar__stats" id="fleet-stats"></div>
+  <div class="bar__actions">
+    <label class="density">
+      Tile size
+      <input type="range" id="density" min="160" max="420" step="20" value="260">
+    </label>
+    <button class="btn btn--primary" id="new-profile">New profile</button>
+    <span class="conn" id="conn" title="Live connection">●</span>
+  </div>
+</header>
+
+<main>
+  <!-- Tiles are created once and updated in place. They are never re-created
+       on a state push, and they are never sorted on anything mutable, so a
+       tile keeps its position in the grid for its whole life. -->
+  <div class="grid" id="grid"></div>
+  <p class="empty" id="empty">No profiles yet. Create one to open its browser.</p>
+</main>
+
+<!-- Enlarged live view. The grid keeps streaming behind it. -->
+<div class="overlay" id="overlay" hidden>
+  <div class="overlay__panel">
+    <div class="overlay__head">
+      <strong id="overlay-name"></strong>
+      <span class="muted" id="overlay-url"></span>
+      <button class="btn btn--ghost" id="overlay-close">Close</button>
+    </div>
+    <img class="overlay__view" id="overlay-view" alt="">
+  </div>
+</div>
+
+<!-- Per-profile settings: proxy and cookies. -->
+<div class="overlay" id="settings" hidden>
+  <div class="overlay__panel overlay__panel--narrow">
+    <div class="overlay__head">
+      <strong id="settings-name"></strong>
+      <button class="btn btn--ghost" id="settings-close">Close</button>
+    </div>
+
+    <div class="form">
+      <label class="field">
+        <span>Name</span>
+        <input type="text" id="f-name" autocomplete="off">
+      </label>
+
+      <label class="field">
+        <span>Session length (minutes)</span>
+        <input type="number" id="f-duration" min="1" step="1" placeholder="use global default">
+      </label>
+
+      <label class="field">
+        <span>Proxy</span>
+        <input type="text" id="f-proxy" autocomplete="off"
+               placeholder="http://user:pass@host:8080  ·  or  host:port:user:pass">
+      </label>
+      <div class="row">
+        <button class="btn btn--primary" id="save-proxy">Save</button>
+        <button class="btn" id="test-proxy">Test connection</button>
+        <span class="hint" id="proxy-status"></span>
+      </div>
+
+      <div class="field">
+        <span>Cookies</span>
+        <div class="row">
+          <!-- A real file picker: the operator browses to the export they
+               already have rather than pasting JSON. -->
+          <input type="file" id="f-cookies" accept=".json,.txt,text/plain,application/json">
+          <button class="btn" id="clear-cookies">Clear</button>
+        </div>
+        <span class="hint" id="cookie-status"></span>
+      </div>
+
+      <p class="hint hint--block" id="settings-identity"></p>
+    </div>
+  </div>
+</div>
+
+<template id="tile-template">
+  <article class="tile" data-status="idle">
+    <header class="tile__head">
+      <span class="dot"></span>
+      <span class="tile__name"></span>
+      <span class="tile__time"></span>
+    </header>
+
+    <div class="tile__screen">
+      <!-- Always streaming, click-free. Small and coarse by design: enough to
+           see the page move, cheap enough to run a wall of them. -->
+      <img class="tile__view" alt="" loading="lazy">
+      <div class="tile__placeholder">no browser open</div>
+    </div>
+
+    <div class="tile__meta">
+      <span class="tile__url"></span>
+      <span class="tile__action"></span>
+    </div>
+
+    <div class="tile__stats">
+      <span title="Pages visited"><b class="s-pages">0</b> pages</span>
+      <span title="Products viewed"><b class="s-products">0</b> prod</span>
+      <span title="Uncaught JS errors" class="s-errors-wrap"><b class="s-errors">0</b> err</span>
+      <span class="tile__badges"></span>
+    </div>
+
+    <footer class="tile__actions">
+      <button class="btn btn--sm btn--primary" data-act="continue">Continue</button>
+      <button class="btn btn--sm" data-act="pause">Pause</button>
+      <button class="btn btn--sm" data-act="close">Close</button>
+      <button class="btn btn--sm" data-act="settings" title="Proxy and cookies">⚙</button>
+      <button class="btn btn--sm btn--danger" data-act="delete" title="Delete profile">✕</button>
+    </footer>
+  </article>
+</template>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

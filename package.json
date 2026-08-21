@@ -4,13 +4,18 @@
   "private": true,
   "description": "Shopify storefront behavior simulator built on CloakBrowser + Playwright",
   "type": "module",
-  "engines": { "node": ">=20" },
-  "bin": { "storefront-sim": "./dist/cli.js" },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "storefront-sim": "./dist/cli.js"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node --enable-source-maps dist/cli.js",
-    "dev": "tsx src/cli.ts"
+    "dev": "tsx src/cli.ts",
+    "test": "node --test test/"
   },
   "dependencies": {
     "cloakbrowser": "^0.5.8",

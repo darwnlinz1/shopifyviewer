@@ -61,6 +61,18 @@ export interface SessionConfig {
   hardTimeoutMs: number;
   /** Per-navigation timeout. */
   navigationTimeoutMs: number;
+  /**
+   * How long to hold the browser open after the budget is spent.
+   *
+   *   0   close immediately — the right default for scripted runs
+   *  -1   hold until the operator closes it
+   *  >0   hold for this many ms
+   *
+   * The dashboard overrides this to -1: its whole purpose is to be watched,
+   * and closing a browser the instant its timer fires throws away the final
+   * state the operator most wants to see.
+   */
+  lingerMs: number;
 }
 
 export interface BehaviorConfig {
@@ -158,6 +170,7 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     concurrency: 1,
     hardTimeoutMs: 20 * 60 * 1000,
     navigationTimeoutMs: 45_000,
+    lingerMs: 0,
   },
   behavior: {
     actionPause: { min: 800, max: 3500 },

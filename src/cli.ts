@@ -12,6 +12,9 @@ import { loadConfig, DEFAULT_CONFIG, type SimulatorConfig } from "./config.js";
 import { runAll } from "./session/runner.js";
 import { probeStorefront, formatProbeReport } from "./navigator/probe.js";
 import { cloakBinaryStatus } from "./browser/cloak.js";
+import { verifyBrowser, formatFingerprintReport } from "./browser/verify.js";
+import { Orchestrator } from "./server/orchestrator.js";
+import { startDashboard } from "./server/http.js";
 
 const USAGE = `
 Shopify Storefront Behaviour Simulator — CloakBrowser + Playwright
@@ -20,8 +23,10 @@ Usage
   storefront-sim <command> [options]
 
 Commands
+  dashboard Manage many browser profiles from a live web UI
   run       Run simulated browsing sessions against a storefront
   probe     Load home/collection/product and report which selectors match
+  verify    Report what the browser exposes to a page, and any inconsistencies
   info      Show CloakBrowser binary status
   init      Write a starter storefront-sim.config.json
 
@@ -40,13 +45,19 @@ Options
   --headless             Force headless (default)
   --fresh-profiles       Do not reuse profiles between runs
   --allow-fallback       Allow stock Chromium if CloakBrowser is unavailable
+  --linger <minutes>     Hold the browser open after the budget is spent
+                         (0 = close immediately, -1 = until closed)
+  --port <n>             Dashboard port                 (default 7317)
+  --host <addr>          Dashboard bind address         (default 127.0.0.1)
   --quiet                Suppress console logging
   -h, --help             Show this help
 
 Examples
+  storefront-sim dashboard --headed
   storefront-sim probe --storefront https://your-shop.com
   storefront-sim run --storefront https://your-shop.com --sessions 3 --concurrency 3
   storefront-sim run --duration 15 --seed 42 --headed
+  storefront-sim verify --headed
 `;
 
 interface ParsedArgs {
@@ -138,6 +149,9 @@ function overridesFrom(flags: Map<string, string[]>): Partial<SimulatorConfig> {
   const logLevel = one(flags, "log-level");
   if (logLevel) logging.level = logLevel;
 
+  const linger = num(flags, "linger");
+  if (linger !== undefined) session.lingerMs = Math.round(linger * 60_000);
+
   if (has(flags, "quiet")) logging.console = false;
 
   if (Object.keys(browser).length) patch.browser = browser;
@@ -182,6 +196,52 @@ async function main(): Promise<number> {
   }
 
   const config = loadConfig(one(flags, "config"), overridesFrom(flags));
+
+  if (command === "dashboard") {
+    const port = num(flags, "port") ?? 7317;
+    const host = one(flags, "host") ?? "127.0.0.1";
+
+    const orchestrator = new Orchestrator(config);
+    const dashboard = await startDashboard(orchestrator, port, host);
+
+    process.stdout.write(
+      [
+        "",
+        `Dashboard  ${dashboard.url}`,
+        `Storefront ${config.storefront}`,
+        `Profiles   ${config.browser.profileDir}`,
+        `Browsers   ${config.browser.headless ? "headless (live view still streams)" : "headed"}`,
+        "",
+        "Every tile streams its browser live. Ctrl-C to stop.",
+        "",
+      ].join("\n"),
+    );
+
+    // Sessions own real browser processes and a profile directory each, so a
+    // clean shutdown matters more here than in a one-shot run.
+    await new Promise<void>((resolve) => {
+      let closing = false;
+      const shutdown = (): void => {
+        if (closing) process.exit(130);
+        closing = true;
+        process.stderr.write("\nClosing browsers…\n");
+        void (async () => {
+          await orchestrator.shutdown().catch(() => undefined);
+          await dashboard.close().catch(() => undefined);
+          resolve();
+        })();
+      };
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
+    });
+    return 0;
+  }
+
+  if (command === "verify") {
+    const report = await verifyBrowser(config);
+    process.stdout.write(`${formatFingerprintReport(report)}\n`);
+    return report.inconsistencies.length > 0 ? 1 : 0;
+  }
 
   if (command === "probe") {
     const report = await probeStorefront(config);

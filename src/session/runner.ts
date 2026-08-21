@@ -66,6 +66,7 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
           sessionId: job.sessionId,
           seed: job.seed,
           config,
+          lingerMs: config.session.lingerMs,
           ...(signal ? { signal } : {}),
         });
         results.push(result);
