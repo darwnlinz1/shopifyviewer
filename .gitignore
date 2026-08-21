@@ -1,7 +1,9 @@
 node_modules/
-dist/
-logs/
-profiles/
+/dist/
+/logs/
+# Chromium user-data directories and the profile registry live here at the
+# repo root. Anchored so it cannot also swallow src/profiles/.
+/profiles/
 *.log
 .DS_Store
 .env
