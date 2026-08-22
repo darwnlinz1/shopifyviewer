@@ -45,6 +45,8 @@ Options
   --headless             Force headless (default)
   --fresh-profiles       Do not reuse profiles between runs
   --allow-fallback       Allow stock Chromium if CloakBrowser is unavailable
+  --pace <factor>        Speed multiplier for every delay
+                         (1 = default, 2 = twice as brisk, 0.5 = half speed)
   --linger <minutes>     Hold the browser open after the budget is spent
                          (0 = close immediately, -1 = until closed)
   --port <n>             Dashboard port                 (default 7317)
@@ -112,6 +114,7 @@ function overridesFrom(flags: Map<string, string[]>): Partial<SimulatorConfig> {
   const browser: Record<string, unknown> = {};
   const session: Record<string, unknown> = {};
   const logging: Record<string, unknown> = {};
+  const behavior: Record<string, unknown> = {};
 
   const storefront = one(flags, "storefront");
   if (storefront) patch.storefront = storefront;
@@ -149,11 +152,18 @@ function overridesFrom(flags: Map<string, string[]>): Partial<SimulatorConfig> {
   const logLevel = one(flags, "log-level");
   if (logLevel) logging.level = logLevel;
 
+  const pace = num(flags, "pace");
+  if (pace !== undefined) {
+    if (!(pace > 0)) throw new Error("--pace expects a number greater than zero");
+    behavior.speedFactor = pace;
+  }
+
   const linger = num(flags, "linger");
   if (linger !== undefined) session.lingerMs = Math.round(linger * 60_000);
 
   if (has(flags, "quiet")) logging.console = false;
 
+  if (Object.keys(behavior).length) patch.behavior = behavior;
   if (Object.keys(browser).length) patch.browser = browser;
   if (Object.keys(session).length) patch.session = session;
   if (Object.keys(logging).length) patch.logging = logging;

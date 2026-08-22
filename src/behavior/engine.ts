@@ -246,13 +246,27 @@ export class BehaviorEngine {
 
     const canScroll = observation.scrollHeight > observation.viewportHeight * 1.2;
     const scrollsDone = this.countOnThisPage("scroll");
+
+    // Already at the foot of the page. Scrolling again is either a no-op or a
+    // trip back up, and a visitor who has reached the bottom of a listing
+    // reads something or moves on — they do not keep dragging at the end stop.
+    const atBottom =
+      observation.scrollHeight > 0 &&
+      observation.scrollY + observation.viewportHeight >= observation.scrollHeight - 8;
+
     const candidates: Array<{ value: ActionKind; weight: number }> = [];
 
     // Scrolling is the universal browsing gesture; it also triggers the lazy
     // loading most Shopify collection templates rely on.
     candidates.push({
       value: "scroll",
-      weight: canScroll ? Math.max(0, 5 - scrollsDone * 1.5) : 0,
+      weight: !canScroll
+        ? 0
+        : atBottom
+          // One trip back up is normal; after that stop offering it, so the
+          // remaining actions go to the page's content instead.
+          ? (scrollsDone < 1 ? 1.5 : 0)
+          : Math.max(0, 5 - scrollsDone * 1.5),
     });
 
     // Idle reading pause.
@@ -297,7 +311,9 @@ export class BehaviorEngine {
     // Past the minimum, the pressure to move on grows with every extra action,
     // reaching certainty at the page type's ceiling.
     if (actionsHere >= minActions) {
-      const pressure = (actionsHere - minActions + 1) / (maxActions - minActions + 1);
+      let pressure = (actionsHere - minActions + 1) / (maxActions - minActions + 1);
+      // Nothing left below the fold is itself a reason to move on.
+      if (atBottom) pressure = Math.min(1, pressure + 0.25);
       if (this.rng.chance(pressure)) return null;
     }
 

@@ -89,14 +89,32 @@ export class Pacing {
     return this.tempo * fatigue;
   }
 
-  /** A paced delay drawn from `range`, in ms. */
-  private draw(range: Range, sigma?: number): number {
-    return Math.round(heavyTailed(this.rng, range, sigma) * this.nextTempo());
+  /** How much to divide every delay by. Guarded so a bad config cannot stall. */
+  private get speed(): number {
+    const factor = this.behavior.speedFactor;
+    return Number.isFinite(factor) && factor > 0 ? factor : 1;
   }
 
-  /** Pause between two consecutive actions. */
+  /**
+   * A paced delay drawn from `range`, in ms.
+   *
+   * `clamp` keeps the result inside the configured range after tempo and
+   * fatigue have been applied. Most delays should not be clamped — the long
+   * tail is the point. The gap between actions is the exception: it is the
+   * rhythm the operator sets and watches, so "2 to 3 seconds" has to mean
+   * that, with the randomness living inside the band rather than escaping it.
+   */
+  private draw(range: Range, sigma?: number, clamp = false): number {
+    const paced = (heavyTailed(this.rng, range, sigma) * this.nextTempo()) / this.speed;
+    const value = clamp
+      ? Math.min(range.max / this.speed, Math.max(range.min / this.speed, paced))
+      : paced;
+    return Math.round(value);
+  }
+
+  /** Pause between two consecutive actions. Held inside its configured band. */
   actionPause(): number {
-    return this.draw(this.behavior.actionPause);
+    return this.draw(this.behavior.actionPause, 0.5, true);
   }
 
   /** Settle time after arriving on a new page, before acting. */
@@ -138,7 +156,7 @@ export class Pacing {
     const skim = 0.25 + this.rng.next() * 0.35;
     const base = (characters / CHARS_PER_MINUTE) * 60_000 * skim;
     const { min, max } = this.behavior.sectionDwell;
-    return Math.round(Math.min(max, Math.max(min, base)) * this.nextTempo());
+    return Math.round((Math.min(max, Math.max(min, base)) * this.nextTempo()) / this.speed);
   }
 
   /** Current tempo, for logging. */

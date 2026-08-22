@@ -772,7 +772,9 @@ export class PageNavigator {
     const thumbs = await this.firstMatchingLocator(this.selectors.productMediaThumb);
     if (thumbs) {
       const total = await thumbs.count().catch(() => 0);
-      const toView = Math.min(total, this.rng.int(1, 4));
+      // Each thumbnail costs a full dwell, so four of them turned one
+      // "look at the gallery" action into eight seconds.
+      const toView = Math.min(total, this.rng.int(1, 2));
       for (let i = 0; i < toView; i++) {
         const thumb = thumbs.nth(i);
         const visible = await thumb.isVisible().catch(() => false);

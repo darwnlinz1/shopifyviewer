@@ -109,6 +109,14 @@ export interface BehaviorConfig {
   idleProbability: number;
   /** Max consecutive actions on one page before the engine forces a move. */
   maxActionsPerPage: number;
+  /**
+   * Global pace multiplier applied to every delay.
+   *
+   * The ranges above describe an unhurried visitor. Raising this divides them
+   * all at once — 2 is about twice as brisk — which is easier to reason about
+   * than editing six ranges and hoping they stay in proportion.
+   */
+  speedFactor: number;
 }
 
 export interface SafetyConfig {
@@ -182,18 +190,24 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     lingerMs: 0,
   },
   behavior: {
-    actionPause: { min: 800, max: 3500 },
-    pageSettle: { min: 1200, max: 4000 },
-    scrollPause: { min: 400, max: 2200 },
+    // The gap between one action and the next. Unlike the other ranges this
+    // one is honoured as a hard band (see Pacing.actionPause), because it is
+    // the rhythm an operator actually watches and wants to set.
+    actionPause: { min: 2000, max: 3000 },
+    pageSettle: { min: 700, max: 2200 },
+    scrollPause: { min: 200, max: 900 },
     scrollFraction: { min: 0.25, max: 0.9 },
-    scrollSteps: { min: 2, max: 6 },
-    mediaDwell: { min: 900, max: 3200 },
-    sectionDwell: { min: 1500, max: 5000 },
+    // One to three gestures per scroll action. Six turned a single "scroll"
+    // into five seconds, which read as the browser stuck on one page.
+    scrollSteps: { min: 1, max: 3 },
+    mediaDwell: { min: 500, max: 1600 },
+    sectionDwell: { min: 800, max: 2400 },
     targetProducts: { min: 4, max: 9 },
     backProbability: 0.28,
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,
-    maxActionsPerPage: 9,
+    maxActionsPerPage: 7,
+    speedFactor: 1,
   },
   safety: {
     allowedHosts: [],

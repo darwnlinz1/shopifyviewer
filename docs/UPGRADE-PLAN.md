@@ -261,3 +261,51 @@ edge hides exactly what you were watching for.
   fetch the 1 GB patched Chromium, so all browser tests run stock Chromium
   through the fallback path.
 - Operational/reporting upgrade ideas: not written yet.
+
+---
+
+## Round 3 — pacing and page exhaustion
+
+### It scrolled to the bottom and stayed there
+
+Two causes, both fixed.
+
+The engine had no idea the page had ended. `chooseOnPageAction` weighted
+`scroll` purely on how many scrolls had happened, so at the foot of a listing
+it kept picking a gesture that could only be a no-op or a trip back up. The
+engine now derives `atBottom` from the observation, offers at most one more
+scroll once there, and raises the pressure to move on — a visitor who has
+reached the end of a listing reads something or leaves.
+
+Separately, one `scroll` action was up to six gestures (`scrollSteps` 2–6),
+each with its own pause. That made a single action take five seconds and read
+as the browser being stuck. Now one to three.
+
+### Everything was too slow
+
+Measured, per action, over a real session:
+
+| | before | after |
+| --- | --- | --- |
+| view_media | 8.4s | ~2.5s of work |
+| dwell | 5.8s | — |
+| scroll | 5.5s | ~0.8s of work |
+| inspect_details | 3.7s | ~1s of work |
+| **gap between actions** | 0.8–3.5s, unbounded by tempo | **2.0–3.0s, hard band** |
+
+`view_media` was the worst offender: it opened up to four thumbnails, each
+with a full dwell. Now one or two.
+
+The gap between actions is now treated differently from every other delay. The
+dwells keep their long tail — that is what makes them look human. The gap is
+the rhythm an operator actually watches and sets, so it is clamped to its
+configured range *after* tempo and fatigue apply: randomness lives inside the
+band instead of escaping it. Measured over 3000 draws at the default:
+min 2000ms, median 2577ms, max 3000ms.
+
+`behavior.speedFactor` (`--pace`) divides every delay at once — `--pace 2` is
+about twice as brisk, `--pace 0.5` half speed — so the whole rhythm can be
+retuned without editing six ranges and hoping they stay in proportion. A zero
+or negative factor is ignored rather than stalling the session.
+
+**62 tests, all passing.**

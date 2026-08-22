@@ -11,7 +11,7 @@ import { Pacing, heavyTailed } from "../dist/behavior/timing.js";
 import { Rng } from "../dist/util/random.js";
 
 const BEHAVIOR = {
-  actionPause: { min: 800, max: 3500 },
+  actionPause: { min: 2000, max: 3000 },
   pageSettle: { min: 1200, max: 4000 },
   scrollPause: { min: 400, max: 2200 },
   scrollFraction: { min: 0.25, max: 0.9 },
@@ -23,6 +23,7 @@ const BEHAVIOR = {
   returnToCollectionProbability: 0.35,
   idleProbability: 0.18,
   maxActionsPerPage: 9,
+  speedFactor: 1,
 };
 
 function sample(count, fn) {
@@ -135,5 +136,45 @@ test("falls back to the dwell range for unmeasurable text", () => {
   for (const characters of [0, -5, Number.NaN]) {
     const value = pacing.readingTime(characters);
     assert.ok(value >= BEHAVIOR.sectionDwell.min * 0.6, `${value} too small`);
+  }
+});
+
+test("the gap between actions stays inside its configured band", () => {
+  // Unlike the dwells, this one is a hard band: it is the rhythm the operator
+  // sets and watches, so "2 to 3 seconds" has to mean that. Tempo and fatigue
+  // still vary it — inside the band, not out of it.
+  const pacing = new Pacing(new Rng(7), BEHAVIOR, () => 0.5);
+  const values = sample(3000, () => pacing.actionPause());
+
+  for (const value of values) {
+    assert.ok(
+      value >= BEHAVIOR.actionPause.min && value <= BEHAVIOR.actionPause.max,
+      `${value} escaped the ${BEHAVIOR.actionPause.min}-${BEHAVIOR.actionPause.max}ms band`,
+    );
+  }
+
+  // Still varied inside it, rather than pinned to one end.
+  const distinct = new Set(values).size;
+  assert.ok(distinct > 500, `only ${distinct} distinct gaps — not random enough`);
+});
+
+test("speedFactor scales every delay", () => {
+  const brisk = new Pacing(new Rng(7), { ...BEHAVIOR, speedFactor: 2 }, () => 0.5);
+  const values = sample(500, () => brisk.actionPause());
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+
+  // Twice as brisk: the same band, halved.
+  assert.ok(mean > 900 && mean < 1600, `expected ~1250ms at pace 2, got ${Math.round(mean)}`);
+  for (const value of values) {
+    assert.ok(value <= BEHAVIOR.actionPause.max / 2 + 1, `${value} above the halved ceiling`);
+  }
+});
+
+test("a nonsensical speedFactor cannot stall the session", () => {
+  // A zero or negative factor would divide the delay to infinity.
+  for (const factor of [0, -3, Number.NaN]) {
+    const pacing = new Pacing(new Rng(1), { ...BEHAVIOR, speedFactor: factor }, () => 0);
+    const value = pacing.actionPause();
+    assert.ok(Number.isFinite(value) && value > 0 && value <= BEHAVIOR.actionPause.max, `${factor} → ${value}`);
   }
 });
