@@ -171,8 +171,47 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     return this.sessions.has(profileId);
   }
 
+  /**
+   * Open a profile in a real window on the desktop, or send it back to the
+   * background — same profile directory, same cookies, same proxy, same pinned
+   * fingerprint.
+   *
+   * Chromium locks a user-data directory to one process, so this cannot simply
+   * open a second window onto a running headless browser: the browser is
+   * relaunched against the same directory instead. Everything that lives in
+   * that directory — cookies, localStorage, history — carries over, and the
+   * remaining session time carries over with it, so the visit continues rather
+   * than starting again.
+   */
+  async setHeaded(profileId: string, headed: boolean): Promise<SessionSnapshot | null> {
+    const profile = this.store.require(profileId);
+    this.store.update(profileId, { headed });
+
+    const live = this.sessions.get(profileId);
+    if (!live) {
+      // Nothing running: the preference is stored and takes effect on start.
+      this.schedulePush();
+      return null;
+    }
+
+    // Carry the unspent budget across so reopening a window mid-visit does not
+    // hand the profile a fresh fifteen minutes.
+    const remainingMs = live.handle.snapshot().remainingMs;
+    await this.closeSession(profileId);
+
+    this.logger.info(
+      "profile_relaunch",
+      `${profile.name} → ${headed ? "desktop window" : "background"}`,
+      { data: { profileId, remainingMs } },
+    );
+    return this.startProfile(profileId, { remainingMs });
+  }
+
   /** Launch a browser for a profile and start browsing. */
-  async startProfile(profileId: string): Promise<SessionSnapshot> {
+  async startProfile(
+    profileId: string,
+    options: { remainingMs?: number } = {},
+  ): Promise<SessionSnapshot> {
     if (this.sessions.has(profileId)) {
       throw new Error("This profile already has a browser open");
     }
@@ -190,10 +229,26 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const sessionId = `${profile.ordinal}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
     let screencast: Screencast | undefined;
 
+    // A profile marked "show on desktop" opens a real window; everything else
+    // about the launch is identical.
+    const config = {
+      ...this.config,
+      browser: { ...this.config.browser, headless: !profile.headed },
+      ...(options.remainingMs && options.remainingMs > 0
+        ? {
+            session: {
+              ...this.config.session,
+              durationMs: options.remainingMs,
+              durationJitterMs: 0,
+            },
+          }
+        : {}),
+    };
+
     const handle = await startSession({
       slot: profile.ordinal,
       sessionId,
-      config: this.config,
+      config,
       profile,
       userDataDir: this.store.userDataDir(profile),
       // The dashboard exists to be watched, so a finished session holds its

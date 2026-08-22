@@ -96,6 +96,7 @@ function createTile(profileId) {
     errors: el.querySelector(".s-errors"),
     errorsWrap: el.querySelector(".s-errors-wrap"),
     badges: el.querySelector(".tile__badges"),
+    desktop: el.querySelector('[data-act="desktop"]'),
     continue: el.querySelector('[data-act="continue"]'),
     pause: el.querySelector('[data-act="pause"]'),
     close: el.querySelector('[data-act="close"]'),
@@ -163,13 +164,21 @@ function updateTile(view) {
   setText(refs.errors, String(errors));
   refs.errorsWrap.dataset.bad = errors > 0 ? "1" : "0";
 
+  // The button reflects where this profile opens, so the operator can see at
+  // a glance which ones have a window on their desktop.
+  refs.desktop.dataset.on = profile.headed ? "1" : "0";
+  refs.desktop.title = profile.headed
+    ? "Opens on the desktop — click to send it back to the background"
+    : "Open on the desktop (same cookies and proxy)";
+
   // ---- badges (static per profile) -------------------------------------
-  const badgeKey = `${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}`;
+  const badgeKey = `${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}`;
   if (refs.badges.dataset.key !== badgeKey) {
     refs.badges.dataset.key = badgeKey;
     refs.badges.replaceChildren();
     if (profile.proxy) refs.badges.append(badge("proxy", "proxy"));
     if (profile.cookies) refs.badges.append(badge("cookie", `${profile.cookies.count}c`));
+    if (profile.headed) refs.badges.append(badge("desktop", "window"));
   }
 
   // ---- the stream ------------------------------------------------------
@@ -262,6 +271,24 @@ async function runAction(profileId, action) {
       await api(`/api/profiles/${profileId}/pause`, { method: "POST" });
     } else if (action === "close") {
       await api(`/api/profiles/${profileId}/close`, { method: "POST" });
+    } else if (action === "desktop") {
+      const view = latestState.find((v) => v.profile.id === profileId);
+      const headed = !view?.profile.headed;
+      // Chromium locks a profile directory to one process, so a running
+      // profile is relaunched against the same directory rather than opened
+      // twice. Say so, because the browser visibly restarts.
+      await api(`/api/profiles/${profileId}/show`, {
+        method: "POST",
+        body: JSON.stringify({ headed }),
+      });
+      toast(
+        headed
+          ? view?.session
+            ? "Reopening on your desktop — same cookies, proxy and remaining time"
+            : "Will open on your desktop when started"
+          : "Back to the background",
+        "ok",
+      );
     } else if (action === "settings") {
       openSettings(profileId);
     } else if (action === "delete") {

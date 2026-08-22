@@ -98,6 +98,12 @@ export interface Profile {
   identity: ProfileIdentity;
   /** Per-profile session length override, in minutes. */
   durationMinutes?: number;
+  /**
+   * Open this profile in a real window on the operator's desktop rather than
+   * headless. Remembered, so a profile the operator likes to watch directly
+   * keeps opening that way.
+   */
+  headed?: boolean;
   notes?: string;
   stats: ProfileStats;
 }

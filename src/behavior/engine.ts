@@ -149,6 +149,20 @@ export class BehaviorEngine {
     return this.memory.pageActions.includes(action);
   }
 
+  /**
+   * Weight for an action that has already been done here.
+   *
+   * Hard caps ("at most three sections, at most one inspect") are the wrong
+   * shape: they say a visitor who has opened three accordions is now
+   * *incapable* of opening a fourth. Real repetition tails off instead — the
+   * second look is likely, the fifth unlikely, the ninth rare but possible.
+   * Decay keeps every action reachable for as long as the page is open while
+   * still pushing the session on to something else.
+   */
+  private fading(action: ActionKind, base: number, rate = 0.9): number {
+    return base / (1 + this.countOnThisPage(action) * rate);
+  }
+
   private countOnThisPage(action: ActionKind): number {
     return this.memory.pageActions.filter((a) => a === action).length;
   }
@@ -199,13 +213,18 @@ export class BehaviorEngine {
 
   /** Probability of ending the session on this step. */
   private exitPressure(timer: SessionTimer): number {
-    const phase = timer.phase();
-    if (phase === "expired") return 1;
-    if (phase !== "late") return 0;
-    const metGoal = this.memory.visitedProducts.size >= this.memory.productTarget;
-    // Ramps from 0 at 80% elapsed to ~0.5 at the deadline once the goal is met.
-    const lateness = Math.min(1, (timer.progress() - 0.8) / 0.2);
-    return metGoal ? lateness * 0.5 : lateness * 0.15;
+    if (timer.phase() === "expired") return 1;
+
+    // The session is given fifteen minutes to explore a shop, so it should
+    // spend them. Winding down used to start at 80% elapsed and reach even
+    // odds by the deadline, which meant a session regularly stopped browsing
+    // minutes early with budget still on the clock. It now only begins to
+    // taper in the last few percent, and gently — the timer ends the session,
+    // not an early loss of interest.
+    const progress = timer.progress();
+    if (progress < 0.95) return 0;
+    const lateness = Math.min(1, (progress - 0.95) / 0.05);
+    return lateness * 0.12;
   }
 
   private exitDecision(reason: string): Decision {
@@ -269,15 +288,16 @@ export class BehaviorEngine {
           // One trip back up is normal; after that stop offering it, so the
           // remaining actions go to the page's content instead.
           ? (scrollsDone < 1 ? 1.5 : 0)
-          // Decays slowly: a visitor scrolls a listing several times, up as well
-        // as down, rather than making one pass and never touching it again.
-        : Math.max(0, 6 - scrollsDone * 0.7),
+          // Never reaches zero: a long listing can be scrolled all afternoon.
+        : this.fading("scroll", 6, 0.35),
     });
 
-    // Idle reading pause.
+    // Idle reading pause. This decays too — without it every page would keep
+    // one non-zero option forever and the engine could only ever leave by
+    // hitting its ceiling, never by running out of things to do.
     candidates.push({
       value: "dwell",
-      weight: this.rng.chance(this.behavior.idleProbability) ? 1.5 : 0.3,
+      weight: this.fading("dwell", this.rng.chance(this.behavior.idleProbability) ? 1.5 : 0.4, 1.1),
     });
 
     // Home and collection pages have sections worth looking at too (hero,
@@ -285,32 +305,28 @@ export class BehaviorEngine {
     if (observation.pageType !== "product") {
       candidates.push({
         value: "read_section",
-        weight:
-          observation.sectionCount > 0 && this.countOnThisPage("read_section") < 3 ? 2.5 : 0,
+        weight: observation.sectionCount > 0 ? this.fading("read_section", 2.5, 0.7) : 0,
       });
     }
 
     if (observation.pageType === "product") {
       candidates.push({
         value: "inspect_details",
-        weight: this.didOnThisPage("inspect_details") ? 0 : 6,
+        // Re-reading the price and title is one of the most ordinary things a
+        // shopper does; once per page was never right.
+        weight: this.fading("inspect_details", 6, 1.2),
       });
       candidates.push({
         value: "view_media",
-        weight: observation.mediaCount > 0 && this.countOnThisPage("view_media") < 3 ? 5 : 0,
+        weight: observation.mediaCount > 0 ? this.fading("view_media", 5, 0.8) : 0,
       });
       candidates.push({
         value: "read_section",
-        weight:
-          observation.sectionCount > 0 &&
-          this.countOnThisPage("read_section") < Math.min(3, observation.sectionCount)
-            ? 4
-            : 0,
+        weight: observation.sectionCount > 0 ? this.fading("read_section", 4, 0.6) : 0,
       });
       candidates.push({
         value: "hover_variants",
-        weight:
-          observation.hasVariants && this.countOnThisPage("hover_variants") < 2 ? 3 : 0,
+        weight: observation.hasVariants ? this.fading("hover_variants", 3, 0.9) : 0,
       });
     }
 

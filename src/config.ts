@@ -202,7 +202,10 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     scrollSteps: { min: 1, max: 3 },
     mediaDwell: { min: 400, max: 1300 },
     sectionDwell: { min: 600, max: 1800 },
-    targetProducts: { min: 4, max: 9 },
+    // How many products before the engine stops actively seeking new ones.
+    // Not a stopping point — the session keeps browsing either way; it just
+    // stops steering so hard toward unseen products.
+    targetProducts: { min: 8, max: 20 },
     backProbability: 0.28,
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,

@@ -39,6 +39,7 @@ export interface CreateProfileInput {
 
 /** Fields the dashboard is allowed to edit on an existing profile. */
 export interface UpdateProfileInput {
+  headed?: boolean;
   name?: string;
   proxy?: string;
   durationMinutes?: number | null;
@@ -182,6 +183,7 @@ export class ProfileStore {
       else delete profile.identity.locale;
     }
     if (patch.notes !== undefined) profile.notes = patch.notes;
+    if (patch.headed !== undefined) profile.headed = patch.headed;
 
     this.write();
     return profile;

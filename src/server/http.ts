@@ -331,6 +331,13 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
         return;
       }
 
+      if (action === "/show" && method === "POST") {
+        const body = await readJsonBody(req);
+        const headed = body.headed !== false;
+        sendJson(res, 200, { headed, session: await orchestrator.setHeaded(id, headed) });
+        return;
+      }
+
       if (action === "/pause" && method === "POST") {
         orchestrator.pauseProfile(id);
         sendJson(res, 200, { paused: id });

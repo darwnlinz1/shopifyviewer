@@ -411,6 +411,10 @@ main { padding: 18px; }
 
 .filebtn { cursor: pointer; }
 
+/* A profile pinned to a desktop window. */
+.iconbtn[data-on="1"] { background: rgba(76,141,255,.16); color: #7fb0ff; }
+.badge--desktop { border-color: rgba(76,141,255,.4); color: #8fbcff; background: rgba(76,141,255,.1); }
+
 /* =============================================================== overlays */
 
 .overlay {

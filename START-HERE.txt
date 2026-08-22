@@ -29,6 +29,17 @@ Lan chay dau can mot trinh duyet. Chon 1 trong 2:
      Tool tu tim Chrome/Edge tren may.
 
 
+Mo browser that tren man hinh
+-----------------------------
+Tren moi tile co nut hinh man hinh. Bam vao la profile do mo cua so
+Chrome that tren may — van dung cookie, proxy va fingerprint cua no,
+va giu nguyen thoi gian con lai cua session. Bam lai de dua ve chay nen.
+
+Luu y: Chromium khoa thu muc profile cho 1 tien trinh, nen browser se
+khoi dong lai chu khong mo them cua so thu hai. Cookie va lich su nam
+trong thu muc profile nen khong mat gi.
+
+
 Cac lenh khac
 -------------
     node dist/cli.js dashboard --pace 2     nhanh gap doi
