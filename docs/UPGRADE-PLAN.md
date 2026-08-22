@@ -182,3 +182,82 @@ All items in this plan are implemented. `npm run build` and `npm test` pass
   The per-step scroll evaluates are gone, which was the high-frequency case.
 - No `--headed` window tiling. Headed mode opens windows wherever the OS puts
   them; the dashboard's live view is the intended way to watch many at once.
+
+---
+
+## Round 2 — operational fixes
+
+Three problems reported from real use, all real, all fixed.
+
+### 1. Scrolling teleported to the bottom, then froze
+
+`mouse.wheel(0, 450)` is **one** wheel event carrying a 450-pixel delta, and
+the browser applies all of it at once. Round 1 swapped `window.scrollBy` for
+`mouse.wheel` to get genuine input events and, without meaning to, traded
+smooth-but-invisible motion for real-but-instant motion.
+
+Gestures are now emitted the way a hand produces them: a burst of small ticks,
+roughly a notch each, tens of milliseconds apart, easing in and out across the
+gesture, with an occasional overshoot and correction. Measured on a 2466px
+page: **24 distinct scroll positions, no 25ms window moving more than 185px.**
+
+The freeze afterwards was separate: scrolling down at the bottom of a page does
+nothing at all, so the tile looked dead. A gesture that would be a no-op now
+turns around instead.
+
+### 2. Navigation never clicked anything
+
+Every page change went through `page.goto(url)` — the address bar. A visitor on
+a collection page clicks the product card; they do not type its URL. The
+difference is visible from the server: a click sends a `Referer`, `goto` sends
+nothing.
+
+`navigateTo()` now locates the anchor on the current page, scrolls it into view
+and clicks it, falling back to `goto()` only where the page genuinely offers no
+link. This also routes navigation through CloakBrowser's human layer, since
+`click` and `scrollIntoViewIfNeeded` are among the methods it patches.
+
+Verified: the destination reports `document.referrer` = the previous page, the
+click lands on the intended anchor, and the event reports `isTrusted: true` —
+real input, not a synthesised event.
+
+Clicking *within* a page (gallery thumbnails, accordions) was already there and
+still is; a test now guards it.
+
+### 3. Live tiles rendered blank
+
+Frames were arriving and decoding — the failure was on the wire. Chromium only
+emits a screencast frame when the page repaints, and a browser rendering
+`multipart/x-mixed-replace` only paints a part once the **next** boundary
+arrives. A session resting on a static product page therefore left its tile
+blank while the server held a perfectly good frame.
+
+The stream now re-sends the last frame on a slow cadence, flushing the pending
+part and keeping the connection warm. Also: the tile `<img>` is no longer
+`loading="lazy"`, and the view uses `object-fit: contain` — the capture's
+aspect ratio follows the browser window, and on a monitoring wall a cropped
+edge hides exactly what you were watching for.
+
+### Also in round 2
+
+- Dashboard redesign: fleet counters, text and status filters, bulk
+  start/pause/close, per-tile progress bars, toasts, a real empty state.
+- Documented that browsers are **headless by default** — the wall runs in the
+  background and the live view does not depend on visible windows.
+- Fixed a launch failure introduced in round 1: auto-geoip needs the optional
+  `mmdb-lib` peer dependency, so adding a proxy to a profile stopped it opening
+  at all. It is now a direct dependency, and the launcher degrades to the
+  configured timezone rather than refusing to start.
+
+**59 tests, all passing.** `npm run build` and typecheck clean.
+
+## Still open
+
+- The observation reads (`observe()`, page-type detection, link collection)
+  still use `page.evaluate`. The package exposes an isolated-world reader
+  internally but not as public API. The per-scroll-step evaluates — the
+  high-frequency case — are gone.
+- No real-storefront or real-CloakBrowser-binary run: this environment cannot
+  fetch the 1 GB patched Chromium, so all browser tests run stock Chromium
+  through the fallback path.
+- Operational/reporting upgrade ideas: not written yet.
