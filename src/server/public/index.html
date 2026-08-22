@@ -170,7 +170,9 @@
     <div class="tile__screen">
       <!-- Always streaming, click-free. Small and coarse by design: enough to
            see the page move, cheap enough to run a wall of them. -->
-      <img class="tile__view" alt="" loading="lazy">
+      <!-- Not lazy: this is a live stream that should be connected as soon
+           as the tile exists, not when it scrolls into view. -->
+      <img class="tile__view" alt="">
       <div class="tile__placeholder">
         <svg viewBox="0 0 24 24" class="ico ico--lg"><rect x="2" y="4" width="20" height="15" rx="2"/><path d="M2 8h20"/></svg>
         <span>no browser open</span>

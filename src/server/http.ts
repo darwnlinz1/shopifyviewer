@@ -132,6 +132,8 @@ function streamMjpeg(
     pragma: "no-cache",
   });
 
+  let lastSentAt = 0;
+
   const writeFrame = (frame: Buffer): void => {
     // `write` returning false means the socket buffer is full: the viewer is
     // slower than the stream. Dropping the frame is the right call for live
@@ -142,6 +144,7 @@ function streamMjpeg(
     );
     res.write(frame);
     res.write("\r\n");
+    lastSentAt = Date.now();
   };
 
   // Show the most recent frame at once, so a tile is never blank while it
@@ -150,7 +153,25 @@ function streamMjpeg(
   if (initial) writeFrame(initial);
 
   const unsubscribe = screencast.subscribe(writeFrame, mode);
+
+  // Chromium only emits a screencast frame when the page actually repaints, so
+  // a session sitting on a static product page can go many seconds without
+  // producing one. That starves the stream in a way that is worse than it
+  // sounds: a browser rendering multipart/x-mixed-replace only paints a part
+  // once the *next* boundary arrives, so a tile whose page has gone quiet
+  // stays blank while holding a perfectly good frame.
+  //
+  // Re-sending the last frame on a slow cadence fixes both halves: the pending
+  // part gets flushed, and the connection stays warm through idle stretches.
+  const heartbeat = setInterval(() => {
+    const frame = screencast.lastFrame;
+    if (!frame || res.writableEnded) return;
+    if (Date.now() - lastSentAt < 700) return;
+    writeFrame(frame);
+  }, 500);
+
   const finish = (): void => {
+    clearInterval(heartbeat);
     unsubscribe();
     if (!res.writableEnded) res.end();
   };

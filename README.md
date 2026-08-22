@@ -82,7 +82,7 @@ Node 20+ required.
 
 ```bash
 # 0. Manage many profiles from a browser, each with a live view
-npx tsx src/cli.ts dashboard --headed
+npx tsx src/cli.ts dashboard
 
 # 1. Check the tool can see your theme's elements
 npx tsx src/cli.ts probe --storefront https://your-shop.com
@@ -127,6 +127,7 @@ After `npm run build`, use `node dist/cli.js …` instead of `npx tsx src/cli.ts
 | `--headed` | off | Visible browser window |
 | `--fresh-profiles` | off | Don't reuse profiles between runs |
 | `--allow-fallback` | off | Allow stock Chromium if CloakBrowser is unavailable |
+| `--headed` | off | Open real OS windows too. The live view works without it. |
 | `--linger <min>` | `0` | Hold the browser open after the budget is spent (`-1` = until closed) |
 | `--port <n>` | `7317` | Dashboard port |
 | `--host <addr>` | `127.0.0.1` | Dashboard bind address |
@@ -137,8 +138,20 @@ After `npm run build`, use `node dist/cli.js …` instead of `npx tsx src/cli.ts
 ## Dashboard
 
 ```bash
-npx tsx src/cli.ts dashboard --headed      # http://127.0.0.1:7317
+npx tsx src/cli.ts dashboard      # http://127.0.0.1:7317
 ```
+
+### It runs in the background
+
+Browsers are **headless by default**: no Chromium windows open on your desktop,
+nothing to keep in the foreground, nothing that breaks when you switch
+applications. The live view does not depend on visible windows — CDP captures
+what the browser renders either way — so the dashboard shows the same picture
+whether or not anything is on screen.
+
+`--headed` additionally opens real OS windows, which is useful for debugging a
+single profile by hand. It is not how you would run a wall of them: a dozen
+visible Chromium windows fight over focus and the taskbar.
 
 One tile per profile, and **every tile streams its browser live without being
 clicked**. Tiles are small and coarse on purpose — a 320x200 JPEG at a couple
@@ -286,6 +299,37 @@ aggregate totals.
 | `http_5xx` | Server error during browsing. |
 | `page_load` timings | `ttfbMs`, `firstContentfulPaintMs`, `loadEventMs` per page. |
 | `navigation_error` | A navigation timed out or failed. |
+
+---
+
+## What a session actually does
+
+Within its budget the session behaves like a visitor rather than a script:
+
+- **Navigates by clicking.** It finds the anchor for its target on the current
+  page, scrolls it into view and clicks it, so the page change carries a
+  Referer and arrives through a real cursor movement. `page.goto()` — the
+  address bar — is only the fallback for destinations the current page does
+  not link to.
+- **Scrolls with the wheel**, as a burst of small ticks that ease in and out,
+  sometimes overshooting and correcting. Not a jump, and not a scripted
+  viewport move: every pixel arrives as real wheel input.
+- **Clicks into the page**: gallery thumbnails, accordion sections. Hovers
+  variant swatches without selecting one, so the theme's variant JS runs
+  without touching cart state.
+- **Reads for as long as there is to read.** Dwell time is derived from the
+  text actually in the block, not drawn from a fixed range.
+- **Paces itself.** Delays are log-normal rather than uniform, with a
+  random-walking tempo so consecutive pauses correlate, and a fatigue drift so
+  the end of a session is paced differently from the start.
+- **Keeps the cursor alive.** It drifts a few pixels while reading instead of
+  freezing for the entire session.
+- **Winds down.** Once it has seen the products it meant to see and the budget
+  is nearly spent, it becomes progressively more likely to leave — so a session
+  ends by choosing to, not by being killed mid-action.
+
+Everything above still flows through one seeded RNG, so `--seed 42` replays a
+session exactly.
 
 ---
 
