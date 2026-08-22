@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "cloakbrowser": "^0.5.8",
+    "mmdb-lib": "^3.0.3",
     "playwright-core": "^1.50.0"
   },
   "devDependencies": {

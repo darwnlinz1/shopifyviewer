@@ -174,6 +174,34 @@ test("streams live frames from the browser", { skip }, async () => {
   assert.equal(frames[0][1], 0xd8);
 });
 
+test("launches a profile that has a proxy configured", { skip }, async () => {
+  // Regression: the launcher turns geoip on by itself when a profile has a
+  // proxy but no pinned timezone, and geoip needs the optional mmdb-lib peer
+  // dependency. Without a guard, an ordinary "profile with a proxy" threw at
+  // launch instead of opening a browser.
+  const { ProfileStore } = await import("../dist/profiles/store.js");
+  const store = new ProfileStore(join(workDir, "proxy-profiles"));
+  const profile = store.create({
+    name: "Proxied",
+    // Never reachable, which is the point: the browser must still *launch*.
+    // A dead proxy is a navigation failure, not a launch failure.
+    proxy: "http://127.0.0.1:9/",
+  });
+  assert.equal(profile.identity.timezone, undefined, "profile should pin no timezone");
+
+  const handle = await startSession({
+    slot: 9,
+    sessionId: "test-proxy-launch",
+    config,
+    profile,
+    userDataDir: store.userDataDir(profile),
+    lingerMs: 0,
+  });
+
+  assert.ok(!handle.page.isClosed(), "browser should be open despite the proxy");
+  await handle.close();
+});
+
 test("closes immediately when linger is off", { skip }, async () => {
   const handle = await startSession({
     slot: 3,

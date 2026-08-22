@@ -13,6 +13,7 @@
  * silently dropping the CloakBrowser layer.
  */
 import { mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve, join } from "node:path";
 import type { BrowserContext } from "playwright-core";
 import type { LaunchPersistentContextOptions as CloakLaunchOptions } from "cloakbrowser";
@@ -70,6 +71,23 @@ export function profilePathFor(
   const path = join(base, name);
   mkdirSync(path, { recursive: true });
   return path;
+}
+
+/**
+ * Whether CloakBrowser's geoip derivation can actually run.
+ *
+ * `geoip` needs `mmdb-lib`, which is an *optional* peer dependency — asking for
+ * geoip without it makes the launch throw. Since the launcher turns geoip on by
+ * itself behind a proxy, it has to check first, or a perfectly ordinary
+ * "profile with a proxy" would fail to start.
+ */
+function geoipAvailable(): boolean {
+  try {
+    createRequire(import.meta.url).resolve("mmdb-lib");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Chromium flags that keep a long automated session stable and quiet. */
@@ -186,11 +204,32 @@ export async function launchBrowser(req: LaunchRequest): Promise<LaunchedBrowser
   // username/password split out of it or it will not authenticate.
   const proxy = proxyInput ? parseProxy(proxyInput) : undefined;
 
+  // A managed profile that pins nothing still inherits the config's timezone
+  // and locale, so dashboard profiles behave like CLI runs by default.
+  if (!identity.timezone && browserCfg.timezone) identity.timezone = browserCfg.timezone;
+  if (!identity.locale && browserCfg.locale) identity.locale = browserCfg.locale;
+
   // When traffic exits through a proxy, let CloakBrowser derive timezone and
   // locale from the exit IP unless they were pinned explicitly. A hardcoded
   // Europe/Paris behind an IP that geolocates elsewhere is a contradiction the
   // page can read directly.
-  const geoip = browserCfg.geoip || (!!proxy && !identity.timezone);
+  //
+  // Only if geoip can actually run, though: it needs the optional `mmdb-lib`
+  // peer dependency, and asking for it without that installed throws at launch.
+  // Degrading to the configured timezone is much better than refusing to open
+  // the browser at all.
+  const wantsGeoip = browserCfg.geoip || (!!proxy && !identity.timezone);
+  const geoip = wantsGeoip && geoipAvailable();
+
+  if (wantsGeoip && !geoip) {
+    logger.warn(
+      "geoip_unavailable",
+      "geoip needs the optional mmdb-lib package (npm install mmdb-lib); " +
+        (identity.timezone
+          ? `falling back to the configured timezone ${identity.timezone}`
+          : "the browser clock will report this machine's timezone, which may not match where the proxy exits"),
+    );
+  }
 
   const options: CloakLaunchOptions = {
     userDataDir: profilePath,
