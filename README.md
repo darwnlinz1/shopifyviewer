@@ -8,6 +8,9 @@ navigation, rendering, page-load timings, JavaScript errors and failed requests.
 The browser layer is [CloakBrowser](https://github.com/CloakHQ/cloakbrowser)'s
 patched Chromium, driven through Playwright.
 
+Sessions run from the CLI, or from a **dashboard** that manages many browser
+profiles at once and streams each one live.
+
 > This is a **read-only** testing tool. It never adds to cart, never touches
 > checkout or account pages, and stays pinned to the host you point it at.
 
@@ -29,6 +32,9 @@ CloakBrowser → Session Manager → Playwright → Page Navigator
 | **Session Timer** | `src/session/timer.ts` | Owns the ~15 minute budget and exposes phase/remaining so the engine can wind down. |
 | **Logger** | `src/logging/logger.ts` | Structured JSONL + console output: URL, action, timestamp, page load, errors. |
 | **Runner** | `src/session/runner.ts` | Runs N independent sessions with bounded concurrency and writes the run summary. |
+| **Profile store** | `src/profiles/` | The profile registry, cookie import and proxy handling. |
+| **Orchestrator** | `src/server/orchestrator.ts` | Profiles on one side, live sessions and their screencast taps on the other. |
+| **Dashboard** | `src/server/` | HTTP API, SSE state channel, MJPEG live views, and the UI. |
 
 ### Behaviour Engine
 
@@ -75,6 +81,9 @@ Node 20+ required.
 ## Usage
 
 ```bash
+# 0. Manage many profiles from a browser, each with a live view
+npx tsx src/cli.ts dashboard --headed
+
 # 1. Check the tool can see your theme's elements
 npx tsx src/cli.ts probe --storefront https://your-shop.com
 
@@ -94,8 +103,10 @@ After `npm run build`, use `node dist/cli.js …` instead of `npx tsx src/cli.ts
 
 | Command | What it does |
 | --- | --- |
+| `dashboard` | Manages many browser profiles from a live web UI. |
 | `run` | Runs simulated browsing sessions (default). |
 | `probe` | Loads home / collection / product and reports which selectors matched. Run this first against a new shop. |
+| `verify` | Reports what the browser exposes to a page, and flags contradictions. |
 | `info` | Reports CloakBrowser binary status. |
 | `init` | Writes a starter `storefront-sim.config.json`. |
 
@@ -116,7 +127,112 @@ After `npm run build`, use `node dist/cli.js …` instead of `npx tsx src/cli.ts
 | `--headed` | off | Visible browser window |
 | `--fresh-profiles` | off | Don't reuse profiles between runs |
 | `--allow-fallback` | off | Allow stock Chromium if CloakBrowser is unavailable |
+| `--linger <min>` | `0` | Hold the browser open after the budget is spent (`-1` = until closed) |
+| `--port <n>` | `7317` | Dashboard port |
+| `--host <addr>` | `127.0.0.1` | Dashboard bind address |
 | `--quiet` | off | No console logging |
+
+---
+
+## Dashboard
+
+```bash
+npx tsx src/cli.ts dashboard --headed      # http://127.0.0.1:7317
+```
+
+One tile per profile, and **every tile streams its browser live without being
+clicked**. Tiles are small and coarse on purpose — a 320x200 JPEG at a couple
+of frames a second, enough to see a page scrolling, cheap enough to run a wall
+of them. Click one to enlarge it to a full-quality stream; the rest keep
+running behind it.
+
+Frames come from CDP `Page.startScreencast` and are served as
+`multipart/x-mixed-replace`, so a tile is a plain `<img>` — no WebSocket, no
+client-side decoding, and nothing added to the dependency tree. This works in
+headless mode too: `--headed` also gives you real OS windows, but the live view
+does not depend on them.
+
+### Tiles hold their position
+
+A dashboard whose cards move while you are trying to click one is unusable, so
+three things are fixed by construction:
+
+- **Order** comes from each profile's creation ordinal, assigned once. Nothing
+  is ever sorted on status, last-run time, or the order sessions finish in.
+- **Geometry** is fixed. The live view has a locked aspect ratio and every
+  variable-length field — URL, status text, error counts — is fixed-height and
+  clipped, so no content can change a tile's footprint.
+- **Updates patch in place.** Tiles are created once; a state push updates
+  their fields and never rebuilds the grid. This is also what keeps a state
+  push from interrupting a running stream.
+
+### Per profile
+
+| | |
+| --- | --- |
+| **Continue** | Starts an idle profile, resumes a paused one, or gives a spent one more time. |
+| **Pause** | Suspends browsing; the browser stays open. |
+| **Close** | Closes the browser. The profile, its cookies and its directory remain. |
+| **Delete** | Removes the profile, its cookie jar and its user-data directory. |
+| **Proxy** | A field with a Save button, plus Test, which opens a real connection and reports the exit IP. |
+| **Cookies** | A file picker. Browse to an export and it is parsed and attached. |
+
+### The browser stays open when the timer ends
+
+A session that runs out of budget stops browsing but **does not close its
+browser**. It goes to `lingering` and holds its last page until you close it,
+so the final state is there to look at. Scripted runs keep the old behaviour:
+`--linger` defaults to `0`, and the dashboard sets `-1`.
+
+### Proxies and cookies
+
+Proxies accept either form operators actually have:
+
+```
+http://user:pass@gate.example:8080     socks5://gate.example:1080
+gate.example:8080:user:pass            gate.example:3128
+```
+
+Credentials are split out of the URL, because the stock-Playwright path cannot
+authenticate from an inline `user:pass`. They are redacted in every log line.
+When a proxy is set and no timezone is pinned, `geoip` turns on automatically
+so the browser clock cannot contradict where the traffic exits.
+
+Cookie files are detected by content rather than extension, since exports are
+routinely saved under the wrong name:
+
+- Playwright `storageState` — `{ "cookies": [...] }`
+- A bare JSON array — EditThisCookie, Cookie-Editor
+- Netscape `cookies.txt` — curl, wget, yt-dlp
+
+Expiry and `sameSite` spellings differ between all of these and are normalised.
+A file that cannot be parsed is rejected with the reason rather than silently
+importing nothing — an empty cookie jar looks exactly like a logged-out
+session, which is a miserable thing to debug at run time.
+
+---
+
+## Checking the browser: `verify`
+
+```bash
+npx tsx src/cli.ts verify --headed
+```
+
+Reports what the browser actually exposes to a page — user agent, platform,
+languages, timezone, screen and viewport, WebGL strings, `navigator.webdriver`,
+plugin count — and then cross-checks those readings for contradictions:
+
+- a viewport larger than the screen it claims to be on
+- a resolved timezone that disagrees with the configured one
+- `Intl` locale and `navigator.languages` disagreeing
+- a proxy with neither `geoip` nor a pinned timezone, so the clock reports this
+  machine's zone regardless of where traffic exits
+
+It reports inconsistencies; it does not score anything or predict what any
+particular shop will make of a run. Whether a storefront is satisfied depends
+on that shop's own protection settings and changes constantly. A browser
+contradicting itself, on the other hand, is a configuration bug whoever is
+looking — and that is the part worth fixing.
 
 ---
 
@@ -224,3 +340,15 @@ node test/mockStorefront.mjs 4321 &
 npx tsx src/cli.ts probe --storefront http://127.0.0.1:4321
 npx tsx src/cli.ts run   --storefront http://127.0.0.1:4321 --duration 2
 ```
+
+The automated suite runs against it:
+
+```bash
+npm test
+```
+
+`test/session.test.mjs` drives a real browser and covers the parts that only
+exist at run time: that a spent session keeps its browser open, that pause and
+resume do not close it, and that the screencast produces decodable JPEG frames.
+It runs on stock Chromium through the fallback path, so CI does not need the
+1 GB CloakBrowser binary, and skips itself when no Chromium is present.

@@ -127,8 +127,10 @@ export class Pacing {
    * Scaled to the actual content rather than drawn from a fixed range: a
    * two-line shipping note and a thousand-word ingredient list should not take
    * the same time. Visitors skim rather than read every word, so a per-draw
-   * skim factor is applied, and the result is bounded by the configured dwell
-   * range so a huge description cannot eat the whole session budget.
+   * skim factor is applied, and the result is clamped to the configured dwell
+   * range so a huge description cannot eat the whole session budget. Tempo and
+   * fatigue then apply on top, exactly as they do to every other delay, so the
+   * final value can exceed `sectionDwell.max` by that multiplier.
    */
   readingTime(characters: number): number {
     if (!Number.isFinite(characters) || characters <= 0) return this.sectionDwell();

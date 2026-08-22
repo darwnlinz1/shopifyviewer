@@ -135,32 +135,50 @@ exposes so the operator can check rather than guess.
 
 ## Status
 
-### Done
+All items in this plan are implemented. `npm run build` and `npm test` pass
+(48 tests, four of which drive a real browser).
 
-- Baseline imported onto `claude/profile-dashboard-upgrades-7cn0kn`.
-- `src/profiles/types.ts` — profile/session domain model, `ordinal` ordering key.
-- `src/profiles/cookies.ts` — cookie import for Playwright `storageState`,
-  EditThisCookie/Cookie-Editor JSON arrays and Netscape `cookies.txt`;
-  format detected from content, expiry/sameSite normalised across exporters.
-- `src/profiles/proxy.ts` — proxy parsing (URL form and vendor
-  `host:port:user:pass` form), validation, redaction, and a real connectivity
-  test that reports the exit IP.
-- `src/profiles/store.ts` — persisted registry, atomic writes, stable
-  `ordinal` ordering, pinned per-profile identity, lifetime stats.
+### Delivered
 
-### Remaining
+| Area | Where |
+| --- | --- |
+| Profile registry, stable ordering, pinned identity | `src/profiles/store.ts`, `types.ts` |
+| Cookie import (storageState / JSON array / Netscape) | `src/profiles/cookies.ts` |
+| Proxy parse, validate, redact, live test | `src/profiles/proxy.ts` |
+| Log-normal delays, tempo, fatigue, reading time | `src/behavior/timing.ts` |
+| Per-profile fingerprint and humanConfig | `src/browser/identity.ts` |
+| Cookie injection, proxy credentials, preflight, geoip | `src/browser/cloak.ts` |
+| Wheel scrolling, cursor drift, content-scaled reads | `src/navigator/pageNavigator.ts` |
+| Linger, pause/resume/extend/park, responsive close | `src/session/manager.ts` |
+| CDP screencast, dual quality | `src/server/screencast.ts` |
+| Orchestration, REST, SSE, MJPEG | `src/server/orchestrator.ts`, `http.ts` |
+| Dashboard grid | `src/server/public/` |
+| Fingerprint self-check | `src/browser/verify.ts` |
 
-1. `src/browser/identity.ts` + `cloak.ts` rewrite — pinned fingerprint,
-   cookie injection via `contextOptions.storageState`, proxy credential split,
-   `validateLicense` / `ensureBinary` preflight, `humanConfig` wiring.
-2. `src/session/manager.ts` — **linger**: stop closing the browser when the
-   timer expires; hold it open in `lingering` until the operator says
-   otherwise. Plus pause / resume / stop / extend.
-3. `src/server/screencast.ts` — CDP screencast, dual-quality frame taps.
-4. `src/server/orchestrator.ts` — profiles ↔ live sessions, event bus.
-5. `src/server/http.ts` — REST + SSE + MJPEG + static.
-6. `src/server/public/*` — the grid described above.
-7. `pageNavigator.ts` — wheel scrolling, cursor idle drift, content-scaled
-   reading time; `src/behavior/timing.ts` for log-normal delays.
-8. `cli.ts` — `dashboard` and `verify` commands.
-9. Tests + README.
+### Bugs found and fixed along the way
+
+1. **Session cookies from `cookies.txt` were being discarded.** Netscape uses
+   expiry `0` for a session cookie; `Date.parse("0")` yields the year 2000, so
+   every one of them was then dropped as expired. Caught by a test.
+2. **Garbage passed proxy validation.** `new URL()` accepts `http://!!!` with a
+   hostname of `!!!`, so an unusable proxy saved cleanly and only failed once a
+   session tried to use it. Now host-validated.
+3. **`.gitignore` swallowed `src/profiles/`.** The unanchored `profiles/`
+   pattern matched at any depth, so the whole new module was silently
+   untracked on its first commit.
+4. **Failed actions counted toward the page budget.** A run of failed
+   navigations pushed the engine off a page it had barely looked at.
+5. **Close was unresponsive.** The loop only checks for a close request between
+   turns, and a turn can sit in a 45-second navigation, so the dashboard's
+   Close button appeared dead. It now force-closes after a short grace period.
+
+### Not done
+
+- No isolated-world migration for the observation reads. `observe()` still uses
+  `page.evaluate` for geometry, link collection and page-type detection.
+  Finding 2 in the audit above stands: the package exposes an isolated-world
+  reader internally (`page._stealth`), but it is not part of its public API, so
+  using it would mean reaching into internals that can change between releases.
+  The per-step scroll evaluates are gone, which was the high-frequency case.
+- No `--headed` window tiling. Headed mode opens windows wherever the OS puts
+  them; the dashboard's live view is the intended way to watch many at once.

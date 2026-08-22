@@ -257,6 +257,7 @@ export async function launchBrowser(req: LaunchRequest): Promise<LaunchedBrowser
     const { chromium } = await import("playwright-core");
     context = await chromium.launchPersistentContext(profilePath, {
       headless: browserCfg.headless,
+      ...(browserCfg.executablePath ? { executablePath: browserCfg.executablePath } : {}),
       viewport: identity.viewport,
       colorScheme: identity.colorScheme,
       args: stabilityArgs(),

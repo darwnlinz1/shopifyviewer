@@ -46,6 +46,15 @@ export interface BrowserConfig {
    * misconfigured run fails loudly instead of silently losing the stealth layer.
    */
   allowFallbackBrowser: boolean;
+  /**
+   * Chromium binary for the fallback path only.
+   *
+   * CloakBrowser provisions and pins its own patched binary, so this never
+   * applies to a normal run. It exists for CI, where a stock Chromium is
+   * already on disk at a known path and downloading another one is pure
+   * overhead.
+   */
+  executablePath?: string;
 }
 
 export interface SessionConfig {

@@ -66,9 +66,13 @@ function normaliseExpiry(raw: unknown): number {
     return raw > 1e12 ? Math.round(raw / 1000) : Math.round(raw);
   }
   if (typeof raw === "string") {
-    const numeric = Number(raw);
-    if (Number.isFinite(numeric) && numeric > 0) return normaliseExpiry(numeric);
-    const parsed = Date.parse(raw);
+    const trimmed = raw.trim();
+    const numeric = Number(trimmed);
+    // Any numeric string is an epoch — including "0", which Netscape uses to
+    // mean "session cookie". Letting "0" fall through to Date.parse yields the
+    // year 2000, and the cookie is then silently dropped as expired.
+    if (trimmed !== "" && Number.isFinite(numeric)) return normaliseExpiry(numeric);
+    const parsed = Date.parse(trimmed);
     if (Number.isFinite(parsed)) return Math.round(parsed / 1000);
   }
   return -1;

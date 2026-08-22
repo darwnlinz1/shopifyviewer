@@ -35,6 +35,17 @@ export class ProxyParseError extends Error {
 
 const SUPPORTED = new Set(["http", "https", "socks4", "socks5"]);
 
+/**
+ * A hostname, IPv4 address, or bracketed IPv6 literal.
+ *
+ * `new URL()` is lenient about what it will accept as a host — `http://!!!`
+ * parses happily with a hostname of "!!!" — so a proxy that never resolves
+ * would otherwise be saved as valid and only fail once a session tried to use
+ * it.
+ */
+const HOST_PATTERN =
+  /^(?:\[[0-9a-fA-F:.]+\]|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)$/;
+
 /** Default port by scheme, used when the operator omits one. */
 const DEFAULT_PORTS: Record<string, number> = {
   http: 8080,
@@ -104,6 +115,9 @@ function buildProxy(
   raw: string,
 ): ParsedProxy {
   if (!host) throw new ProxyParseError("proxy host is missing");
+  if (!HOST_PATTERN.test(host)) {
+    throw new ProxyParseError(`"${host}" is not a valid proxy host`);
+  }
 
   const portNumber = port ? Number(port) : DEFAULT_PORTS[protocol];
   if (!portNumber || !Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) {

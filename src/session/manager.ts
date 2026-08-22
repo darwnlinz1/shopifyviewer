@@ -486,6 +486,21 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     park: () => control.park(),
     close: async () => {
       control.requestClose();
+
+      // The loop only notices a close request between turns, and a turn can be
+      // most of a minute if it is sitting in a slow navigation. Waiting for it
+      // makes the dashboard's Close button feel broken, so give it a moment to
+      // stop cleanly and then take the context out from under it. The in-flight
+      // action fails, `drive()` catches it, and the session settles normally.
+      const settled = await Promise.race([
+        done.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3_000)),
+      ]);
+
+      if (!settled) {
+        logger.debug("session_force_close", "closing the browser out from under the loop");
+        await browser.context.close().catch(() => undefined);
+      }
       return done;
     },
     done,
