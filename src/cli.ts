@@ -8,6 +8,7 @@
  *   storefront-sim init             write a starter config file
  */
 import { writeFileSync, existsSync } from "node:fs";
+import { ensureDependencies } from "./bootstrap.js";
 import { loadConfig, DEFAULT_CONFIG, type SimulatorConfig } from "./config.js";
 import { runAll } from "./session/runner.js";
 import { probeStorefront, formatProbeReport } from "./navigator/probe.js";
@@ -177,6 +178,10 @@ async function main(): Promise<number> {
     process.stdout.write(USAGE);
     return 0;
   }
+
+  // Install anything missing before a command tries to import it. A no-op
+  // once dependencies are present, so this costs one resolve per run.
+  if (!ensureDependencies({ quiet: has(flags, "quiet") })) return 1;
 
   if (command === "init") {
     const path = one(flags, "config") ?? "storefront-sim.config.json";

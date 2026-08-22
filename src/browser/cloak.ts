@@ -12,7 +12,7 @@
  * `browser.allowFallbackBrowser`, so a normal run fails loudly rather than
  * silently dropping the CloakBrowser layer.
  */
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve, join } from "node:path";
 import type { BrowserContext } from "playwright-core";
@@ -88,6 +88,54 @@ function geoipAvailable(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Chromium builds already on this machine, for the fallback path.
+ *
+ * The CloakBrowser binary is a ~1 GB download, and someone trying the tool for
+ * the first time should not have to wait for it before seeing anything work.
+ * Almost every desktop already has a Chrome or an Edge; when the operator has
+ * opted into the fallback, using one of those beats refusing to start.
+ *
+ * This is only ever the fallback — a normal run uses CloakBrowser's patched
+ * binary, and stock Chrome carries none of its fingerprint work.
+ */
+function installedChromePaths(): string[] {
+  const programFiles = process.env["PROGRAMFILES"] ?? "C:\\Program Files";
+  const programFilesX86 = process.env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)";
+  const localAppData = process.env["LOCALAPPDATA"] ?? "";
+
+  if (process.platform === "win32") {
+    return [
+      `${programFiles}\\Google\\Chrome\\Application\\chrome.exe`,
+      `${programFilesX86}\\Google\\Chrome\\Application\\chrome.exe`,
+      localAppData ? `${localAppData}\\Google\\Chrome\\Application\\chrome.exe` : "",
+      `${programFiles}\\Microsoft\\Edge\\Application\\msedge.exe`,
+      `${programFilesX86}\\Microsoft\\Edge\\Application\\msedge.exe`,
+    ];
+  }
+
+  if (process.platform === "darwin") {
+    return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ];
+  }
+
+  return [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+  ];
+}
+
+/** The first Chromium-family browser found on this machine, if any. */
+export function findInstalledChrome(): string | undefined {
+  return installedChromePaths().find((path) => path !== "" && existsSync(path));
 }
 
 /** Chromium flags that keep a long automated session stable and quiet. */
@@ -283,20 +331,34 @@ export async function launchBrowser(req: LaunchRequest): Promise<LaunchedBrowser
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     if (!browserCfg.allowFallbackBrowser) {
+      // Name the way out that actually applies to this machine, rather than
+      // listing options the operator then has to go and check themselves.
+      const local = findInstalledChrome();
       throw new Error(
-        `CloakBrowser failed to launch: ${detail}\n` +
-          `Run "npx cloakbrowser install" to fetch the patched Chromium binary, ` +
-          `or set browser.allowFallbackBrowser=true to run on stock Chromium.`,
+        `CloakBrowser failed to launch: ${detail}\n\n` +
+          `Fetch the patched Chromium (about 1 GB, once):\n` +
+          `  npx cloakbrowser install\n\n` +
+          (local
+            ? `Or run on the Chrome already installed here — no download, but ` +
+              `without CloakBrowser's fingerprint patches:\n` +
+              `  set "allowFallbackBrowser": true in the "browser" section of your config\n` +
+              `  (found ${local})`
+            : `Or set browser.allowFallbackBrowser=true and browser.executablePath ` +
+              `to a Chrome or Chromium on this machine.`),
       );
     }
+    const fallbackExecutable = browserCfg.executablePath ?? findInstalledChrome();
     logger.warn(
       "browser_fallback",
-      `CloakBrowser unavailable (${detail}); falling back to stock Chromium`,
+      `CloakBrowser unavailable (${detail}); falling back to stock Chromium` +
+        (fallbackExecutable ? ` at ${fallbackExecutable}` : ""),
     );
     const { chromium } = await import("playwright-core");
     context = await chromium.launchPersistentContext(profilePath, {
       headless: browserCfg.headless,
-      ...(browserCfg.executablePath ? { executablePath: browserCfg.executablePath } : {}),
+      // playwright-core ships no browsers of its own, so without an explicit
+      // path the fallback needs one that is already here.
+      ...(fallbackExecutable ? { executablePath: fallbackExecutable } : {}),
       viewport: identity.viewport,
       colorScheme: identity.colorScheme,
       args: stabilityArgs(),
