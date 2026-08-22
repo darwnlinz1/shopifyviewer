@@ -382,7 +382,12 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       if (!outcome.failed) behavior.noteAction(decision.action);
 
       publish();
-      await navigator.actionPause();
+
+      // Two waits used to stack on a freshly loaded page: the settle pause
+      // above, and then the ordinary gap between actions — up to five seconds
+      // of a new page sitting there untouched. Arriving somewhere already *is*
+      // the pause before the first thing you do there, so only one applies.
+      if (!outcome.navigated) await navigator.actionPause();
     }
   };
 

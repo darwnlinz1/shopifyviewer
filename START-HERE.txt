@@ -54,8 +54,8 @@ Chinh hanh vi
 Mo storefront-sim.config.json:
 
   "storefront"        shop muc tieu
-  "actionPause"       khoang cach giua 2 hanh dong (mac dinh 1000-2000ms)
-  "maxActionsPerPage" tran an toan cho 1 trang (mac dinh 30 — gan nhu khong gioi han)
+  "actionPause"       khoang cach giua 2 hanh dong (mac dinh 2000-3000ms)
+  "maxActionsPerPage" so hanh dong tren 1 trang roi chuyen trang (mac dinh 8)
   "speedFactor"       chia deu moi delay (2 = nhanh gap doi)
   "session.durationMs" do dai 1 session (mac dinh 15 phut)
 

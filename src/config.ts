@@ -193,7 +193,7 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     // The gap between one action and the next. Unlike the other ranges this
     // one is honoured as a hard band (see Pacing.actionPause), because it is
     // the rhythm an operator actually watches and wants to set.
-    actionPause: { min: 1000, max: 2000 },
+    actionPause: { min: 2000, max: 3000 },
     pageSettle: { min: 700, max: 2200 },
     scrollPause: { min: 200, max: 900 },
     scrollFraction: { min: 0.25, max: 0.9 },
@@ -210,13 +210,13 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,
     /**
-      * Effectively uncapped. This is a backstop against a page that offers
-      * something to do forever, not a budget — the engine leaves a page when
-      * its options run dry or the weights favour a navigation, which is how a
-      * person leaves a page too. Capping it low made the session tour the shop
-      * instead of exploring it.
+      * Actions on one page before the session moves on.
+      *
+      * Hitting this is not a pause — the engine navigates on the very next
+      * turn, so the ceiling reads as "seen enough here, next page" rather than
+      * as the session running out of things to do and idling.
       */
-    maxActionsPerPage: 30,
+    maxActionsPerPage: 8,
     speedFactor: 1,
   },
   safety: {
