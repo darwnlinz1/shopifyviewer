@@ -208,7 +208,12 @@ export class PageNavigator {
   /** Click a link and wait for the page it leads to. */
   private async clickThrough(link: Locator, url: string): Promise<NavigationMetrics | null> {
     const started = Date.now();
-    const timeout = this.config.session.navigationTimeoutMs;
+    // Deliberately short, and *not* navigationTimeoutMs. A click can be
+    // swallowed — a cookie banner over the card, a theme opening a quick-view
+    // instead, an overlay eating the event — and when that happens there is
+    // nothing to wait for. Waiting the full navigation budget before falling
+    // back to goto() turned one blocked click into a minute of dead air.
+    const timeout = Math.min(12_000, this.config.session.navigationTimeoutMs);
 
     try {
       // scrollIntoViewIfNeeded and click are both patched by the human layer,
@@ -298,21 +303,25 @@ export class PageNavigator {
    */
   private async settle(): Promise<void> {
     try {
-      await this.page.waitForLoadState("load", { timeout: 15_000 });
+      await this.page.waitForLoadState("load", { timeout: 10_000 });
     } catch {
-      this.logger.debug("settle_timeout", "load state not reached in 15s", {
+      this.logger.debug("settle_timeout", "load state not reached in 10s", {
         url: this.safeUrl(),
       });
     }
     try {
-      await this.page.waitForLoadState("networkidle", { timeout: 5_000 });
+      // Shopify storefronts essentially never go idle — analytics beacons,
+      // chat widgets and lazy sections keep sockets warm — so this almost
+      // always times out. Keep the window short: it is a nice-to-have, and at
+      // five seconds it was pure tax on every single navigation.
+      await this.page.waitForLoadState("networkidle", { timeout: 1_500 });
     } catch {
       /* expected on storefronts with persistent connections */
     }
     // Give the main content region a chance to appear before observing.
     const main = this.selectors.mainContent.join(", ");
     await this.page
-      .waitForSelector(main, { timeout: 5_000, state: "attached" })
+      .waitForSelector(main, { timeout: 2_500, state: "attached" })
       .catch(() => undefined);
   }
 
@@ -411,18 +420,34 @@ export class PageNavigator {
     const pageType = await this.detectPageType();
     const url = this.safeUrl();
 
-    const [geometry, productLinks, collectionLinks, mediaCount, sectionCount, hasVariants, hasPrice, hasMain, title] =
-      await Promise.all([
-        this.readGeometry(),
-        this.collectLinks(this.selectors.productLink, "product"),
-        this.collectLinks(this.selectors.collectionLink, "collection"),
-        this.countFirstMatching(this.selectors.productMedia),
-        this.countSections(pageType),
-        this.existsAny(this.selectors.variantPicker),
-        this.existsAny(this.selectors.productPrice),
-        this.existsAny(this.selectors.mainContent),
-        this.page.title().catch(() => ""),
-      ]);
+    const [geometry, productLinks, collectionLinks, counts, title] = await Promise.all([
+      this.readGeometry(),
+      this.collectLinks(this.selectors.productLink, "product"),
+      this.collectLinks(this.selectors.collectionLink, "collection"),
+      // Every concept the observation needs, in one trip into the page.
+      this.countConcepts({
+        media: this.selectors.productMedia,
+        collapsible: this.selectors.collapsibleSection,
+        content: this.selectors.contentSection,
+        variants: this.selectors.variantPicker,
+        price: this.selectors.productPrice,
+        main: this.selectors.mainContent,
+      }),
+      this.page.title().catch(() => ""),
+    ]);
+
+    const mediaCount = counts.media ?? 0;
+    // Accordions when the theme has them, content sections otherwise — and on
+    // a product page, no accordions means nothing worth counting.
+    const sectionCount =
+      (counts.collapsible ?? 0) > 0
+        ? (counts.collapsible ?? 0)
+        : pageType === "product"
+          ? 0
+          : (counts.content ?? 0);
+    const hasVariants = (counts.variants ?? 0) > 0;
+    const hasPrice = (counts.price ?? 0) > 0;
+    const hasMain = (counts.main ?? 0) > 0;
 
     const observation: PageObservation = {
       url,
@@ -510,24 +535,48 @@ export class PageNavigator {
     return [];
   }
 
-  /** Count elements for the first candidate selector that matches anything. */
-  /**
-   * Count the sections a visitor could actually open or read here: accordions
-   * on a product page, theme content sections everywhere else.
-   */
-  private async countSections(pageType: PageType): Promise<number> {
-    const collapsible = await this.countFirstMatching(this.selectors.collapsibleSection);
-    if (collapsible > 0) return collapsible;
-    if (pageType === "product") return 0;
-    return this.countFirstMatching(this.selectors.contentSection);
+  private async countFirstMatching(candidates: string[]): Promise<number> {
+    const counts = await this.countConcepts({ only: candidates });
+    return counts.only ?? 0;
   }
 
-  private async countFirstMatching(candidates: string[]): Promise<number> {
-    for (const selector of candidates) {
-      const count = await this.page.locator(selector).count().catch(() => 0);
-      if (count > 0) return count;
-    }
-    return 0;
+  /**
+   * Count several selector concepts in a single round trip.
+   *
+   * Each concept is a candidate list tried most-specific first, and the old
+   * implementation did one `locator.count()` per candidate — so a page with
+   * six concepts of nine candidates each could cost fifty round trips before
+   * the engine got to decide anything. Against a real storefront that was
+   * seconds of latency per turn, every turn. The whole sweep now happens
+   * inside the page and comes back as one object.
+   */
+  private async countConcepts(
+    concepts: Record<string, string[]>,
+  ): Promise<Record<string, number>> {
+    const empty = Object.fromEntries(Object.keys(concepts).map((key) => [key, 0]));
+    const counts = await this.page
+      .evaluate((groups: Record<string, string[]>) => {
+        const out: Record<string, number> = {};
+        for (const [name, candidates] of Object.entries(groups)) {
+          out[name] = 0;
+          for (const selector of candidates) {
+            let found = 0;
+            try {
+              found = document.querySelectorAll(selector).length;
+            } catch {
+              // A selector Playwright accepts but querySelectorAll does not.
+              continue;
+            }
+            if (found > 0) {
+              out[name] = found;
+              break;
+            }
+          }
+        }
+        return out;
+      }, concepts)
+      .catch(() => empty);
+    return counts;
   }
 
   private async existsAny(candidates: string[]): Promise<boolean> {
@@ -593,7 +642,9 @@ export class PageNavigator {
 
     // Mostly downward, with the occasional scroll back up to re-read
     // something — drawn from the seeded RNG so sessions stay reproducible.
-    let dir = direction ?? (this.rng.chance(0.15) ? "up" : "down");
+    // Real browsing is not a one-way trip down the page: people scroll back to
+    // re-read a price, check a photo again, glance at the header.
+    let dir = direction ?? (this.rng.chance(0.32) ? "up" : "down");
 
     // Asking to scroll down at the bottom of the page (or up at the top) does
     // nothing at all, which reads as the browser freezing. Turn around instead.

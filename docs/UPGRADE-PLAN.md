@@ -309,3 +309,56 @@ retuned without editing six ranges and hoping they stay in proportion. A zero
 or negative factor is ignored rather than stalling the session.
 
 **62 tests, all passing.**
+
+---
+
+## Round 4 — the minute-long gaps, and too little activity
+
+Reported from a run against the real storefront: sometimes a minute or two
+between actions, and too few actions overall.
+
+### Where the minutes went
+
+Three stalls, none of them the pacing:
+
+1. **A swallowed click cost a full navigation timeout.** `clickThrough` waited
+   `navigationTimeoutMs` (45s) for a navigation that was never going to
+   happen — a cookie banner over the card, a theme opening a quick-view, an
+   overlay eating the event — then fell back to `goto()` for another ~9s. One
+   blocked click was a minute of dead air. The click attempt is now bounded at
+   12s: if it has not navigated by then there is nothing to wait for.
+
+2. **`settle()` taxed every navigation up to 25s.** `networkidle` at 5s
+   essentially always times out on a Shopify storefront (analytics beacons,
+   chat widgets, lazy sections keep sockets warm), so it was 5 seconds of pure
+   cost per page. Now 1.5s, with `load` at 10s and the main-content wait at
+   2.5s.
+
+3. **Observation cost dozens of round trips.** Each selector concept is a
+   candidate list tried most-specific first, and each candidate was its own
+   `locator.count()`. Six concepts of up to nine candidates is up to fifty
+   round trips before the engine could decide anything — negligible locally,
+   seconds per turn against a real site. The whole sweep now runs inside the
+   page as one `evaluate`. Measured on the mock storefront: **16–23ms per
+   observation**, detecting exactly what it did before.
+
+### Too little activity
+
+`maxActionsPerPage` was 7, and listing pages got *half* of that — so a session
+glanced at a collection and left. Now 14, with listing pages at 75% of the
+ceiling rather than 50%, and minimums raised.
+
+The on-page weights were tuned for one pass: scroll decayed at 1.5 per use
+(gone after three), media capped at 2, sections at 2, variants at 1. A visitor
+does more than one pass — scrolls a grid, comes back up, opens another section,
+looks at the gallery again. Scroll now decays at 0.7, and the caps are raised.
+Scrolling back *up* went from 15% of gestures to 32%.
+
+Measured against the mock storefront, same 60-second budget:
+
+| | before | after |
+| --- | --- | --- |
+| actions | 9 | **16** |
+| average gap | 5.7s | **3.2s** |
+
+**62 tests, all passing.**

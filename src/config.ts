@@ -206,7 +206,9 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     backProbability: 0.28,
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,
-    maxActionsPerPage: 7,
+    // A visitor does a lot on one page: scrolls it, comes back up, opens a
+    // section, looks at the gallery, scrolls again. Seven was a glance.
+    maxActionsPerPage: 14,
     speedFactor: 1,
   },
   safety: {

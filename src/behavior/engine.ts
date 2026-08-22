@@ -224,10 +224,13 @@ export class BehaviorEngine {
     maxActions: number;
   } {
     const ceiling = this.behavior.maxActionsPerPage;
-    if (pageType === "product") return { minActions: 4, maxActions: ceiling };
+    if (pageType === "product") return { minActions: 5, maxActions: ceiling };
+    // Listing pages used to get half a product page's budget, which made the
+    // session look like it glanced at a collection and left. A visitor scans a
+    // grid properly — scrolls it, comes back up, looks again.
     return {
-      minActions: 2,
-      maxActions: Math.max(3, Math.ceil(ceiling / 2)),
+      minActions: 3,
+      maxActions: Math.max(5, Math.ceil(ceiling * 0.75)),
     };
   }
 
@@ -266,7 +269,9 @@ export class BehaviorEngine {
           // One trip back up is normal; after that stop offering it, so the
           // remaining actions go to the page's content instead.
           ? (scrollsDone < 1 ? 1.5 : 0)
-          : Math.max(0, 5 - scrollsDone * 1.5),
+          // Decays slowly: a visitor scrolls a listing several times, up as well
+        // as down, rather than making one pass and never touching it again.
+        : Math.max(0, 6 - scrollsDone * 0.7),
     });
 
     // Idle reading pause.
@@ -281,7 +286,7 @@ export class BehaviorEngine {
       candidates.push({
         value: "read_section",
         weight:
-          observation.sectionCount > 0 && this.countOnThisPage("read_section") < 2 ? 2 : 0,
+          observation.sectionCount > 0 && this.countOnThisPage("read_section") < 3 ? 2.5 : 0,
       });
     }
 
@@ -292,7 +297,7 @@ export class BehaviorEngine {
       });
       candidates.push({
         value: "view_media",
-        weight: observation.mediaCount > 0 && this.countOnThisPage("view_media") < 2 ? 5 : 0,
+        weight: observation.mediaCount > 0 && this.countOnThisPage("view_media") < 3 ? 5 : 0,
       });
       candidates.push({
         value: "read_section",
@@ -304,7 +309,8 @@ export class BehaviorEngine {
       });
       candidates.push({
         value: "hover_variants",
-        weight: observation.hasVariants && !this.didOnThisPage("hover_variants") ? 2.5 : 0,
+        weight:
+          observation.hasVariants && this.countOnThisPage("hover_variants") < 2 ? 3 : 0,
       });
     }
 
