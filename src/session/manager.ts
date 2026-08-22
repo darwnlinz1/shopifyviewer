@@ -547,7 +547,9 @@ async function executeDecision(
           behavior.noteFailure();
           return { navigated: false, failed: true, metrics: null };
         }
-        const metrics = await navigator.goto(decision.url);
+        // navigateTo clicks the link when the current page offers one, and
+        // only falls back to the address bar when it does not.
+        const metrics = await navigator.navigateTo(decision.url);
         behavior.noteSuccess();
         return { navigated: true, failed: false, metrics };
       }

@@ -3,126 +3,207 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Storefront Simulator — Profiles</title>
+<title>Storefront Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
 
-<header class="bar">
-  <div class="bar__title">
-    <h1>Storefront Simulator</h1>
-    <span class="bar__storefront" id="storefront"></span>
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand__mark" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="2"  y="4"  width="9" height="7"  rx="1.5"/>
+      <rect x="13" y="4"  width="9" height="7"  rx="1.5"/>
+      <rect x="2"  y="13" width="9" height="7"  rx="1.5"/>
+      <rect x="13" y="13" width="9" height="7"  rx="1.5"/>
+    </svg>
+    <div class="brand__text">
+      <span class="brand__name">Storefront Simulator</span>
+      <span class="brand__sub" id="storefront">—</span>
+    </div>
   </div>
-  <div class="bar__stats" id="fleet-stats"></div>
-  <div class="bar__actions">
-    <label class="density">
-      Tile size
-      <input type="range" id="density" min="160" max="420" step="20" value="260">
-    </label>
-    <button class="btn btn--primary" id="new-profile">New profile</button>
-    <span class="conn" id="conn" title="Live connection">●</span>
+
+  <div class="stats" id="fleet-stats"></div>
+
+  <div class="topbar__right">
+    <span class="conn" id="conn"><i></i><span id="conn-label">connecting</span></span>
+    <button class="btn btn--primary" id="new-profile">
+      <svg viewBox="0 0 16 16" class="ico"><path d="M8 3v10M3 8h10"/></svg>
+      New profile
+    </button>
   </div>
 </header>
 
+<div class="toolbar">
+  <div class="search">
+    <svg viewBox="0 0 16 16" class="ico"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
+    <input type="search" id="filter" placeholder="Filter profiles…" autocomplete="off">
+  </div>
+
+  <div class="chips" id="status-filter">
+    <button class="chip is-on" data-filter="all">All</button>
+    <button class="chip" data-filter="running">Running</button>
+    <button class="chip" data-filter="lingering">Held open</button>
+    <button class="chip" data-filter="paused">Paused</button>
+    <button class="chip" data-filter="idle">Idle</button>
+  </div>
+
+  <div class="toolbar__right">
+    <div class="bulk">
+      <button class="btn btn--sm" id="bulk-start">Start all</button>
+      <button class="btn btn--sm" id="bulk-pause">Pause all</button>
+      <button class="btn btn--sm" id="bulk-close">Close all</button>
+    </div>
+    <label class="density" title="Tile size">
+      <svg viewBox="0 0 16 16" class="ico"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
+      <input type="range" id="density" min="180" max="460" step="20" value="280">
+    </label>
+  </div>
+</div>
+
 <main>
-  <!-- Tiles are created once and updated in place. They are never re-created
-       on a state push, and they are never sorted on anything mutable, so a
-       tile keeps its position in the grid for its whole life. -->
+  <!-- Tiles are created once and patched in place. They are never re-created
+       on a state push, and never sorted on anything mutable, so a tile keeps
+       its position in the grid for its whole life. -->
   <div class="grid" id="grid"></div>
-  <p class="empty" id="empty">No profiles yet. Create one to open its browser.</p>
+
+  <div class="empty" id="empty">
+    <svg viewBox="0 0 24 24" class="empty__art" aria-hidden="true">
+      <rect x="2" y="4" width="9" height="7" rx="1.5"/>
+      <rect x="13" y="4" width="9" height="7" rx="1.5"/>
+      <rect x="2" y="13" width="9" height="7" rx="1.5"/>
+      <rect x="13" y="13" width="9" height="7" rx="1.5"/>
+    </svg>
+    <h2>No profiles yet</h2>
+    <p>Each profile is its own browser — its own cookies, proxy and fingerprint.<br>
+       Create one and it appears here with a live view.</p>
+    <button class="btn btn--primary" id="empty-create">Create the first profile</button>
+  </div>
 </main>
 
 <!-- Enlarged live view. The grid keeps streaming behind it. -->
 <div class="overlay" id="overlay" hidden>
-  <div class="overlay__panel">
-    <div class="overlay__head">
+  <div class="panel panel--wide">
+    <header class="panel__head">
+      <span class="dot" id="overlay-dot"></span>
       <strong id="overlay-name"></strong>
-      <span class="muted" id="overlay-url"></span>
-      <button class="btn btn--ghost" id="overlay-close">Close</button>
-    </div>
-    <img class="overlay__view" id="overlay-view" alt="">
+      <code class="panel__url" id="overlay-url"></code>
+      <div class="panel__actions">
+        <button class="btn btn--sm" data-overlay-act="continue">Continue</button>
+        <button class="btn btn--sm" data-overlay-act="pause">Pause</button>
+        <button class="btn btn--sm" data-overlay-act="close">Close browser</button>
+        <button class="iconbtn" id="overlay-dismiss" title="Close (Esc)">
+          <svg viewBox="0 0 16 16" class="ico"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+        </button>
+      </div>
+    </header>
+    <img class="panel__view" id="overlay-view" alt="">
   </div>
 </div>
 
 <!-- Per-profile settings: proxy and cookies. -->
 <div class="overlay" id="settings" hidden>
-  <div class="overlay__panel overlay__panel--narrow">
-    <div class="overlay__head">
+  <div class="panel">
+    <header class="panel__head">
       <strong id="settings-name"></strong>
-      <button class="btn btn--ghost" id="settings-close">Close</button>
-    </div>
+      <button class="iconbtn" id="settings-dismiss" title="Close (Esc)">
+        <svg viewBox="0 0 16 16" class="ico"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </header>
 
     <div class="form">
-      <label class="field">
-        <span>Name</span>
-        <input type="text" id="f-name" autocomplete="off">
-      </label>
+      <div class="grid2">
+        <label class="field">
+          <span>Name</span>
+          <input type="text" id="f-name" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>Session length <em>minutes</em></span>
+          <input type="number" id="f-duration" min="1" step="1" placeholder="global default">
+        </label>
+      </div>
 
-      <label class="field">
-        <span>Session length (minutes)</span>
-        <input type="number" id="f-duration" min="1" step="1" placeholder="use global default">
-      </label>
-
-      <label class="field">
+      <div class="field">
         <span>Proxy</span>
-        <input type="text" id="f-proxy" autocomplete="off"
-               placeholder="http://user:pass@host:8080  ·  or  host:port:user:pass">
-      </label>
-      <div class="row">
-        <button class="btn btn--primary" id="save-proxy">Save</button>
-        <button class="btn" id="test-proxy">Test connection</button>
-        <span class="hint" id="proxy-status"></span>
+        <input type="text" id="f-proxy" autocomplete="off" spellcheck="false"
+               placeholder="http://user:pass@host:8080   ·   host:port:user:pass">
+        <div class="row">
+          <button class="btn btn--primary btn--sm" id="save-proxy">Save</button>
+          <button class="btn btn--sm" id="test-proxy">Test connection</button>
+          <span class="hint" id="proxy-status"></span>
+        </div>
       </div>
 
       <div class="field">
         <span>Cookies</span>
         <div class="row">
-          <!-- A real file picker: the operator browses to the export they
-               already have rather than pasting JSON. -->
-          <input type="file" id="f-cookies" accept=".json,.txt,text/plain,application/json">
-          <button class="btn" id="clear-cookies">Clear</button>
+          <!-- A real file picker: browse to the export you already have
+               rather than pasting JSON. -->
+          <label class="filebtn btn btn--sm">
+            Choose file…
+            <input type="file" id="f-cookies" accept=".json,.txt,text/plain,application/json" hidden>
+          </label>
+          <button class="btn btn--sm" id="clear-cookies">Clear</button>
+          <span class="hint" id="cookie-status"></span>
         </div>
-        <span class="hint" id="cookie-status"></span>
+        <p class="note">Accepts Playwright <code>storageState</code>, EditThisCookie / Cookie-Editor
+           exports, and Netscape <code>cookies.txt</code>. Detected by content, not file name.</p>
       </div>
 
-      <p class="hint hint--block" id="settings-identity"></p>
+      <div class="identity" id="settings-identity"></div>
     </div>
   </div>
 </div>
+
+<div class="toasts" id="toasts"></div>
 
 <template id="tile-template">
   <article class="tile" data-status="idle">
     <header class="tile__head">
       <span class="dot"></span>
       <span class="tile__name"></span>
-      <span class="tile__time"></span>
+      <span class="tile__badges"></span>
     </header>
 
     <div class="tile__screen">
       <!-- Always streaming, click-free. Small and coarse by design: enough to
            see the page move, cheap enough to run a wall of them. -->
       <img class="tile__view" alt="" loading="lazy">
-      <div class="tile__placeholder">no browser open</div>
+      <div class="tile__placeholder">
+        <svg viewBox="0 0 24 24" class="ico ico--lg"><rect x="2" y="4" width="20" height="15" rx="2"/><path d="M2 8h20"/></svg>
+        <span>no browser open</span>
+      </div>
+      <span class="tile__zoom">
+        <svg viewBox="0 0 16 16" class="ico"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14M7 5v4M5 7h4"/></svg>
+      </span>
     </div>
 
+    <div class="tile__progress"><i></i></div>
+
     <div class="tile__meta">
-      <span class="tile__url"></span>
+      <code class="tile__url"></code>
       <span class="tile__action"></span>
     </div>
 
     <div class="tile__stats">
-      <span title="Pages visited"><b class="s-pages">0</b> pages</span>
-      <span title="Products viewed"><b class="s-products">0</b> prod</span>
-      <span title="Uncaught JS errors" class="s-errors-wrap"><b class="s-errors">0</b> err</span>
-      <span class="tile__badges"></span>
+      <span title="Pages visited"><b class="s-pages">0</b><em>pages</em></span>
+      <span title="Products viewed"><b class="s-products">0</b><em>prod</em></span>
+      <span title="Uncaught JS errors" class="s-errors-wrap"><b class="s-errors">0</b><em>err</em></span>
+      <span class="tile__time"></span>
     </div>
 
     <footer class="tile__actions">
       <button class="btn btn--sm btn--primary" data-act="continue">Continue</button>
       <button class="btn btn--sm" data-act="pause">Pause</button>
       <button class="btn btn--sm" data-act="close">Close</button>
-      <button class="btn btn--sm" data-act="settings" title="Proxy and cookies">⚙</button>
-      <button class="btn btn--sm btn--danger" data-act="delete" title="Delete profile">✕</button>
+      <button class="iconbtn" data-act="settings" title="Proxy and cookies">
+        <svg viewBox="0 0 16 16" class="ico"><circle cx="8" cy="8" r="2.4"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4"/></svg>
+      </button>
+      <button class="iconbtn iconbtn--danger" data-act="delete" title="Delete profile">
+        <svg viewBox="0 0 16 16" class="ico"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.7 8.5h5.6l.7-8.5"/></svg>
+      </button>
     </footer>
   </article>
 </template>

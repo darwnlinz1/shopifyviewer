@@ -147,6 +147,126 @@ export class PageNavigator {
     return this.collectMetrics(url, response?.status() ?? null, started);
   }
 
+  /**
+   * Go to `url` the way a visitor would: by clicking the link that leads there.
+   *
+   * `page.goto()` is the address bar. A person on a collection page does not
+   * type a product URL — they click the card, which fires pointer and click
+   * events on the anchor, carries a Referer, and (because click is one of the
+   * methods CloakBrowser's human layer patches) arrives via a real cursor
+   * movement rather than instantaneously.
+   *
+   * Not every destination is reachable that way: the engine sometimes returns
+   * to a collection it remembers but which the current page does not link to.
+   * Those still go through `goto()`, and the log records which path was taken
+   * so the click-through ratio is visible.
+   */
+  async navigateTo(url: string): Promise<NavigationMetrics> {
+    const link = await this.findLinkTo(url);
+    if (link) {
+      const metrics = await this.clickThrough(link, url);
+      if (metrics) return metrics;
+      this.logger.debug("click_nav_failed", "falling back to direct navigation", { url });
+    }
+    return this.goto(url);
+  }
+
+  /**
+   * Find a visible, clickable anchor pointing at `url`.
+   *
+   * Themes write hrefs inconsistently — absolute, root-relative, with tracking
+   * parameters — so matching is on the path, most-specific first.
+   */
+  private async findLinkTo(url: string): Promise<Locator | null> {
+    let path: string;
+    try {
+      path = new URL(url).pathname.replace(/\/+$/, "");
+    } catch {
+      return null;
+    }
+    if (!path) return null;
+
+    const escaped = path.replace(/["\\]/g, "\\$&");
+    const candidates = [
+      `a[href="${escaped}"]`,
+      `a[href$="${escaped}"]`,
+      `a[href*="${escaped}"]`,
+    ];
+
+    for (const selector of candidates) {
+      const locator = this.page.locator(selector).first();
+      const count = await locator.count().catch(() => 0);
+      if (count === 0) continue;
+      // An anchor scrolled off-screen or hidden behind a mega-menu cannot be
+      // clicked; better to fall back than to time out on it.
+      const visible = await locator.isVisible().catch(() => false);
+      if (visible) return locator;
+    }
+    return null;
+  }
+
+  /** Click a link and wait for the page it leads to. */
+  private async clickThrough(link: Locator, url: string): Promise<NavigationMetrics | null> {
+    const started = Date.now();
+    const timeout = this.config.session.navigationTimeoutMs;
+
+    try {
+      // scrollIntoViewIfNeeded and click are both patched by the human layer,
+      // so this is where the mouse actually travels to the card.
+      await link.scrollIntoViewIfNeeded({ timeout: 5_000 });
+      // People look at a thing before they click it.
+      await sleep(this.rng.int(140, 520));
+
+      const responsePromise = this.page
+        .waitForResponse(
+          (response) =>
+            response.request().isNavigationRequest() &&
+            response.request().frame() === this.page.mainFrame(),
+          { timeout },
+        )
+        .catch(() => null);
+
+      const navigationPromise = this.page
+        .waitForURL(() => true, { timeout, waitUntil: "domcontentloaded" })
+        .catch(() => undefined);
+
+      await link.click({ timeout: 8_000 });
+      const [response] = await Promise.all([responsePromise, navigationPromise]);
+
+      // The click may have gone somewhere else entirely — a theme intercepting
+      // it, a quick-view modal, an overlay swallowing the event. Only treat it
+      // as success if we actually arrived.
+      const landed = this.safeUrl();
+      if (!this.samePath(landed, url)) {
+        this.logger.debug("click_nav_diverted", `expected ${url}, landed on ${landed}`);
+        return null;
+      }
+
+      await this.settle();
+      // The cursor moved to the link on the page we just left.
+      this.cursor = null;
+      const metrics = await this.collectMetrics(landed, response?.status() ?? null, started);
+      this.logger.debug("click_nav", "navigated by clicking the link", { url: landed });
+      return metrics;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Whether two URLs point at the same path, ignoring query and hash. */
+  private samePath(a: string, b: string): boolean {
+    try {
+      const left = new URL(a);
+      const right = new URL(b);
+      return (
+        left.host === right.host &&
+        left.pathname.replace(/\/+$/, "") === right.pathname.replace(/\/+$/, "")
+      );
+    } catch {
+      return false;
+    }
+  }
+
   /** Browser Back. Returns null when there is no history entry to go back to. */
   async back(): Promise<NavigationMetrics | null> {
     const started = Date.now();
@@ -464,44 +584,45 @@ export class PageNavigator {
    */
   async scroll(direction?: "down" | "up"): Promise<number> {
     const behavior = this.config.behavior;
-    // Mostly downward, with the occasional scroll back up to re-read
-    // something — drawn from the seeded RNG so sessions stay reproducible.
-    const dir = direction ?? (this.rng.chance(0.15) ? "up" : "down");
-    const steps = this.rng.range(behavior.scrollSteps);
-
-    // A wheel event goes to whatever sits under the pointer. A cursor that has
-    // never moved is at (0, 0) — over the header, or over nothing — so put it
-    // somewhere in the content first.
     await this.ensureCursor();
 
     const viewportHeight =
       this.geometry.viewportHeight || this.page.viewportSize()?.height || 900;
     const maxScroll = Math.max(0, this.geometry.scrollHeight - viewportHeight);
     let position = this.geometry.scrollY;
+
+    // Mostly downward, with the occasional scroll back up to re-read
+    // something — drawn from the seeded RNG so sessions stay reproducible.
+    let dir = direction ?? (this.rng.chance(0.15) ? "up" : "down");
+
+    // Asking to scroll down at the bottom of the page (or up at the top) does
+    // nothing at all, which reads as the browser freezing. Turn around instead.
+    if (!direction && maxScroll > 0) {
+      if (dir === "down" && position >= maxScroll - 8) dir = "up";
+      else if (dir === "up" && position <= 8) dir = "down";
+    }
+
+    const steps = this.rng.range(behavior.scrollSteps);
     let travelled = 0;
 
     for (let i = 0; i < steps; i++) {
       const fraction = this.rng.rangeFloat(behavior.scrollFraction);
       const distance = Math.round(viewportHeight * fraction) * (dir === "up" ? -1 : 1);
 
-      try {
-        await this.page.mouse.wheel(0, distance);
-      } catch {
-        // A navigation mid-gesture detaches the page; the session loop will
-        // re-observe and carry on.
-        break;
-      }
+      const moved = await this.wheelBy(distance);
+      if (moved === null) break; // page went away mid-gesture
 
-      travelled += Math.abs(distance);
-      position = Math.min(maxScroll, Math.max(0, position + distance));
-      await sleep(this.pacing.scrollPause());
+      travelled += Math.abs(moved);
+      position = Math.min(maxScroll, Math.max(0, position + moved));
 
-      // Estimated rather than re-read: one `evaluate` per scroll step, several
-      // steps per gesture, hundreds of gestures per session is a lot of
-      // instrumentation for a value `observe()` refreshes on the next turn
-      // anyway.
+      // Position is estimated between observations rather than re-read: one
+      // `evaluate` per step, several steps per gesture, hundreds of gestures a
+      // session is a lot of instrumentation for a value `observe()` refreshes
+      // on the next turn anyway.
       if (dir === "down" && maxScroll > 0 && position >= maxScroll - 4) break;
       if (dir === "up" && position <= 0) break;
+
+      await sleep(this.pacing.scrollPause());
     }
 
     this.geometry.scrollY = position;
@@ -511,6 +632,74 @@ export class PageNavigator {
       data: { direction: dir, steps, travelledPx: travelled, scrollY: position },
     });
     return travelled;
+  }
+
+  /**
+   * Scroll by `distance` px using real wheel input.
+   *
+   * A wheel event carries a delta, and the browser applies all of it at once:
+   * `mouse.wheel(0, 600)` is a single 600-pixel jump, not a scroll. Nothing
+   * about that looks like a person, and on screen it reads as the page
+   * teleporting.
+   *
+   * A hand on a wheel or trackpad produces a *burst* of small deltas instead —
+   * roughly one notch each, tens of milliseconds apart, starting slowly,
+   * running fastest in the middle and easing to a stop. That is what this
+   * emits, so the motion is smooth and every pixel of it still arrives as
+   * genuine wheel input rather than a scripted viewport move.
+   *
+   * Returns the signed distance travelled, or null if the page went away.
+   */
+  private async wheelBy(distance: number): Promise<number | null> {
+    const direction = Math.sign(distance);
+    const total = Math.abs(distance);
+    if (total < 8) return 0;
+
+    // One notch of a physical wheel is around 100px; a trackpad flick is a
+    // burst of much smaller deltas. Draw somewhere in that band per gesture,
+    // so different gestures feel like different input devices.
+    const notch = this.rng.int(34, 92);
+    const ticks = Math.max(4, Math.round(total / notch));
+    let moved = 0;
+
+    for (let i = 0; i < ticks; i++) {
+      // Ease in and out across the gesture: 0 at the edges, 1 in the middle.
+      // A constant-rate scroll is the giveaway of a scripted one.
+      const ease = Math.sin(Math.PI * ((i + 0.5) / ticks));
+      const step = Math.max(
+        6,
+        Math.round(notch * (0.4 + ease) * this.rng.float(0.85, 1.15)),
+      );
+
+      try {
+        await this.page.mouse.wheel(0, step * direction);
+      } catch {
+        // A navigation mid-gesture detaches the page; the session loop will
+        // re-observe and carry on.
+        return null;
+      }
+      moved += step;
+
+      // Faster in the middle of the gesture, slower at either end — the same
+      // easing applied to the gaps rather than the deltas.
+      await sleep(Math.round(this.rng.int(9, 24) / (0.45 + ease)));
+    }
+
+    // People overshoot what they were aiming at and correct back. Doing it
+    // here rather than in the caller keeps the correction part of the same
+    // continuous gesture.
+    if (this.rng.chance(0.18)) {
+      const overshoot = this.rng.int(30, 110);
+      try {
+        await this.page.mouse.wheel(0, overshoot * direction);
+        await sleep(this.rng.int(90, 260));
+        await this.page.mouse.wheel(0, -overshoot * direction);
+      } catch {
+        return moved * direction;
+      }
+    }
+
+    return moved * direction;
   }
 
   /**
