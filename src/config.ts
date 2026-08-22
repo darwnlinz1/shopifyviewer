@@ -193,22 +193,27 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     // The gap between one action and the next. Unlike the other ranges this
     // one is honoured as a hard band (see Pacing.actionPause), because it is
     // the rhythm an operator actually watches and wants to set.
-    actionPause: { min: 2000, max: 3000 },
+    actionPause: { min: 1000, max: 2000 },
     pageSettle: { min: 700, max: 2200 },
     scrollPause: { min: 200, max: 900 },
     scrollFraction: { min: 0.25, max: 0.9 },
     // One to three gestures per scroll action. Six turned a single "scroll"
     // into five seconds, which read as the browser stuck on one page.
     scrollSteps: { min: 1, max: 3 },
-    mediaDwell: { min: 500, max: 1600 },
-    sectionDwell: { min: 800, max: 2400 },
+    mediaDwell: { min: 400, max: 1300 },
+    sectionDwell: { min: 600, max: 1800 },
     targetProducts: { min: 4, max: 9 },
     backProbability: 0.28,
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,
-    // A visitor does a lot on one page: scrolls it, comes back up, opens a
-    // section, looks at the gallery, scrolls again. Seven was a glance.
-    maxActionsPerPage: 14,
+    /**
+      * Effectively uncapped. This is a backstop against a page that offers
+      * something to do forever, not a budget — the engine leaves a page when
+      * its options run dry or the weights favour a navigation, which is how a
+      * person leaves a page too. Capping it low made the session tour the shop
+      * instead of exploring it.
+      */
+    maxActionsPerPage: 30,
     speedFactor: 1,
   },
   safety: {

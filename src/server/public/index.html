@@ -165,6 +165,9 @@
       <span class="dot"></span>
       <span class="tile__name"></span>
       <span class="tile__badges"></span>
+      <!-- Elapsed, counting up, against the session budget. In the header
+           because it is the thing an operator glances at most. -->
+      <span class="tile__clock"><b class="tile__elapsed">0:00</b><em class="tile__budget"></em></span>
     </header>
 
     <div class="tile__screen">
@@ -193,7 +196,7 @@
       <span title="Pages visited"><b class="s-pages">0</b><em>pages</em></span>
       <span title="Products viewed"><b class="s-products">0</b><em>prod</em></span>
       <span title="Uncaught JS errors" class="s-errors-wrap"><b class="s-errors">0</b><em>err</em></span>
-      <span class="tile__time"></span>
+      <span class="tile__state"></span>
     </div>
 
     <footer class="tile__actions">

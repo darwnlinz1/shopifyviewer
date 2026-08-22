@@ -224,13 +224,13 @@ export class BehaviorEngine {
     maxActions: number;
   } {
     const ceiling = this.behavior.maxActionsPerPage;
-    if (pageType === "product") return { minActions: 5, maxActions: ceiling };
+    if (pageType === "product") return { minActions: 6, maxActions: ceiling };
     // Listing pages used to get half a product page's budget, which made the
     // session look like it glanced at a collection and left. A visitor scans a
     // grid properly — scrolls it, comes back up, looks again.
     return {
-      minActions: 3,
-      maxActions: Math.max(5, Math.ceil(ceiling * 0.75)),
+      minActions: 4,
+      maxActions: Math.max(6, Math.ceil(ceiling * 0.8)),
     };
   }
 
@@ -317,9 +317,13 @@ export class BehaviorEngine {
     // Past the minimum, the pressure to move on grows with every extra action,
     // reaching certainty at the page type's ceiling.
     if (actionsHere >= minActions) {
-      let pressure = (actionsHere - minActions + 1) / (maxActions - minActions + 1);
+      // Squared, so the pull toward leaving stays weak through most of the
+      // page's budget and only becomes decisive near the ceiling. A linear
+      // ramp made the engine bail out of pages it had barely started on.
+      const linear = (actionsHere - minActions + 1) / (maxActions - minActions + 1);
+      let pressure = linear * linear;
       // Nothing left below the fold is itself a reason to move on.
-      if (atBottom) pressure = Math.min(1, pressure + 0.25);
+      if (atBottom) pressure = Math.min(1, pressure + 0.2);
       if (this.rng.chance(pressure)) return null;
     }
 

@@ -84,7 +84,9 @@ function createTile(profileId) {
 
   const refs = {
     name: el.querySelector(".tile__name"),
-    time: el.querySelector(".tile__time"),
+    elapsed: el.querySelector(".tile__elapsed"),
+    budget: el.querySelector(".tile__budget"),
+    state: el.querySelector(".tile__state"),
     view: el.querySelector(".tile__view"),
     url: el.querySelector(".tile__url"),
     action: el.querySelector(".tile__action"),
@@ -125,15 +127,21 @@ function updateTile(view) {
   setText(refs.name, profile.name);
 
   // ---- timing --------------------------------------------------------
+  // The clock counts up against the budget: "how far into this session are we"
+  // reads better at a glance than "how long until it stops".
   if (session) {
-    setText(refs.time, status === "lingering" ? "held open" : clock(session.remainingMs));
+    setText(refs.elapsed, clock(session.elapsedMs));
+    setText(refs.budget, `/${clock(session.plannedDurationMs)}`);
+    setText(refs.state, status === "lingering" ? "held open" : status);
     const pct = session.plannedDurationMs
       ? Math.min(100, (session.elapsedMs / session.plannedDurationMs) * 100)
       : 0;
     const width = `${pct.toFixed(1)}%`;
     if (refs.progress.style.width !== width) refs.progress.style.width = width;
   } else {
-    setText(refs.time, "");
+    setText(refs.elapsed, "0:00");
+    setText(refs.budget, "");
+    setText(refs.state, "idle");
     if (refs.progress.style.width !== "0%") refs.progress.style.width = "0%";
   }
 
@@ -541,6 +549,26 @@ function setConnected(live) {
   conn.dataset.live = live ? "1" : "0";
   connLabel.textContent = live ? "live" : "reconnecting";
 }
+
+// State arrives only when something happens, but a clock has to move every
+// second regardless. Ticking locally between pushes keeps it honest without
+// asking the server for state it has not changed. Elapsed is derived from the
+// server's startedAt, so a slow push cannot make the tile drift behind.
+setInterval(() => {
+  for (const view of latestState) {
+    const tile = tiles.get(view.profile.id);
+    const session = view.session;
+    if (!tile || !session) continue;
+    if (session.status !== "running" && session.status !== "starting") continue;
+
+    const elapsed = Date.now() - new Date(session.startedAt).getTime();
+    setText(tile.refs.elapsed, clock(elapsed));
+    if (session.plannedDurationMs) {
+      const pct = Math.min(100, (elapsed / session.plannedDurationMs) * 100);
+      tile.refs.progress.style.width = `${pct.toFixed(1)}%`;
+    }
+  }
+}, 1000);
 
 function connect() {
   const source = new EventSource("/api/events");

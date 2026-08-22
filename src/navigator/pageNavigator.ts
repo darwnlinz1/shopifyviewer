@@ -218,9 +218,9 @@ export class PageNavigator {
     try {
       // scrollIntoViewIfNeeded and click are both patched by the human layer,
       // so this is where the mouse actually travels to the card.
-      await link.scrollIntoViewIfNeeded({ timeout: 5_000 });
+      await link.scrollIntoViewIfNeeded({ timeout: 3_000 });
       // People look at a thing before they click it.
-      await sleep(this.rng.int(140, 520));
+      await sleep(this.rng.int(120, 380));
 
       const responsePromise = this.page
         .waitForResponse(
@@ -235,7 +235,7 @@ export class PageNavigator {
         .waitForURL(() => true, { timeout, waitUntil: "domcontentloaded" })
         .catch(() => undefined);
 
-      await link.click({ timeout: 8_000 });
+      await link.click({ timeout: 5_000 });
       const [response] = await Promise.all([responsePromise, navigationPromise]);
 
       // The click may have gone somewhere else entirely — a theme intercepting
@@ -816,7 +816,7 @@ export class PageNavigator {
       return 0;
     }
 
-    await gallery.first().scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+    await gallery.first().scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
     await this.idle(this.pacing.mediaDwell());
     let viewed = 1;
 
@@ -830,7 +830,7 @@ export class PageNavigator {
         const thumb = thumbs.nth(i);
         const visible = await thumb.isVisible().catch(() => false);
         if (!visible) continue;
-        await thumb.click({ timeout: 4_000 }).catch(() => undefined);
+        await thumb.click({ timeout: 2_500 }).catch(() => undefined);
         await this.idle(this.pacing.mediaDwell());
         viewed++;
       }
@@ -856,10 +856,10 @@ export class PageNavigator {
       if (total > 0) {
         const index = this.rng.int(0, total - 1);
         const section = sections.nth(index);
-        await section.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+        await section.scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
         const summary = section.locator("summary").first();
         const target = (await summary.count().catch(() => 0)) > 0 ? summary : section;
-        await target.click({ timeout: 4_000 }).catch(() => undefined);
+        await target.click({ timeout: 2_500 }).catch(() => undefined);
         // Time the read against the section that was actually opened, not a
         // fixed range: a shipping blurb and an ingredient list are not the
         // same amount of reading.
@@ -877,7 +877,7 @@ export class PageNavigator {
     const description = await this.firstMatchingLocator(this.selectors.productDescription);
     if (description) {
       const block = description.first();
-      await block.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+      await block.scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
       const readMs = await this.readingTimeFor(block);
       await this.idle(readMs);
       this.logger.info("read_section", "read description block", {
@@ -895,7 +895,7 @@ export class PageNavigator {
       if (total > 0) {
         const index = this.rng.int(0, total - 1);
         const block = content.nth(index);
-        await block.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => undefined);
+        await block.scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
         const readMs = await this.readingTimeFor(block);
         await this.idle(readMs);
         this.logger.info("read_section", `viewed content section #${index + 1}/${total}`, {
@@ -962,7 +962,7 @@ export class PageNavigator {
       const option = options.nth(this.rng.int(0, total - 1));
       const visible = await option.isVisible().catch(() => false);
       if (!visible) continue;
-      await option.hover({ timeout: 3_000 }).catch(() => undefined);
+      await option.hover({ timeout: 2_000 }).catch(() => undefined);
       // A hover moves the real cursor, so keep our idea of where it is honest.
       this.cursor = null;
       await sleep(this.rng.int(400, 1400));
