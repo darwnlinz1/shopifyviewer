@@ -46,7 +46,9 @@ const ACTION_COST_MS: Record<ActionKind, number> = {
   exit: 0,
 };
 
-/** What the engine remembers across the session. */
+/**
+ * Session pacing state for the behaviour engine.
+ */
 export interface SessionMemory {
   visitedUrls: Set<string>;
   visitedProducts: Set<string>;
@@ -67,6 +69,16 @@ export class BehaviorEngine {
   state: BehaviorState = "START";
   readonly memory: SessionMemory;
   private readonly behavior: BehaviorConfig;
+  /** When the current page was arrived on; drives the time-based page budget. */
+  private pageEnteredAt = Date.now();
+  /**
+   * How long to keep working the current page before navigating on. Drawn per
+   * page from `pageEngagementMs` — 30–45s by default — and deliberately
+   * *not* an action count: an action count let a page go visibly idle once
+   * its interesting actions were exhausted (at the bottom of a listing there
+   * was nothing left but dwell), which read as the browser hanging.
+   */
+  private pageBudgetMs = 0;
 
   constructor(
     private readonly config: SimulatorConfig,
@@ -129,6 +141,13 @@ export class BehaviorEngine {
   /** Called by the session manager when the page changed. */
   resetPageActions(): void {
     this.memory.pageActions = [];
+    this.pageEnteredAt = Date.now();
+    this.pageBudgetMs = this.rng.range(this.behavior.pageEngagementMs);
+  }
+
+  /** Time already spent on the current page, in ms. */
+  private timeOnPage(): number {
+    return Date.now() - this.pageEnteredAt;
   }
 
   /** Record that an action completed, for weighting later decisions. */
@@ -238,15 +257,18 @@ export class BehaviorEngine {
    * description, accordions, variants — so it earns a longer look. A listing
    * page is mostly a means of getting to one, so the engine moves on sooner.
    */
+  /**
+   * How long to keep working the current page, by type.
+   *
+   * Retained only for the session summary; the live decision now uses the
+   * per-page time budget drawn in `resetPageActions`.
+   */
   private engagementBudget(pageType: PageType): {
     minActions: number;
     maxActions: number;
   } {
     const ceiling = this.behavior.maxActionsPerPage;
     if (pageType === "product") return { minActions: 6, maxActions: ceiling };
-    // Listing pages used to get half a product page's budget, which made the
-    // session look like it glanced at a collection and left. A visitor scans a
-    // grid properly — scrolls it, comes back up, looks again.
     return {
       minActions: 4,
       maxActions: Math.max(6, Math.ceil(ceiling * 0.8)),
@@ -254,24 +276,28 @@ export class BehaviorEngine {
   }
 
   /**
-   * Weighted choice among things worth doing on *this* page. Returns null when
-   * the page is exhausted (or we've lingered long enough) and it is time to
-   * navigate.
+   * Weighted choice among things worth doing on *this* page. Returns null
+   * only when the page's TIME budget is spent — never because the action
+   * list ran dry. While time remains the engine always finds something: a
+   * page at the bottom of its scroll offers scrolling back up, re-inspection,
+   * another look at media. A visitor does not freeze mid-page.
    */
   private chooseOnPageAction(
     observation: PageObservation,
     timer: SessionTimer,
   ): Decision | null {
+    // Time on page decides when to move on; the 30–45s band keeps every page
+    // visibly alive for at least that long.
+    if (this.timeOnPage() >= this.pageBudgetMs) return null;
     const actionsHere = this.memory.pageActions.length;
-    const { minActions, maxActions } = this.engagementBudget(observation.pageType);
-    if (actionsHere >= maxActions) return null;
 
     const canScroll = observation.scrollHeight > observation.viewportHeight * 1.2;
     const scrollsDone = this.countOnThisPage("scroll");
 
-    // Already at the foot of the page. Scrolling again is either a no-op or a
-    // trip back up, and a visitor who has reached the bottom of a listing
-    // reads something or moves on — they do not keep dragging at the end stop.
+    // Already at the foot of the page: scrolling down again would be a no-op,
+    // but scrolling back UP is exactly what a visitor does next — re-reading
+    // what they passed. The old rule zeroed scrolling here entirely, which
+    // stranded the session at the bottom doing nothing.
     const atBottom =
       observation.scrollHeight > 0 &&
       observation.scrollY + observation.viewportHeight >= observation.scrollHeight - 8;
@@ -279,36 +305,33 @@ export class BehaviorEngine {
     const candidates: Array<{ value: ActionKind; weight: number }> = [];
 
     // Scrolling is the universal browsing gesture; it also triggers the lazy
-    // loading most Shopify collection templates rely on. Base weight 3.5 (was
-    // 6): at 6 it dominated the first action on nearly every page, so a fresh
-    // page visibly lurched downward before anything else happened. A visitor
-    // often reads the top of the page first.
+    // loading most Shopify collection templates rely on.
     candidates.push({
       value: "scroll",
       weight: !canScroll
         ? 0
         : atBottom
-          // One trip back up is normal; after that stop offering it, so the
-          // remaining actions go to the page's content instead.
-          ? (scrollsDone < 1 ? 1.5 : 0)
-          // Never reaches zero: a long listing can be scrolled all afternoon.
-        : this.fading("scroll", 3.5, 0.35),
+          // At the bottom, prefer heading back up; keep offering it so the
+          // page never runs out of motion while its budget lasts.
+          ? (scrollsDone < 2 ? 3 : 1)
+        : this.fading("scroll", 4, 0.25),
     });
 
-    // Idle reading pause. This decays too — without it every page would keep
-    // one non-zero option forever and the engine could only ever leave by
-    // hitting its ceiling, never by running out of things to do.
+    // Idle reading pause. Weighted low and decaying fast: it exists so pauses
+    // occur naturally between gestures, not as something the engine settles
+    // into when other options thin out.
     candidates.push({
       value: "dwell",
-      weight: this.fading("dwell", this.rng.chance(this.behavior.idleProbability) ? 1.5 : 0.4, 1.1),
+      weight: this.fading("dwell", 0.6, 0.9),
     });
 
     // Home and collection pages have sections worth looking at too (hero,
     // featured collections, testimonials) — not just product accordions.
+    // These are repeatable looks at DIFFERENT sections, so decay slowly.
     if (observation.pageType !== "product") {
       candidates.push({
         value: "read_section",
-        weight: observation.sectionCount > 0 ? this.fading("read_section", 2.5, 0.7) : 0,
+        weight: observation.sectionCount > 0 ? this.fading("read_section", 3, 0.35) : 0,
       });
     }
 
@@ -317,44 +340,35 @@ export class BehaviorEngine {
         value: "inspect_details",
         // Re-reading the price and title is one of the most ordinary things a
         // shopper does; once per page was never right.
-        weight: this.fading("inspect_details", 6, 1.2),
+        weight: this.fading("inspect_details", 5, 0.5),
       });
       candidates.push({
         value: "view_media",
-        weight: observation.mediaCount > 0 ? this.fading("view_media", 5, 0.8) : 0,
+        weight: observation.mediaCount > 0 ? this.fading("view_media", 4.5, 0.45) : 0,
       });
       candidates.push({
         value: "read_section",
-        weight: observation.sectionCount > 0 ? this.fading("read_section", 4, 0.6) : 0,
+        weight: observation.sectionCount > 0 ? this.fading("read_section", 4, 0.45) : 0,
       });
       candidates.push({
         value: "hover_variants",
-        weight: observation.hasVariants ? this.fading("hover_variants", 3, 0.9) : 0,
+        weight: observation.hasVariants ? this.fading("hover_variants", 3, 0.7) : 0,
       });
-    }
-
-    // Past the minimum, the pressure to move on grows with every extra action,
-    // reaching certainty at the page type's ceiling.
-    if (actionsHere >= minActions) {
-      // Squared, so the pull toward leaving stays weak through most of the
-      // page's budget and only becomes decisive near the ceiling. A linear
-      // ramp made the engine bail out of pages it had barely started on.
-      const linear = (actionsHere - minActions + 1) / (maxActions - minActions + 1);
-      let pressure = linear * linear;
-      // Nothing left below the fold is itself a reason to move on.
-      if (atBottom) pressure = Math.min(1, pressure + 0.2);
-      if (this.rng.chance(pressure)) return null;
     }
 
     const affordable = candidates.filter(
       (c) => c.weight > 0 && timer.hasRoomFor(ACTION_COST_MS[c.value]),
     );
     const chosen = this.rng.weighted(affordable);
-    if (!chosen) return null;
+    if (!chosen) {
+      // Every candidate filtered out (e.g. session nearly over). Rather than
+      // freezing, say the page is done — the navigation path takes over.
+      return null;
+    }
 
     return {
       action: chosen,
-      reason: `on-page (${observation.pageType}, ${actionsHere} action(s) here)`,
+      reason: `on-page (${observation.pageType}, ${actionsHere} action(s) here, ${Math.round(this.timeOnPage() / 1000)}s/${Math.round(this.pageBudgetMs / 1000)}s)`,
       nextState: this.state,
     };
   }

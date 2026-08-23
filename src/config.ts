@@ -107,7 +107,20 @@ export interface BehaviorConfig {
   returnToCollectionProbability: number;
   /** Probability of an idle "reading" pause between actions. */
   idleProbability: number;
-  /** Max consecutive actions on one page before the engine forces a move. */
+  /**
+   * How long the engine keeps working one page before navigating on.
+   *
+   * Drawn per page, so different pages get different looks. Time-based rather
+   * than action-count-based on purpose: with a count ceiling, a page whose
+   * interesting actions were exhausted early went visibly idle for its
+   * remaining budget — at the bottom of a listing there was nothing left but
+   * dwell — which read as the browser hanging.
+   */
+  pageEngagementMs: Range;
+  /**
+   * Legacy per-page action cap, kept so existing config files still parse.
+   * No longer consulted by the engine; `pageEngagementMs` governs instead.
+   */
   maxActionsPerPage: number;
   /**
    * Global pace multiplier applied to every delay.
@@ -213,12 +226,13 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     backProbability: 0.28,
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,
+    // Every page gets a fresh 30–45s of continuous activity before the
+    // engine navigates on — scrolling, opening sections, looking at media,
+    // re-reading details. The page never sits still inside its window.
+    pageEngagementMs: { min: 30_000, max: 45_000 },
     /**
-      * Actions on one page before the session moves on.
-      *
-      * Hitting this is not a pause — the engine navigates on the very next
-      * turn, so the ceiling reads as "seen enough here, next page" rather than
-      * as the session running out of things to do and idling.
+      * Legacy: no longer consulted by the engine (see pageEngagementMs).
+      * Kept only so older config files continue to load.
       */
     maxActionsPerPage: 8,
     speedFactor: 1,
