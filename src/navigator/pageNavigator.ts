@@ -815,6 +815,30 @@ export class PageNavigator {
       await sleep(this.pacing.scrollPause());
     }
 
+    // Reached the foot of the page mid-gesture: glide back up instead of
+    // ending the action parked at the bottom. A visitor who hits the end of a
+    // listing drifts back up through what they passed — they do not sit at the
+    // last stop. The upward pass uses the same eased wheel input, so it is
+    // motion the page can observe like any other scroll.
+    if (
+      !direction &&
+      dir === "down" &&
+      maxScroll > 0 &&
+      position >= maxScroll - 4 &&
+      this.rng.chance(0.75)
+    ) {
+      const backTarget = maxScroll * this.rng.rangeFloat({ min: 0.25, max: 0.6 });
+      const backDistance = Math.round(backTarget - position);
+      if (backDistance < -viewportHeight * 0.2) {
+        await sleep(this.rng.int(400, 900)); // beat at the bottom before turning
+        const returned = await this.wheelBy(backDistance);
+        if (returned !== null) {
+          travelled += Math.abs(returned);
+          position = Math.max(0, position + returned);
+        }
+      }
+    }
+
     this.geometry.scrollY = position;
 
     this.logger.info("scroll", `${dir} ~${travelled}px in ${steps} steps`, {
