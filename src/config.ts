@@ -195,8 +195,12 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     // the rhythm an operator actually watches and wants to set.
     actionPause: { min: 2000, max: 3000 },
     pageSettle: { min: 700, max: 2200 },
-    scrollPause: { min: 200, max: 900 },
-    scrollFraction: { min: 0.25, max: 0.9 },
+    scrollPause: { min: 350, max: 1100 },
+    // One gesture now covers at most about half a screen per step. The old
+    // 0.9 ceiling meant a single three-step action could sweep nearly three
+    // viewports, which on screen read as the page being dragged to the bottom
+    // in one motion rather than skimmed.
+    scrollFraction: { min: 0.25, max: 0.55 },
     // One to three gestures per scroll action. Six turned a single "scroll"
     // into five seconds, which read as the browser stuck on one page.
     scrollSteps: { min: 1, max: 3 },

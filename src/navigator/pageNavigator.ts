@@ -871,8 +871,10 @@ export class PageNavigator {
       moved += step;
 
       // Faster in the middle of the gesture, slower at either end — the same
-      // easing applied to the gaps rather than the deltas.
-      await sleep(Math.round(this.rng.int(9, 24) / (0.45 + ease)));
+      // easing applied to the gaps rather than the deltas. The floor was
+      // raised from 9ms: at 9–16ms mid-gesture the wheel ticks blurred into
+      // one visible lurch instead of a hand rolling the wheel.
+      await sleep(Math.round(this.rng.int(16, 34) / (0.45 + ease)));
     }
 
     // People overshoot what they were aiming at and correct back. Doing it

@@ -279,7 +279,10 @@ export class BehaviorEngine {
     const candidates: Array<{ value: ActionKind; weight: number }> = [];
 
     // Scrolling is the universal browsing gesture; it also triggers the lazy
-    // loading most Shopify collection templates rely on.
+    // loading most Shopify collection templates rely on. Base weight 3.5 (was
+    // 6): at 6 it dominated the first action on nearly every page, so a fresh
+    // page visibly lurched downward before anything else happened. A visitor
+    // often reads the top of the page first.
     candidates.push({
       value: "scroll",
       weight: !canScroll
@@ -289,7 +292,7 @@ export class BehaviorEngine {
           // remaining actions go to the page's content instead.
           ? (scrollsDone < 1 ? 1.5 : 0)
           // Never reaches zero: a long listing can be scrolled all afternoon.
-        : this.fading("scroll", 6, 0.35),
+        : this.fading("scroll", 3.5, 0.35),
     });
 
     // Idle reading pause. This decays too — without it every page would keep
