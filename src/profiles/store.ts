@@ -45,6 +45,8 @@ export interface UpdateProfileInput {
   durationMinutes?: number | null;
   timezone?: string;
   locale?: string;
+  /** Per-profile storefront URL; null/empty clears back to the global one. */
+  storefront?: string | null;
   notes?: string;
 }
 
@@ -184,6 +186,27 @@ export class ProfileStore {
     }
     if (patch.notes !== undefined) profile.notes = patch.notes;
     if (patch.headed !== undefined) profile.headed = patch.headed;
+
+    if (patch.storefront !== undefined) {
+      const url = typeof patch.storefront === "string" ? patch.storefront.trim() : "";
+      if (!url) {
+        // Empty string / null clears the override — back to the global shop.
+        delete profile.storefront;
+      } else {
+        let parsed: URL;
+        try {
+          parsed = new URL(url.includes("://") ? url : `https://${url}`);
+        } catch {
+          throw new Error(`Invalid storefront URL: ${url}`);
+        }
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+          throw new Error(`Storefront must be an http(s) URL: ${url}`);
+        }
+        // Normalised without trailing slash, matching how the global
+        // storefront is stored.
+        profile.storefront = parsed.toString().replace(/\/+$/, "");
+      }
+    }
 
     this.write();
     return profile;

@@ -19,8 +19,11 @@ import { buildSelectors, type SelectorSet } from "./selectors.js";
 import type {
   DiscoveredLink,
   NavigationMetrics,
+  PageAudit,
+  PageCondition,
   PageObservation,
   PageType,
+  SessionBlocker,
 } from "../types.js";
 
 /** Maps Shopify's own analytics pageType values onto our PageType. */
@@ -45,6 +48,11 @@ export class PageNavigator {
   private jsErrors = 0;
   private consoleErrors = 0;
   private failedRequests = 0;
+  /** A redirect/history traversal that crossed the session safety boundary. */
+  private blocker: SessionBlocker | null = null;
+  /** URLs that have already received their deterministic QA check. */
+  private readonly auditedPages = new Set<string>();
+  private qaFailedPages = 0;
 
   /**
    * Last geometry read by `observe()`. Scroll gestures estimate their position
@@ -129,15 +137,46 @@ export class PageNavigator {
     };
   }
 
+  get safetyBlocker(): SessionBlocker | null {
+    return this.blocker;
+  }
+
+  get qaCounts(): { checkedPages: number; failedPages: number } {
+    return { checkedPages: this.auditedPages.size, failedPages: this.qaFailedPages };
+  }
+
+  /**
+   * Verify the location after every navigation and again before every decision.
+   * Checking only the URL requested by the engine is insufficient: redirects,
+   * SPA code and browser history can all land on a blocked route afterwards.
+   */
+  ensureSafeCurrentLocation(): void {
+    const url = this.safeUrl();
+    if (url === "about:blank" || this.isAllowed(url)) return;
+    if (!this.blocker) {
+      this.blocker = {
+        kind: "safety",
+        message: "browser landed outside the read-only safety boundary",
+        url,
+      };
+      this.logger.error("safety_blocked", this.blocker.message, { url });
+    }
+    throw new Error(`Safety boundary crossed: ${url}`);
+  }
+
   /** Navigate to a URL and wait for the page to be genuinely usable. */
-  async goto(url: string): Promise<NavigationMetrics> {
+  async goto(url: string, budgetMs?: number): Promise<NavigationMetrics> {
     const started = Date.now();
     let response: Response | null = null;
     try {
       response = await this.page.goto(url, {
         waitUntil: "domcontentloaded",
-        timeout: this.config.session.navigationTimeoutMs,
+        // A caller-supplied budget (the click-fallback path) keeps one bad
+        // destination from eating the whole navigation allowance.
+        timeout: Math.min(budgetMs ?? this.config.session.navigationTimeoutMs,
+          this.config.session.navigationTimeoutMs),
       });
+      this.ensureSafeCurrentLocation();
       await this.settle();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -165,10 +204,18 @@ export class PageNavigator {
     const link = await this.findLinkTo(url);
     if (link) {
       const metrics = await this.clickThrough(link, url);
+      if (this.blocker) throw new Error(`Safety boundary crossed: ${this.blocker.url}`);
       if (metrics) return metrics;
       this.logger.debug("click_nav_failed", "falling back to direct navigation", { url });
     }
-    return this.goto(url);
+    // The click already spent up to ~15s of the destination's patience; the
+    // fallback gets a bounded slice of the navigation budget rather than the
+    // whole allowance, so one unreachable product costs seconds, not a minute.
+    const fallbackBudget = Math.min(
+      15_000,
+      this.config.session.navigationTimeoutMs,
+    );
+    return this.goto(url, fallbackBudget);
   }
 
   /**
@@ -247,6 +294,7 @@ export class PageNavigator {
         return null;
       }
 
+      this.ensureSafeCurrentLocation();
       await this.settle();
       // The cursor moved to the link on the page we just left.
       this.cursor = null;
@@ -280,6 +328,7 @@ export class PageNavigator {
       timeout: this.config.session.navigationTimeoutMs,
     });
     if (!response) return null;
+    this.ensureSafeCurrentLocation();
     await this.settle();
     return this.collectMetrics(this.safeUrl(), response.status(), started);
   }
@@ -292,6 +341,7 @@ export class PageNavigator {
       timeout: this.config.session.navigationTimeoutMs,
     });
     if (!response) return null;
+    this.ensureSafeCurrentLocation();
     await this.settle();
     return this.collectMetrics(this.safeUrl(), response.status(), started);
   }
@@ -299,24 +349,29 @@ export class PageNavigator {
   /**
    * Wait for the page to stop working. `networkidle` is unreliable on Shopify
    * (analytics beacons, chat widgets and lazy sections keep sockets warm), so
-   * we wait for `load` and then give the theme a bounded settle window.
+   * we wait for `load` with a bounded window and then confirm the main
+   * content region exists.
+   *
+   * The old version stacked three fixed waits here: `load` up to 10s, then a
+   * `networkidle` probe that on Shopify *always* ran to its timeout, then a
+   * selector wait. That was 3-6 seconds of dead air bolted onto every single
+   * navigation, which the operator read as "slow page transitions". The
+   * engine's own `pageSettle` pause already provides the human beat after
+   * arrival, so settle() only needs to answer one question: is the document
+   * ready to be observed?
    */
   private async settle(): Promise<void> {
+    // Themes that never finish loading (a hung analytics beacon is enough)
+    // must not tax every transition with the full window. DOMContentLoaded —
+    // which `goto()` already waits for — means the document is parseable;
+    // `load` adds images and deferred scripts, worth having but not worth a
+    // 10s ceiling.
     try {
-      await this.page.waitForLoadState("load", { timeout: 10_000 });
+      await this.page.waitForLoadState("load", { timeout: 4_000 });
     } catch {
-      this.logger.debug("settle_timeout", "load state not reached in 10s", {
+      this.logger.debug("settle_timeout", "load state not reached in 4s", {
         url: this.safeUrl(),
       });
-    }
-    try {
-      // Shopify storefronts essentially never go idle — analytics beacons,
-      // chat widgets and lazy sections keep sockets warm — so this almost
-      // always times out. Keep the window short: it is a nice-to-have, and at
-      // five seconds it was pure tax on every single navigation.
-      await this.page.waitForLoadState("networkidle", { timeout: 1_500 });
-    } catch {
-      /* expected on storefronts with persistent connections */
     }
     // Give the main content region a chance to appear before observing.
     const main = this.selectors.mainContent.join(", ");
@@ -448,6 +503,7 @@ export class PageNavigator {
     const hasVariants = (counts.variants ?? 0) > 0;
     const hasPrice = (counts.price ?? 0) > 0;
     const hasMain = (counts.main ?? 0) > 0;
+    const condition = await this.detectPageCondition({ pageType, hasMain });
 
     const observation: PageObservation = {
       url,
@@ -463,6 +519,8 @@ export class PageNavigator {
       hasVariants,
       hasPrice,
       hasMainContent: hasMain,
+      condition: condition.kind,
+      ...(condition.detail ? { conditionDetail: condition.detail } : {}),
     };
 
     this.geometry = geometry;
@@ -479,6 +537,87 @@ export class PageNavigator {
       },
     });
     return observation;
+  }
+
+  /**
+   * Identify pages whose measurements would be misleading. This deliberately
+   * stops at classification; it never attempts to solve a challenge, dismiss a
+   * consent wall, or authenticate. The operator sees why the session paused.
+   */
+  private async detectPageCondition(
+    context: { pageType: PageType; hasMain: boolean },
+  ): Promise<{ kind: PageCondition; detail?: string }> {
+    const path = (() => {
+      try { return new URL(this.safeUrl()).pathname.toLowerCase(); } catch { return ""; }
+    })();
+    const signal = await this.page.evaluate(() => {
+      const text = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 12000).toLowerCase();
+      const dialogs = Array.from(document.querySelectorAll<HTMLElement>("[role='dialog'], dialog, .modal, .popup"));
+      const consentDialog = dialogs.some((node) => /cookie|consent|privacy/.test(node.innerText ?? ""));
+      const overflowLocked = getComputedStyle(document.body).overflow === "hidden" ||
+        getComputedStyle(document.documentElement).overflow === "hidden";
+      return { text, consentDialog, overflowLocked, bodyLength: text.length };
+    }).catch(() => ({ text: "", consentDialog: false, overflowLocked: false, bodyLength: 0 }));
+
+    if (/verify you are human|checking your browser|security check|captcha|cf-chl|just a moment/.test(signal.text)) {
+      return { kind: "challenge", detail: "anti-bot or verification interstitial" };
+    }
+    if (/not available in (your )?(country|region)|cannot ship to your location|outside (your )?(country|region)/.test(signal.text)) {
+      return { kind: "geo_blocked", detail: "regional availability message" };
+    }
+    if (/under maintenance|temporarily unavailable|we'll be back soon|we will be back soon|opening soon/.test(signal.text)) {
+      return { kind: "maintenance", detail: "maintenance or coming-soon page" };
+    }
+    if (path.includes("/account/login") || path.includes("/customer/authentication") ||
+        (context.pageType === "unknown" && /sign in to your account|customer login/.test(signal.text))) {
+      return { kind: "login_required", detail: "login page" };
+    }
+    if (signal.consentDialog && signal.overflowLocked) {
+      return { kind: "consent_wall", detail: "cookie consent dialog blocks the document" };
+    }
+    if (!context.hasMain && signal.bodyLength < 80) {
+      return { kind: "empty_shell", detail: "no recognisable main content" };
+    }
+    return { kind: "storefront" };
+  }
+
+  /**
+   * Run exactly once for each page URL. Behaviour remains variable, but core
+   * QA coverage (a usable main region, product title/price/description, and a
+   * collection grid) is guaranteed instead of depending on weighted actions.
+   */
+  async auditPage(observation: PageObservation): Promise<PageAudit> {
+    const key = this.normaliseUrl(observation.url) ?? observation.url;
+    if (this.auditedPages.has(key)) {
+      return { checked: false, pageType: observation.pageType, issues: [] };
+    }
+    this.auditedPages.add(key);
+
+    const issues: string[] = [];
+    if (!observation.hasMainContent) issues.push("main_content_missing");
+    if (observation.pageType === "collection" && observation.productLinks.length === 0) {
+      issues.push("product_grid_empty");
+    }
+    if (observation.pageType === "product") {
+      const [title, hasDescription] = await Promise.all([
+        this.firstText(this.selectors.productTitle),
+        this.existsAny(this.selectors.productDescription),
+      ]);
+      if (!title) issues.push("product_title_missing");
+      if (!observation.hasPrice) issues.push("product_price_missing");
+      if (!hasDescription) issues.push("product_description_missing");
+    }
+
+    if (issues.length > 0) {
+      this.qaFailedPages++;
+      this.logger.warn("page_assertion_failed", issues.join(", "), {
+        url: observation.url,
+        data: { pageType: observation.pageType, issues },
+      });
+    } else {
+      this.logger.debug("page_assertion_passed", observation.pageType, { url: observation.url });
+    }
+    return { checked: true, pageType: observation.pageType, issues };
   }
 
   private async readGeometry(): Promise<{

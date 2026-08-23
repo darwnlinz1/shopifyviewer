@@ -416,7 +416,10 @@ export class BehaviorEngine {
               why: `collection → product "${product.text || product.url}"`,
               next: "PRODUCT",
             },
-            weight: needsProducts ? 10 : 5,
+            // Meeting the product target softens the pull (6 vs 10) but never
+            // removes it: a visitor who has "seen enough" still clicks cards
+            // on a listing — they just stop hunting for unseen ones.
+            weight: needsProducts ? 10 : 6,
           });
         }
         const otherCollection = this.pickLink(unvisitedCollections, observation.collectionLinks);
@@ -449,7 +452,12 @@ export class BehaviorEngine {
               why: `product → related product "${related.text || related.url}"`,
               next: "PRODUCT",
             },
-            weight: needsProducts ? 7 : 3,
+            // After the target is met this stays the strongest single option:
+            // hopping related-product → related-product is what a shopper who
+            // is "just looking" actually does. Dropping it to 3 used to hand
+            // the turn to Back (0.28 × 10 ≈ 3) half the time, which read as
+            // the session bouncing off every PDP instead of continuing.
+            weight: needsProducts ? 7 : 5,
           });
         }
         options.push({

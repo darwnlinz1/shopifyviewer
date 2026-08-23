@@ -16,6 +16,30 @@ export type PageType =
   | "not_found"
   | "unknown";
 
+/** A page that is not a usable storefront document for a synthetic QA visit. */
+export type PageCondition =
+  | "storefront"
+  | "challenge"
+  | "consent_wall"
+  | "maintenance"
+  | "login_required"
+  | "geo_blocked"
+  | "empty_shell";
+
+/** Result of the deterministic, once-per-page QA check. */
+export interface PageAudit {
+  checked: boolean;
+  pageType: PageType;
+  issues: string[];
+}
+
+/** Why the session deliberately stopped interacting with the page. */
+export interface SessionBlocker {
+  kind: "safety" | Exclude<PageCondition, "storefront">;
+  message: string;
+  url: string;
+}
+
 /** States of the behaviour state machine. */
 export type BehaviorState =
   | "START"
@@ -89,6 +113,10 @@ export interface PageObservation {
   hasPrice: boolean;
   /** Whether the page rendered a recognisable main content region. */
   hasMainContent: boolean;
+  /** Whether this is safe, usable storefront content rather than an interstitial. */
+  condition: PageCondition;
+  /** Short evidence for a non-storefront condition, when available. */
+  conditionDetail?: string;
 }
 
 /** Timing and health metrics for a single navigation. */
@@ -119,7 +147,7 @@ export interface SessionResult {
   endedAt: string;
   durationMs: number;
   /** Why the session stopped. */
-  exitReason: "timer" | "engine_exit" | "error" | "aborted";
+  exitReason: "timer" | "engine_exit" | "error" | "aborted" | "blocked";
   actionsPerformed: number;
   pagesVisited: number;
   productsViewed: number;
@@ -130,5 +158,6 @@ export interface SessionResult {
   navigationErrors: number;
   /** Slowest navigation observed, for a quick performance read. */
   slowestNavigation: NavigationMetrics | null;
+  blocker?: SessionBlocker;
   error?: string;
 }

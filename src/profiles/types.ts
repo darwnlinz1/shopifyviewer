@@ -104,6 +104,15 @@ export interface Profile {
    * keeps opening that way.
    */
   headed?: boolean;
+  /**
+   * Per-profile storefront. When set, this profile browses this shop instead
+   * of the global `config.storefront` — one fleet can watch several shops at
+   * once without duplicating the deployment. Empty = follow the global
+   * setting. The host is always validated against the safety allowlist at
+   * session start, so a per-profile URL cannot widen what the browser may
+   * touch.
+   */
+  storefront?: string;
   notes?: string;
   stats: ProfileStats;
 }

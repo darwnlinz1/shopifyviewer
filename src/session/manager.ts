@@ -33,6 +33,7 @@ import type {
   Decision,
   NavigationMetrics,
   PageObservation,
+  SessionBlocker,
   SessionResult,
 } from "../types.js";
 
@@ -41,6 +42,8 @@ export type SessionStatus =
   | "starting"
   | "running"
   | "paused"
+  /** Storefront content was not safe or usable; no further interaction occurs. */
+  | "blocked"
   /** Budget spent; browser deliberately still open, nothing driving it. */
   | "lingering"
   | "stopping"
@@ -73,6 +76,10 @@ export interface SessionSnapshot {
   navigationErrors: number;
   engine: BrowserEngine;
   cookiesInjected: number;
+  qaCheckedPages: number;
+  qaFailedPages: number;
+  currentQaIssues: string[];
+  blocker?: SessionBlocker;
   error?: string;
 }
 
@@ -269,9 +276,12 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
   let slowestNavigation: NavigationMetrics | null = null;
   let exitReason: SessionResult["exitReason"] = "engine_exit";
   let errorMessage: string | undefined;
+  let blocker: SessionBlocker | undefined;
+  let currentQaIssues: string[] = [];
 
   const snapshot = (): SessionSnapshot => {
     const counts = navigator.errorCounts;
+    const qa = navigator.qaCounts;
     return {
       sessionId,
       ...(profile ? { profileId: profile.id } : {}),
@@ -296,6 +306,10 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       navigationErrors,
       engine: browser.engine,
       cookiesInjected: browser.cookiesInjected,
+      qaCheckedPages: qa.checkedPages,
+      qaFailedPages: qa.failedPages,
+      currentQaIssues,
+      ...(blocker ? { blocker } : {}),
       ...(errorMessage ? { error: errorMessage } : {}),
     };
   };
@@ -327,17 +341,59 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
         logger.warn("session_hard_timeout", "hard timeout reached");
         break;
       }
+      if (navigator.safetyBlocker) {
+        blocker = navigator.safetyBlocker;
+        exitReason = "blocked";
+        lastReason = blocker.message;
+        publish("blocked");
+        break;
+      }
 
       // Observe the live page before deciding anything. On the very first
       // turn nothing is loaded yet, so the engine runs off a placeholder and
       // the state stays START until the homepage is open.
       const first = behavior.state === "START";
+      if (!first) {
+        try {
+          navigator.ensureSafeCurrentLocation();
+        } catch {
+          blocker = navigator.safetyBlocker ?? {
+            kind: "safety",
+            message: "browser left the read-only safety boundary",
+            url: navigator.currentUrl,
+          };
+          exitReason = "blocked";
+          lastReason = blocker.message;
+          logger.error("session_blocked", blocker.message, { url: blocker.url });
+          publish("blocked");
+          break;
+        }
+      }
       const observation = first
         ? emptyObservation(config.storefront)
         : await navigator.observe();
       if (!first) lastTitle = observation.title;
 
-      if (!first) behavior.syncState(observation);
+      if (!first) {
+        if (observation.condition !== "storefront") {
+          blocker = {
+            kind: observation.condition,
+            message: observation.conditionDetail ?? `page condition: ${observation.condition}`,
+            url: observation.url,
+          };
+          exitReason = "blocked";
+          lastReason = blocker.message;
+          logger.warn("session_blocked", blocker.message, {
+            url: blocker.url,
+            data: { kind: blocker.kind },
+          });
+          publish("blocked");
+          break;
+        }
+        const audit = await navigator.auditPage(observation);
+        currentQaIssues = audit.issues;
+        behavior.syncState(observation);
+      }
       const decision = behavior.decide(observation, timer);
       lastReason = decision.reason;
 
@@ -416,7 +472,9 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
           : `budget spent — holding the browser open for ${Math.round(lingerMs / 1000)}s`,
         { url: navigator.currentUrl },
       );
-      publish("lingering");
+      // A blocked page remains visible for diagnosis, but the dashboard makes
+      // the reason explicit instead of showing the reassuring "held open".
+      publish(blocker ? "blocked" : "lingering");
       await control.waitForClose(lingerMs);
     }
 
@@ -441,6 +499,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       failedRequests: counts.failedRequests,
       navigationErrors,
       slowestNavigation,
+      ...(blocker ? { blocker } : {}),
       ...(errorMessage ? { error: errorMessage } : {}),
     };
 
@@ -637,6 +696,7 @@ function emptyObservation(storefront: string): PageObservation {
     hasVariants: false,
     hasPrice: false,
     hasMainContent: false,
+    condition: "storefront",
   };
 }
 

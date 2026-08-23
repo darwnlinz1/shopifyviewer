@@ -279,6 +279,10 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
               : {}),
             ...(typeof body.timezone === "string" ? { timezone: body.timezone } : {}),
             ...(typeof body.locale === "string" ? { locale: body.locale } : {}),
+            // null clears the override; a string sets it. Absent = untouched.
+            ...(body.storefront === null || typeof body.storefront === "string"
+              ? { storefront: body.storefront as string | null }
+              : {}),
             ...(typeof body.notes === "string" ? { notes: body.notes } : {}),
           }),
         );

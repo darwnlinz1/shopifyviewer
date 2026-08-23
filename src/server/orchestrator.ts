@@ -229,10 +229,33 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const sessionId = `${profile.ordinal}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
     let screencast: Screencast | undefined;
 
+    // A per-profile storefront overrides the global one for this session. The
+    // host must already be in the safety allowlist — an override can point at
+    // another shop the operator added to the allowlist, but can never widen
+    // what any session is allowed to touch.
+    const storefront = profile.storefront ?? this.config.storefront;
+    let storefrontHost = "";
+    try {
+      storefrontHost = new URL(storefront).host;
+    } catch {
+      throw new Error(`Profile has an invalid storefront URL: ${storefront}`);
+    }
+    if (!this.config.safety.allowedHosts.includes(storefrontHost)) {
+      throw new Error(
+        `Storefront ${storefrontHost} is not in safety.allowedHosts — ` +
+          `add it to the config before pointing a profile at it.`,
+      );
+    }
+
     // A profile marked "show on desktop" opens a real window; everything else
     // about the launch is identical.
     const config = {
       ...this.config,
+      storefront,
+      seedCollections:
+        storefront === this.config.storefront
+          ? this.config.seedCollections
+          : ["/collections/all"],
       browser: { ...this.config.browser, headless: !profile.headed },
       ...(options.remainingMs && options.remainingMs > 0
         ? {

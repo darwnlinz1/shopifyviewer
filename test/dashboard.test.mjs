@@ -129,6 +129,55 @@ test("changing the proxy clears the stale check result", async () => {
   assert.equal(orchestrator.store.require(id).proxyCheck, undefined);
 });
 
+test("sets a per-profile storefront, normalised, and clears it back to global", async () => {
+  const { body: state } = await api("/api/state");
+  const id = state[2].profile.id;
+
+  // A bare host is accepted and normalised to an https URL without a slash.
+  const saved = await api(`/api/profiles/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ storefront: "other-shop.example" }),
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.storefront, "https://other-shop.example");
+
+  // A full URL keeps its scheme and drops the trailing slash.
+  await api(`/api/profiles/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ storefront: "http://third-shop.example/" }),
+  });
+  assert.equal(orchestrator.store.require(id).storefront, "http://third-shop.example");
+
+  // Garbage is rejected without disturbing the stored value.
+  const rejected = await api(`/api/profiles/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ storefront: "not a url ???" }),
+  });
+  assert.equal(rejected.status, 500);
+  assert.match(rejected.body.error, /Invalid storefront/);
+  assert.equal(orchestrator.store.require(id).storefront, "http://third-shop.example");
+
+  // null / empty clears the override — the profile follows the global shop again.
+  await api(`/api/profiles/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ storefront: null }),
+  });
+  assert.equal(orchestrator.store.require(id).storefront, undefined);
+});
+
+test("starting a profile refuses a storefront outside the allowlist", async () => {
+  const { body: state } = await api("/api/state");
+  const id = state[2].profile.id;
+
+  orchestrator.store.update(id, { storefront: "https://stranger.example" });
+  await assert.rejects(
+    () => orchestrator.startProfile(id),
+    /not in safety\.allowedHosts/,
+  );
+  // Nothing half-started: the profile has no browser open after the refusal.
+  assert.equal(orchestrator.isRunning(id), false);
+});
+
 test("imports cookies through the endpoint the file picker posts to", async () => {
   const { body: state } = await api("/api/state");
   const id = state[1].profile.id;

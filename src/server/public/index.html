@@ -36,7 +36,19 @@
   </div>
 </header>
 
-<div class="toolbar">
+  <section class="fleet-hero" aria-label="Fleet overview">
+    <div>
+      <p class="eyebrow">LIVE QA CONTROL ROOM</p>
+      <h1>See the visit. Trust the signal.</h1>
+      <p class="fleet-hero__copy">Every profile stays in its lane: safe routes only, deterministic page checks, and explicit stops when the storefront is not actually available.</p>
+    </div>
+    <div class="fleet-hero__signal" id="fleet-signal">
+      <span class="signal-orb"></span>
+      <div><b>Awaiting fleet state</b><small>Connecting to local dashboard</small></div>
+    </div>
+  </section>
+
+  <div class="toolbar">
   <div class="search">
     <svg viewBox="0 0 16 16" class="ico"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
     <input type="search" id="filter" placeholder="Filter profiles…" autocomplete="off">
@@ -47,6 +59,7 @@
     <button class="chip" data-filter="running">Running</button>
     <button class="chip" data-filter="lingering">Held open</button>
     <button class="chip" data-filter="paused">Paused</button>
+    <button class="chip chip--attention" data-filter="blocked">Needs attention</button>
     <button class="chip" data-filter="idle">Idle</button>
   </div>
 
@@ -63,7 +76,11 @@
   </div>
 </div>
 
-<main>
+  <main>
+    <div class="section-head">
+      <div><p class="eyebrow">PROFILE WALL</p><h2>Live sessions</h2></div>
+      <p id="fleet-insight" class="section-head__hint">Profiles are pinned in creation order.</p>
+    </div>
   <!-- Tiles are created once and patched in place. They are never re-created
        on a state push, and never sorted on anything mutable, so a tile keeps
        its position in the grid for its whole life. -->
@@ -126,6 +143,15 @@
       </div>
 
       <div class="field">
+        <span>Storefront <em>per-profile site</em></span>
+        <input type="text" id="f-storefront" autocomplete="off" spellcheck="false"
+               placeholder="empty = follow the global shop">
+        <p class="note">Point this profile at its own shop. The host must already be in
+           <code>safety.allowedHosts</code>; the browser never widens its reach for a
+           profile override.</p>
+      </div>
+
+      <div class="field">
         <span>Proxy</span>
         <input type="text" id="f-proxy" autocomplete="off" spellcheck="false"
                placeholder="http://user:pass@host:8080   ·   host:port:user:pass">
@@ -148,7 +174,7 @@
           <button class="btn btn--sm" id="clear-cookies">Clear</button>
           <span class="hint" id="cookie-status"></span>
         </div>
-        <p class="note">Accepts Playwright <code>storageState</code>, EditThisCookie / Cookie-Editor
+        <p class="note">Proxy and imported-cookie changes apply on the next browser start. Accepts Playwright <code>storageState</code>, EditThisCookie / Cookie-Editor
            exports, and Netscape <code>cookies.txt</code>. Detected by content, not file name.</p>
       </div>
 
@@ -190,6 +216,11 @@
     <div class="tile__meta">
       <code class="tile__url"></code>
       <span class="tile__action"></span>
+    </div>
+
+    <div class="tile__health">
+      <span class="health-pill tile__qa">QA pending</span>
+      <span class="tile__issue"></span>
     </div>
 
     <div class="tile__stats">

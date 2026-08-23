@@ -95,6 +95,8 @@ function createTile(profileId) {
     products: el.querySelector(".s-products"),
     errors: el.querySelector(".s-errors"),
     errorsWrap: el.querySelector(".s-errors-wrap"),
+    qa: el.querySelector(".tile__qa"),
+    issue: el.querySelector(".tile__issue"),
     badges: el.querySelector(".tile__badges"),
     desktop: el.querySelector('[data-act="desktop"]'),
     continue: el.querySelector('[data-act="continue"]'),
@@ -151,7 +153,9 @@ function updateTile(view) {
   setText(
     refs.action,
     session
-      ? status === "lingering"
+      ? status === "blocked"
+        ? session.blocker?.message || "interaction stopped for review"
+        : status === "lingering"
         ? "budget spent · browser kept open"
         : session.lastReason || session.state
       : "no browser open",
@@ -164,6 +168,33 @@ function updateTile(view) {
   setText(refs.errors, String(errors));
   refs.errorsWrap.dataset.bad = errors > 0 ? "1" : "0";
 
+  // QA is deterministic: unlike browsing gestures, these checks happen once
+  // on every newly visited page. A visible pill makes coverage and failures
+  // readable without opening the event log.
+  const blocker = session?.blocker;
+  const qaIssues = session?.currentQaIssues ?? [];
+  if (blocker) {
+    setText(refs.qa, "interaction stopped");
+    refs.qa.dataset.tone = "blocked";
+    setText(refs.issue, blocker.kind.replace(/_/g, " "));
+    refs.issue.dataset.tone = "blocked";
+  } else if (qaIssues.length) {
+    setText(refs.qa, `${qaIssues.length} QA issue${qaIssues.length === 1 ? "" : "s"}`);
+    refs.qa.dataset.tone = "bad";
+    setText(refs.issue, qaIssues[0].replace(/_/g, " "));
+    refs.issue.dataset.tone = "bad";
+  } else if (session?.qaCheckedPages) {
+    setText(refs.qa, `${session.qaCheckedPages} page${session.qaCheckedPages === 1 ? "" : "s"} checked`);
+    refs.qa.dataset.tone = "ok";
+    setText(refs.issue, session.qaFailedPages ? `${session.qaFailedPages} past issue${session.qaFailedPages === 1 ? "" : "s"}` : "QA clean");
+    refs.issue.dataset.tone = session.qaFailedPages ? "bad" : "ok";
+  } else {
+    setText(refs.qa, "QA pending");
+    refs.qa.dataset.tone = "muted";
+    setText(refs.issue, "waiting for first page");
+    refs.issue.dataset.tone = "muted";
+  }
+
   // The button reflects where this profile opens, so the operator can see at
   // a glance which ones have a window on their desktop.
   refs.desktop.dataset.on = profile.headed ? "1" : "0";
@@ -172,13 +203,23 @@ function updateTile(view) {
     : "Open on the desktop (same cookies and proxy)";
 
   // ---- badges (static per profile) -------------------------------------
-  const badgeKey = `${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}`;
+  const badgeKey = `${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}${profile.storefront ? "s" : ""}`;
   if (refs.badges.dataset.key !== badgeKey) {
     refs.badges.dataset.key = badgeKey;
     refs.badges.replaceChildren();
     if (profile.proxy) refs.badges.append(badge("proxy", "proxy"));
     if (profile.cookies) refs.badges.append(badge("cookie", `${profile.cookies.count}c`));
     if (profile.headed) refs.badges.append(badge("desktop", "window"));
+    // A per-profile storefront is worth a badge: the tile's URL bar would
+    // give it away anyway, but the badge says it up front and survives
+    // periods where no browser is open.
+    if (profile.storefront) {
+      let host = profile.storefront;
+      try { host = new URL(profile.storefront).host; } catch { /* keep raw */ }
+      const siteBadge = badge("site", host);
+      siteBadge.title = `This profile browses ${profile.storefront} instead of the global shop`;
+      refs.badges.append(siteBadge);
+    }
   }
 
   // ---- the stream ------------------------------------------------------
@@ -200,7 +241,7 @@ function updateTile(view) {
 
   // ---- controls --------------------------------------------------------
   refs.continue.textContent = !session ? "Start" : status === "paused" ? "Resume" : "Continue";
-  refs.continue.disabled = status === "running" || status === "starting" || status === "stopping";
+  refs.continue.disabled = status === "running" || status === "starting" || status === "stopping" || status === "blocked";
   refs.pause.disabled = status !== "running";
   refs.close.disabled = !session || status === "stopping";
 
@@ -247,11 +288,14 @@ function render(state) {
 function renderFleet(state) {
   const count = (status) => state.filter((v) => statusOf(v) === status).length;
   const errors = state.reduce((sum, v) => sum + (v.session?.jsErrors ?? 0), 0);
+  const blocked = count("blocked");
+  const qaIssues = state.reduce((sum, v) => sum + (v.session?.qaFailedPages ?? 0), 0);
 
   const cells = [
     ["profiles", state.length, ""],
     ["running", count("running"), "ok"],
     ["held", count("lingering"), "info"],
+    ["attention", blocked + qaIssues, blocked + qaIssues ? "danger" : ""],
     ["js errors", errors, errors > 0 ? "danger" : ""],
   ];
 
@@ -259,6 +303,32 @@ function renderFleet(state) {
     .map(([label, value, tone]) =>
       `<span class="stat"${tone ? ` data-tone="${tone}"` : ""}><b>${value}</b>${label}</span>`)
     .join("");
+
+  const signal = document.getElementById("fleet-signal");
+  const signalTitle = signal.querySelector("b");
+  const signalSub = signal.querySelector("small");
+  const insight = document.getElementById("fleet-insight");
+  if (blocked) {
+    signal.dataset.tone = "danger";
+    setText(signalTitle, `${blocked} profile${blocked === 1 ? " needs" : "s need"} review`);
+    setText(signalSub, "Interaction stopped safely — inspect the live view");
+    setText(insight, `${blocked} session${blocked === 1 ? " is" : "s are"} blocked before further interaction.`);
+  } else if (qaIssues) {
+    signal.dataset.tone = "warn";
+    setText(signalTitle, `${qaIssues} QA signal${qaIssues === 1 ? "" : "s"} found`);
+    setText(signalSub, "Profiles remain live; inspect the marked tile");
+    setText(insight, `${qaIssues} page assertion${qaIssues === 1 ? " needs" : "s need"} attention.`);
+  } else if (count("running")) {
+    signal.dataset.tone = "ok";
+    setText(signalTitle, `${count("running")} profile${count("running") === 1 ? " is" : "s are"} browsing`);
+    setText(signalSub, "Safety guard and page assertions are active");
+    setText(insight, "Live view, fixed tile positions, deterministic QA coverage.");
+  } else {
+    signal.dataset.tone = "muted";
+    setText(signalTitle, "Fleet is ready");
+    setText(signalSub, "Start a profile to begin a monitored visit");
+    setText(insight, "Profiles are pinned in creation order.");
+  }
 }
 
 // ================================================================= actions
@@ -390,6 +460,7 @@ function openSettings(profileId) {
   settingsFor = profileId;
 
   document.getElementById("f-name").value = view.profile.name;
+  document.getElementById("f-storefront").value = view.profile.storefront || "";
   document.getElementById("f-proxy").value = view.profile.proxy || "";
   document.getElementById("f-duration").value = view.profile.durationMinutes ?? "";
   proxyStatus.textContent = "";
@@ -438,6 +509,7 @@ document.getElementById("save-proxy").addEventListener("click", async () => {
       method: "PATCH",
       body: JSON.stringify({
         name: document.getElementById("f-name").value,
+        storefront: document.getElementById("f-storefront").value.trim() || null,
         proxy: document.getElementById("f-proxy").value,
         durationMinutes: duration ? Number(duration) : null,
       }),
