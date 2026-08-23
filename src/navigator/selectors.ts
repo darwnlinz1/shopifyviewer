@@ -49,11 +49,18 @@ export const SHOPIFY_SELECTORS: SelectorSet = {
     ".card-wrapper a[href*='/products/']",
     ".grid__item a[href*='/products/']",
     // Common third-party themes
+    // (aiju-cosmetique.fr and other themes built on .product-card__link)
+    "a.product-card__link[href*='/products/']",
+    ".product-grid__item a[href*='/products/']",
     ".product-item a[href*='/products/']",
     ".product-card a[href*='/products/']",
     ".product-grid-item a[href*='/products/']",
     "[data-product-card] a[href*='/products/']",
-    // Fallback: any product link in the document
+    // Fallback: any product link in the document, skipping announcement bars,
+    // headers and footers — those carry promo links to products that would
+    // otherwise dominate the pool and pull the session out of the grid.
+    "main a[href*='/products/']",
+    "#MainContent a[href*='/products/']",
     "a[href*='/products/']",
   ],
 
