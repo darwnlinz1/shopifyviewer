@@ -1,8 +1,8 @@
-/**
+﻿/**
  * Configuration schema, defaults, and loading for the simulator.
  *
  * Config resolution order (later wins):
- *   defaults  →  config file (--config / storefront-sim.config.json)  →  CLI flags
+ *   defaults  â†’  config file (--config / storefront-sim.config.json)  â†’  CLI flags
  */
 import { readFileSync, existsSync } from "node:fs";
 import type { SelectorSet } from "./navigator/selectors.js";
@@ -21,7 +21,7 @@ export interface BrowserConfig {
   profileDir: string;
   /**
    * Reuse the same profile directory across runs so cookies, localStorage and
-   * cache persist — the point of persistent profiles.
+   * cache persist â€” the point of persistent profiles.
    */
   persistProfiles: boolean;
   /** Proxy URLs; session N uses proxies[N % proxies.length]. Empty = direct. */
@@ -73,7 +73,7 @@ export interface SessionConfig {
   /**
    * How long to hold the browser open after the budget is spent.
    *
-   *   0   close immediately — the right default for scripted runs
+   *   0   close immediately â€” the right default for scripted runs
    *  -1   hold until the operator closes it
    *  >0   hold for this many ms
    *
@@ -103,7 +103,7 @@ export interface BehaviorConfig {
   targetProducts: Range;
   /** Probability of using browser Back rather than a fresh link. */
   backProbability: number;
-  /** Probability of returning to a collection instead of jumping product→product. */
+  /** Probability of returning to a collection instead of jumping productâ†’product. */
   returnToCollectionProbability: number;
   /** Probability of an idle "reading" pause between actions. */
   idleProbability: number;
@@ -113,8 +113,8 @@ export interface BehaviorConfig {
    * Drawn per page, so different pages get different looks. Time-based rather
    * than action-count-based on purpose: with a count ceiling, a page whose
    * interesting actions were exhausted early went visibly idle for its
-   * remaining budget — at the bottom of a listing there was nothing left but
-   * dwell — which read as the browser hanging.
+   * remaining budget â€” at the bottom of a listing there was nothing left but
+   * dwell â€” which read as the browser hanging.
    */
   pageEngagementMs: Range;
   /**
@@ -126,7 +126,7 @@ export interface BehaviorConfig {
    * Global pace multiplier applied to every delay.
    *
    * The ranges above describe an unhurried visitor. Raising this divides them
-   * all at once — 2 is about twice as brisk — which is easier to reason about
+   * all at once â€” 2 is about twice as brisk â€” which is easier to reason about
    * than editing six ranges and hoping they stay in proportion.
    */
   speedFactor: number;
@@ -206,8 +206,8 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     // The gap between one action and the next. Unlike the other ranges this
     // one is honoured as a hard band (see Pacing.actionPause), because it is
     // the rhythm an operator actually watches and wants to set.
-    actionPause: { min: 2000, max: 3000 },
-    pageSettle: { min: 700, max: 2200 },
+    actionPause: { min: 1200, max: 2200 },
+    pageSettle: { min: 400, max: 1200 },
     scrollPause: { min: 350, max: 1100 },
     // One gesture now covers at most about half a screen per step. The old
     // 0.9 ceiling meant a single three-step action could sweep nearly three
@@ -217,17 +217,17 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     // One to three gestures per scroll action. Six turned a single "scroll"
     // into five seconds, which read as the browser stuck on one page.
     scrollSteps: { min: 1, max: 3 },
-    mediaDwell: { min: 400, max: 1300 },
-    sectionDwell: { min: 600, max: 1800 },
+    mediaDwell: { min: 300, max: 800 },
+    sectionDwell: { min: 400, max: 1000 },
     // How many products before the engine stops actively seeking new ones.
-    // Not a stopping point — the session keeps browsing either way; it just
+    // Not a stopping point â€” the session keeps browsing either way; it just
     // stops steering so hard toward unseen products.
     targetProducts: { min: 8, max: 20 },
     backProbability: 0.28,
     returnToCollectionProbability: 0.35,
     idleProbability: 0.18,
-    // Every page gets a fresh 30–45s of continuous activity before the
-    // engine navigates on — scrolling, opening sections, looking at media,
+    // Every page gets a fresh 30â€“45s of continuous activity before the
+    // engine navigates on â€” scrolling, opening sections, looking at media,
     // re-reading details. The page never sits still inside its window.
     pageEngagementMs: { min: 30_000, max: 45_000 },
     /**
@@ -288,6 +288,20 @@ function finalise(config: SimulatorConfig): SimulatorConfig {
     config.safety.allowedHosts.length > 0
       ? config.safety.allowedHosts
       : [host, host.startsWith("www.") ? host.slice(4) : `www.${host}`];
+  // The session's own storefront is always allowed, whatever the allowlist
+  // says: a per-profile override must be able to browse the shop it was
+  // pointed at without a config edit.
+  for (const extra of [storefront]) {
+    let h: string;
+    try {
+      h = new URL(extra).host;
+    } catch {
+      continue;
+    }
+    if (!allowedHosts.includes(h)) allowedHosts.push(h);
+    const bare = h.startsWith("www.") ? h.slice(4) : `www.${h}`;
+    if (!allowedHosts.includes(bare)) allowedHosts.push(bare);
+  }
 
   if (config.session.concurrency < 1) config.session.concurrency = 1;
   if (config.session.count < 1) config.session.count = 1;
@@ -326,3 +340,39 @@ export function loadConfig(
   }
   return finalise(config);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// AI-DRIVEN CONFIG (v2)
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Default AI configuration for element detection. */
+export interface AiConfig {
+  cookiesDir: string;
+  claudeBaseUrl?: string;
+  model?: string;
+  maxHtmlChars: number;
+  maxRetries: number;
+  advanceActionTimeMs: number;
+  detectionCooldownMs: number;
+}
+
+export const DEFAULT_AI_CONFIG: AiConfig = {
+  cookiesDir: "./Cookies",
+  maxHtmlChars: 40000,
+  maxRetries: 3,
+  advanceActionTimeMs: 10 * 60 * 1000,  // 10 minutes
+  detectionCooldownMs: 500,               // 500ms between AI calls
+};
+
+/** Extended config with AI layer support. */
+export interface AiDrivenConfig extends SimulatorConfig {
+  /** AI detection layer configuration */
+  ai: AiConfig;
+}
+
+/** Default AI-driven config. */
+export const DEFAULT_AI_DRIVEN_CONFIG: AiDrivenConfig = {
+  ...DEFAULT_CONFIG,
+  ai: DEFAULT_AI_CONFIG,
+};

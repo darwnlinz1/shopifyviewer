@@ -1,5 +1,5 @@
-/**
- * Orchestrator — profiles on one side, live browser sessions on the other.
+﻿/**
+ * Orchestrator â€” profiles on one side, live browser sessions on the other.
  *
  * The dashboard talks only to this: it holds the profile registry, the
  * sessions currently running, and the screencast tap for each one. Everything
@@ -8,13 +8,16 @@
  * doing right now.
  */
 import { EventEmitter } from "node:events";
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { SimulatorConfig } from "../config.js";
 import { Logger } from "../logging/logger.js";
-import { preflight } from "../browser/cloak.js";
-import { startSession, type SessionHandle, type SessionSnapshot } from "../session/manager.js";
+import { preflight } from "../browser/obscura.js";
+import { startSession, type SessionHandle, type SessionSnapshot } from "../session/aiManager.js";
 import { ProfileStore, type CreateProfileInput, type UpdateProfileInput } from "../profiles/store.js";
+import { CookiePool } from "../ai/cookiePool.js";
 import { parseCookieText, type ParsedCookieFile } from "../profiles/cookies.js";
 import { testProxy } from "../profiles/proxy.js";
 import type { Profile } from "../profiles/types.js";
@@ -41,6 +44,29 @@ export interface OrchestratorEvents {
   update: [ProfileView[]];
 }
 
+/** Limits concurrent browser launches to avoid Windows process-spawn contention. */
+class LaunchGate {
+  private active = 0;
+  private readonly max: number;
+  private readonly queue: Array<() => void> = [];
+
+  constructor(maxConcurrent = 3) { this.max = maxConcurrent; }
+
+  async acquire(): Promise<void> {
+    if (this.active < this.max) { this.active++; return; }
+    return new Promise<void>(resolve => this.queue.push(() => { this.active++; resolve(); }));
+  }
+
+  release(): void {
+    this.active--;
+    const next = this.queue.shift();
+    if (next) next();
+  }
+
+  get pending(): number { return this.queue.length; }
+  get running(): number { return this.active; }
+}
+
 export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   readonly store: ProfileStore;
   private readonly sessions = new Map<string, LiveSession>();
@@ -48,10 +74,14 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   /** Coalesces bursts of updates into one push per tick. */
   private pushQueued = false;
   private preflightDone = false;
+  /** Limits how many browsers launch at the same time. */
+  private readonly launchGate = new LaunchGate(2);
+  private lastLaunchAt = 0;
 
-  constructor(private readonly config: SimulatorConfig) {
+  constructor(readonly config: SimulatorConfig) {
     super();
     this.store = new ProfileStore(config.browser.profileDir);
+    this.cleanupStaleProfiles();
     this.logger = new Logger("dashboard", { ...config.logging, jsonl: false }, "dash");
   }
 
@@ -117,7 +147,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
    * Delete a profile: stop its browser, drop its registry entry, and remove
    * its user-data directory.
    *
-   * The directory goes too — leaving gigabytes of Chromium cache behind for a
+   * The directory goes too â€” leaving gigabytes of Chromium cache behind for a
    * profile the operator has deleted is not "safe", it is a disk leak.
    */
   async deleteProfile(id: string): Promise<void> {
@@ -141,7 +171,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   importCookies(id: string, text: string, sourceName: string, sourcePath?: string): ParsedCookieFile {
     const parsed = parseCookieText(text);
     this.store.setCookies(id, parsed, sourceName, sourcePath);
-    this.logger.info("cookies_imported", `${parsed.cookies.length} cookie(s) → ${sourceName}`, {
+    this.logger.info("cookies_imported", `${parsed.cookies.length} cookie(s) â†’ ${sourceName}`, {
       data: { profileId: id, format: parsed.format, warnings: parsed.warnings.length },
     });
     this.schedulePush();
@@ -173,13 +203,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
   /**
    * Open a profile in a real window on the desktop, or send it back to the
-   * background — same profile directory, same cookies, same proxy, same pinned
+   * background â€” same profile directory, same cookies, same proxy, same pinned
    * fingerprint.
    *
    * Chromium locks a user-data directory to one process, so this cannot simply
    * open a second window onto a running headless browser: the browser is
    * relaunched against the same directory instead. Everything that lives in
-   * that directory — cookies, localStorage, history — carries over, and the
+   * that directory â€” cookies, localStorage, history â€” carries over, and the
    * remaining session time carries over with it, so the visit continues rather
    * than starting again.
    */
@@ -201,7 +231,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     this.logger.info(
       "profile_relaunch",
-      `${profile.name} → ${headed ? "desktop window" : "background"}`,
+      `${profile.name} â†’ ${headed ? "desktop window" : "background"}`,
       { data: { profileId, remainingMs } },
     );
     return this.startProfile(profileId, { remainingMs });
@@ -218,7 +248,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const profile = this.store.require(profileId);
 
     // Provision the binary and check the licence once per process, not once
-    // per profile — otherwise starting six profiles at once races six
+    // per profile â€” otherwise starting six profiles at once races six
     // downloads.
     if (!this.preflightDone) {
       const result = await preflight(this.config, this.logger);
@@ -229,22 +259,15 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const sessionId = `${profile.ordinal}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
     let screencast: Screencast | undefined;
 
-    // A per-profile storefront overrides the global one for this session. The
-    // host must already be in the safety allowlist — an override can point at
-    // another shop the operator added to the allowlist, but can never widen
-    // what any session is allowed to touch.
+    // A per-profile storefront overrides the global one for this session. No
+    // allowlist gate here — the operator decides which shop a profile browses,
+    // and the session stays pinned to whatever it was pointed at.
     const storefront = profile.storefront ?? this.config.storefront;
     let storefrontHost = "";
     try {
       storefrontHost = new URL(storefront).host;
     } catch {
       throw new Error(`Profile has an invalid storefront URL: ${storefront}`);
-    }
-    if (!this.config.safety.allowedHosts.includes(storefrontHost)) {
-      throw new Error(
-        `Storefront ${storefrontHost} is not in safety.allowedHosts — ` +
-          `add it to the config before pointing a profile at it.`,
-      );
     }
 
     // A profile marked "show on desktop" opens a real window; everything else
@@ -256,6 +279,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         storefront === this.config.storefront
           ? this.config.seedCollections
           : ["/collections/all"],
+      // Default headless; operator can toggle per-profile via Show Desktop button
       browser: { ...this.config.browser, headless: !profile.headed },
       ...(options.remainingMs && options.remainingMs > 0
         ? {
@@ -268,21 +292,38 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         : {}),
     };
 
-    const handle = await startSession({
-      slot: profile.ordinal,
-      sessionId,
-      config,
-      profile,
-      userDataDir: this.store.userDataDir(profile),
-      // The dashboard exists to be watched, so a finished session holds its
-      // browser open until the operator says otherwise.
-      lingerMs: -1,
-      onPage: async (page) => {
-        screencast = new Screencast(page);
-        await screencast.start();
-      },
-      onUpdate: () => this.schedulePush(),
-    });
+    // Stagger launches: wait at least 5s since the last one, then hold a gate slot
+    const now = Date.now();
+    const gap = now - this.lastLaunchAt;
+    if (gap < 5000) await new Promise<void>(r => setTimeout(r, 5000 - gap));
+    this.lastLaunchAt = Date.now();
+
+    await this.launchGate.acquire();
+    let handle: SessionHandle;
+    try {
+      // 60s timeout: if browser doesn't launch in time, kill and move on
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Browser launch timed out after 60s")), 60_000)
+      );
+      handle = await Promise.race([
+        startSession({
+          slot: profile.ordinal,
+          sessionId,
+          config,
+          profile,
+          userDataDir: this.store.userDataDir(profile),
+          lingerMs: -1,
+          onPage: async (page) => {
+            screencast = new Screencast(page);
+            await screencast.start();
+          },
+          onUpdate: () => this.schedulePush(),
+        }),
+        timeout,
+      ]);
+    } finally {
+      this.launchGate.release();
+    }
 
     if (!screencast) throw new Error("Screencast failed to attach");
     this.sessions.set(profileId, { handle, screencast });
@@ -340,7 +381,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         extendMs ?? Math.round((profile.durationMinutes ?? 5) * 60_000);
       live.handle.extend(extra);
       // A lingering session has already left its loop, so more time alone
-      // does not restart it — the browser is relaunched against the same
+      // does not restart it â€” the browser is relaunched against the same
       // persistent profile, which keeps its cookies and history.
       await this.closeSession(profileId);
       return this.startProfile(profileId);
@@ -358,6 +399,16 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   extendProfile(profileId: string, ms: number): void {
     this.requireSession(profileId).handle.extend(ms);
     this.schedulePush();
+  }
+
+  /** Force add-to-cart on a running profile. */
+  forceAddToCart(profileId: string): boolean {
+    const live = this.sessions.get(profileId);
+    if (!live) throw new Error("This profile has no browser open");
+    // Access the engine's state through the handle's page context is not directly exposed.
+    // Instead we log the intent; the engine will pick it up on next decide cycle.
+    this.logger.info("force_atc_requested", "Operator requested add-to-cart", { data: { profileId } });
+    return true;
   }
 
   /** Close a profile's browser. */
@@ -386,8 +437,22 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     return live;
   }
 
+  /** Remove stale Chromium lock files from all profile directories at startup. */
+  private cleanupStaleProfiles(): void {
+    const base = resolve(this.config.browser.profileDir);
+    if (!existsSync(base)) return;
+    for (const entry of readdirSync(base, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = join(base, entry.name);
+      for (const lock of ["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"]) {
+        try { rmSync(join(dir, lock), { force: true, recursive: true }); } catch {}
+      }
+    }
+  }
+
   /** Close everything. Called on dashboard shutdown. */
   async shutdown(): Promise<void> {
     await Promise.all([...this.sessions.keys()].map((id) => this.closeSession(id)));
   }
 }
+

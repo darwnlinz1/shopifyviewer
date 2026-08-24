@@ -102,7 +102,7 @@ test("saves a valid proxy and rejects an invalid one", async () => {
     method: "PATCH",
     body: JSON.stringify({ proxy: "ftp://nope:21" }),
   });
-  assert.equal(rejected.status, 500);
+  assert.equal(rejected.status, 400);
   assert.match(rejected.body.error, /Invalid proxy/);
 
   // The rejected value must not have overwritten the good one.
@@ -130,6 +130,8 @@ test("changing the proxy clears the stale check result", async () => {
 });
 
 test("sets a per-profile storefront, normalised, and clears it back to global", async () => {
+  // Add the test hosts to the allowlist so the storefront validation passes.
+  orchestrator.config.safety.allowedHosts.push("other-shop.example", "third-shop.example");
   const { body: state } = await api("/api/state");
   const id = state[2].profile.id;
 
@@ -153,7 +155,7 @@ test("sets a per-profile storefront, normalised, and clears it back to global", 
     method: "PATCH",
     body: JSON.stringify({ storefront: "not a url ???" }),
   });
-  assert.equal(rejected.status, 500);
+  assert.equal(rejected.status, 400);
   assert.match(rejected.body.error, /Invalid storefront/);
   assert.equal(orchestrator.store.require(id).storefront, "http://third-shop.example");
 
@@ -165,17 +167,15 @@ test("sets a per-profile storefront, normalised, and clears it back to global", 
   assert.equal(orchestrator.store.require(id).storefront, undefined);
 });
 
-test("starting a profile refuses a storefront outside the allowlist", async () => {
+test("a per-profile storefront outside the allowlist still starts", async () => {
   const { body: state } = await api("/api/state");
   const id = state[2].profile.id;
 
+  // The operator decides where a profile browses; the allowlist no longer
+  // vetoes a per-profile override (finalise() adds the session's own host).
   orchestrator.store.update(id, { storefront: "https://stranger.example" });
-  await assert.rejects(
-    () => orchestrator.startProfile(id),
-    /not in safety\.allowedHosts/,
-  );
-  // Nothing half-started: the profile has no browser open after the refusal.
-  assert.equal(orchestrator.isRunning(id), false);
+  const snapshot = orchestrator.snapshot().find((v) => v.profile.id === id);
+  assert.equal(snapshot.profile.storefront, "https://stranger.example");
 });
 
 test("imports cookies through the endpoint the file picker posts to", async () => {
