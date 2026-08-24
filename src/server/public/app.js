@@ -18,6 +18,7 @@ const template = document.getElementById("tile-template");
 const conn = document.getElementById("conn");
 const connLabel = document.getElementById("conn-label");
 const toasts = document.getElementById("toasts");
+const offlineBanner = document.getElementById("offline-banner");
 
 /** profileId → { el, refs, streamKey } */
 const tiles = new Map();
@@ -27,6 +28,123 @@ let settingsFor = null;
 let overlayFor = null;
 let statusFilter = "all";
 let textFilter = "";
+
+
+// ── Multiplexed screen stream: ONE connection for ALL tiles ──
+let muxActive = false;
+let muxController = null;
+
+async function startMultiplexStream() {
+  if (muxActive) return;
+  muxActive = true;
+  try {
+    const resp = await fetch("/api/screens.mjpg");
+    if (!resp.ok || !resp.body) { muxActive = false; return; }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    
+    while (muxActive) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      buffer += decoder.decode(value, { stream: true });
+      
+      // Parse multipart parts with X-Profile-Id headers
+      while (true) {
+        const headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd === -1) break;
+        
+        const header = buffer.slice(0, headerEnd);
+        const profileMatch = header.match(/X-Profile-Id:\s*(.+?)\r?\n/);
+        const lengthMatch = header.match(/Content-Length:\s*(\d+)/);
+        if (!profileMatch || !lengthMatch) {
+          // Skip malformed part
+          const nextBoundary = buffer.indexOf("--multiprofile", headerEnd);
+          if (nextBoundary === -1) break;
+          buffer = buffer.slice(nextBoundary);
+          continue;
+        }
+        
+        const contentLength = parseInt(lengthMatch[1]);
+        const dataStart = headerEnd + 4;
+        const dataEnd = dataStart + contentLength;
+        
+        // Check if we have enough data
+        if (buffer.length < dataEnd + 2) break;
+        
+        // Extract JPEG bytes
+        const jpegData = buffer.slice(dataStart, dataEnd);
+        updateTileFrame(profileMatch[1], jpegData);
+        
+        // Move past this part
+        buffer = buffer.slice(dataEnd + 2);
+      }
+    }
+  } catch (e) {
+    // Connection dropped, reconnect after delay
+    setTimeout(() => { muxActive = false; startMultiplexStream(); }, 2000);
+  }
+}
+
+function updateTileFrame(profileId, uint8Array) {
+  const tile = document.querySelector(`[data-profile-id="${profileId}"] .tile__view`);
+  if (!tile || !tile.isConnected) return;
+  
+  // Create blob URL from binary data
+  const blob = new Blob([uint8Array], { type: "image/jpeg" });
+  const url = URL.createObjectURL(blob);
+  
+  // Revoke old URL to prevent memory leaks
+  if (tile._blobUrl) URL.revokeObjectURL(tile._blobUrl);
+  tile.src = url;
+  tile._blobUrl = url;
+}
+
+// Start multiplex stream when first tile appears
+setTimeout(() => { if (document.querySelectorAll(".tile").length > 0) startMultiplexStream(); }, 1000);
+
+
+// ── IntersectionObserver: pause off-screen tile streams ──
+// With 10+ profiles, streaming all simultaneously overwhelms the browser.
+// Only visible tiles keep their MJPEG connection; off-screen ones disconnect.
+const tileObserver = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    const el = entry.target;
+    const img = el.querySelector(".tile__view");
+    if (!img) continue;
+    
+    const profileId = el.dataset.profileId;
+    const state = latestState.find(v => v.profile.id === profileId);
+    const hasSession = state?.session && state.session.status !== "finished";
+    
+    if (entry.isIntersecting) {
+      // Visible → connect stream
+      if (hasSession && !img.src) {
+        img.src = `/api/profiles/${encodeURIComponent(profileId)}/stream.mjpg?mode=thumb&s=${state.session.sessionId}`;
+        img.closest(".tile")?.classList.add("tile--live");
+      }
+      img.dataset.visible = "1";
+    } else {
+      // Off-screen → disconnect to save bandwidth
+      img.removeAttribute("src");
+      img.dataset.visible = "0";
+      el.classList.remove("tile--live");
+    }
+  }
+}, { threshold: 0.05 }); // 5% visible = considered on-screen
+
+
+/** Prevent duplicate API calls from double-clicks. */
+const _debouncePending = new Set();
+async function debouncedRun(profileId, action) {
+  const key = profileId + ":" + action;
+  if (_debouncePending.has(key)) return;
+  _debouncePending.add(key);
+  try { await runAction(profileId, action); }
+  finally { _debouncePending.delete(key); }
+}
+
 
 // ================================================================= helpers
 
@@ -76,6 +194,48 @@ function statusOf(view) {
   return view.session?.status ?? "idle";
 }
 
+/**
+ * Redraw the page-load sparkline when new timings arrived. The plotted value
+ * is TTFB — the part of page load the storefront itself controls — so the
+ * line answers "is the shop getting slower?" at a glance.
+ */
+function drawSpark(tile, navigations) {
+  const { refs } = tile;
+  if (!navigations.length) {
+    if (!refs.sparkWrap.dataset.off) {
+      refs.sparkWrap.dataset.off = "1";
+      refs.sparkSvg.hidden = true;
+      refs.sparkLabel.hidden = true;
+    }
+    return;
+  }
+  delete refs.sparkWrap.dataset.off;
+
+  const key = navigations.map((m) => Math.round(m.ttfbMs ?? -1)).join(",");
+  if (refs.sparkKey === key) return;
+  refs.sparkKey = key;
+
+  const values = navigations.slice(-24).map((m) => m.ttfbMs ?? null);
+  const known = values.filter((v) => v !== null);
+  const max = Math.max(500, ...known);
+  // Onto the 100x20 viewBox; missing samples simply drop out of the line.
+  const points = values
+    .map((v, i) => {
+      if (v === null) return "";
+      const x = (i / Math.max(1, values.length - 1)) * 100;
+      const y = 18 - (v / max) * 15;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .filter(Boolean)
+    .join(" ");
+  refs.sparkLine.setAttribute("points", points);
+  refs.sparkSvg.hidden = false;
+  refs.sparkLabel.hidden = false;
+  const last = known[known.length - 1] ?? 0;
+  setText(refs.sparkLabel, `${Math.round(last)}ms`);
+  refs.sparkWrap.dataset.slow = known.some((v) => v > 2500) ? "1" : "0";
+}
+
 // =================================================================== tiles
 
 function createTile(profileId) {
@@ -98,6 +258,10 @@ function createTile(profileId) {
     qa: el.querySelector(".tile__qa"),
     issue: el.querySelector(".tile__issue"),
     badges: el.querySelector(".tile__badges"),
+    sparkWrap: el.querySelector(".tile__spark"),
+    sparkSvg: el.querySelector(".tile__spark-svg"),
+    sparkLine: el.querySelector(".tile__spark-line"),
+    sparkLabel: el.querySelector(".tile__spark-label"),
     desktop: el.querySelector('[data-act="desktop"]'),
     continue: el.querySelector('[data-act="continue"]'),
     pause: el.querySelector('[data-act="pause"]'),
@@ -108,12 +272,14 @@ function createTile(profileId) {
     const action = event.target.closest("[data-act]")?.dataset.act;
     if (action) {
       event.stopPropagation();
-      void runAction(profileId, action);
+      void debouncedRun(profileId, action);
       return;
     }
     if (event.target.closest(".tile__screen")) openViewer(profileId);
   });
 
+  // profileId already assigned above
+  tileObserver.observe(el);
   grid.append(el);
   const tile = { el, refs, streamKey: null };
   tiles.set(profileId, tile);
@@ -168,6 +334,8 @@ function updateTile(view) {
   setText(refs.errors, String(errors));
   refs.errorsWrap.dataset.bad = errors > 0 ? "1" : "0";
 
+  drawSpark(tile, session?.recentNavigations ?? []);
+
   // QA is deterministic: unlike browsing gestures, these checks happen once
   // on every newly visited page. A visible pill makes coverage and failures
   // readable without opening the event log.
@@ -203,7 +371,7 @@ function updateTile(view) {
     : "Open on the desktop (same cookies and proxy)";
 
   // ---- badges (static per profile) -------------------------------------
-  const badgeKey = `${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}${profile.storefront ? "s" : ""}`;
+  const badgeKey = `${profile.ordinal}${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}${profile.storefront ? "s" : ""}`;
   if (refs.badges.dataset.key !== badgeKey) {
     refs.badges.dataset.key = badgeKey;
     refs.badges.replaceChildren();
@@ -212,14 +380,20 @@ function updateTile(view) {
     if (profile.headed) refs.badges.append(badge("desktop", "window"));
     // A per-profile storefront is worth a badge: the tile's URL bar would
     // give it away anyway, but the badge says it up front and survives
-    // periods where no browser is open.
+    // periods where no browser is open. The bare domain without the usual
+    // marketing prefixes stays short enough to read at tile size.
     if (profile.storefront) {
       let host = profile.storefront;
       try { host = new URL(profile.storefront).host; } catch { /* keep raw */ }
+      host = host.replace(/^www\./, "").replace(/\.(com|net|org|fr|vn|io|co|shop|store)$/, "");
       const siteBadge = badge("site", host);
       siteBadge.title = `This profile browses ${profile.storefront} instead of the global shop`;
       refs.badges.append(siteBadge);
     }
+    // Ordinal badge so the operator can see position at a glance.
+    const ordBadge = badge("ordinal", `#${profile.ordinal}`);
+    ordBadge.title = `Creation order — tile position ${profile.ordinal}`;
+    refs.badges.append(ordBadge);
   }
 
   // ---- the stream ------------------------------------------------------
@@ -229,7 +403,9 @@ function updateTile(view) {
   const streamKey = session && session.status !== "finished" ? session.sessionId : null;
   if (tile.streamKey !== streamKey) {
     tile.streamKey = streamKey;
-    if (streamKey) {
+    // Only set src if tile is currently visible (IntersectionObserver manages re-connect)
+    const isVisible = refs.view.dataset.visible !== "0";
+    if (streamKey && isVisible) {
       refs.view.src =
         `/api/profiles/${encodeURIComponent(profile.id)}/stream.mjpg?mode=thumb&s=${streamKey}`;
       el.classList.add("tile--live");
@@ -305,30 +481,34 @@ function renderFleet(state) {
     .join("");
 
   const signal = document.getElementById("fleet-signal");
-  const signalTitle = signal.querySelector("b");
-  const signalSub = signal.querySelector("small");
-  const insight = document.getElementById("fleet-insight");
+  const signalTitle = document.getElementById("signal-title");
+  const signalSub = document.getElementById("signal-sub");
   if (blocked) {
     signal.dataset.tone = "danger";
     setText(signalTitle, `${blocked} profile${blocked === 1 ? " needs" : "s need"} review`);
     setText(signalSub, "Interaction stopped safely — inspect the live view");
-    setText(insight, `${blocked} session${blocked === 1 ? " is" : "s are"} blocked before further interaction.`);
   } else if (qaIssues) {
     signal.dataset.tone = "warn";
     setText(signalTitle, `${qaIssues} QA signal${qaIssues === 1 ? "" : "s"} found`);
     setText(signalSub, "Profiles remain live; inspect the marked tile");
-    setText(insight, `${qaIssues} page assertion${qaIssues === 1 ? " needs" : "s need"} attention.`);
   } else if (count("running")) {
     signal.dataset.tone = "ok";
     setText(signalTitle, `${count("running")} profile${count("running") === 1 ? " is" : "s are"} browsing`);
     setText(signalSub, "Safety guard and page assertions are active");
-    setText(insight, "Live view, fixed tile positions, deterministic QA coverage.");
   } else {
     signal.dataset.tone = "muted";
     setText(signalTitle, "Fleet is ready");
     setText(signalSub, "Start a profile to begin a monitored visit");
-    setText(insight, "Profiles are pinned in creation order.");
   }
+
+  // The tab title carries the same signal, so a dashboard parked in a
+  // background tab still announces trouble.
+  const attentionTotal = blocked + qaIssues;
+  document.title = attentionTotal
+    ? `(${attentionTotal}) Storefront Simulator`
+    : count("running")
+      ? `(${count("running")}▶) Storefront Simulator`
+      : "Storefront Simulator";
 }
 
 // ================================================================= actions
@@ -365,9 +545,14 @@ async function runAction(profileId, action) {
       const name = tiles.get(profileId)?.refs.name.textContent ?? "this profile";
       // Deleting drops the cookie jar and the whole user-data directory, so it
       // is worth one confirmation.
-      if (!confirm(`Delete ${name}?\n\nIts browser profile directory and imported cookies are removed too.`)) return;
-      await api(`/api/profiles/${profileId}`, { method: "DELETE" });
-      toast(`Deleted ${name}`);
+      confirmModal(
+        `Delete ${name}?`,
+        "Its browser profile directory and imported cookies are removed too. This cannot be undone.",
+        async () => {
+          await api(`/api/profiles/${profileId}`, { method: "DELETE" });
+          toast(`Deleted ${name}`);
+        },
+      );
     }
   } catch (err) {
     toast(err.message, "bad");
@@ -397,6 +582,22 @@ document.getElementById("bulk-pause").addEventListener("click", () =>
   bulk("pause", (v) => statusOf(v) === "running", "Paused"));
 document.getElementById("bulk-close").addEventListener("click", () =>
   bulk("close", (v) => v.session !== null, "Closed"));
+
+document.getElementById("bulk-delete").addEventListener("click", () => {
+  const targets = latestState.filter((v) => statusOf(v) === "idle").map((v) => v.profile.id);
+  if (targets.length === 0) { toast("Nothing to delete"); return; }
+  confirmModal(
+    `Delete ${targets.length} idle profile(s)?`,
+    "Their browser profile directories and imported cookies are removed too.",
+    async () => {
+      const result = await api("/api/profiles/batch-delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: targets }),
+      });
+      toast(`Deleted ${result.deleted} profile(s)`, result.failed ? "bad" : "ok");
+    },
+  );
+});
 
 // ================================================================== viewer
 
@@ -444,7 +645,7 @@ overlay.addEventListener("click", (e) => { if (e.target === overlay) closeViewer
 
 document.querySelectorAll("[data-overlay-act]").forEach((button) => {
   button.addEventListener("click", () => {
-    if (overlayFor) void runAction(overlayFor, button.dataset.overlayAct);
+    if (overlayFor) void debouncedRun(overlayFor, button.dataset.overlayAct);
   });
 });
 
@@ -579,19 +780,89 @@ document.getElementById("clear-cookies").addEventListener("click", async () => {
 
 // =================================================================== shell
 
-async function createProfile() {
-  const name = prompt("Profile name", `Profile ${latestState.length + 1}`);
-  if (name === null) return;
+// ---- create-profile modal (replaces window.prompt) ----------------------
+
+const createModal = document.getElementById("create");
+const createStatus = document.getElementById("create-status");
+
+function openCreate() {
+  document.getElementById("c-name").value = "";
+  document.getElementById("c-storefront").value = "";
+  document.getElementById("c-proxy").value = "";
+  document.getElementById("c-duration").value = "";
+  document.getElementById("c-headed").checked = false;
+  createStatus.textContent = "";
+  createStatus.removeAttribute("data-tone");
+  createModal.hidden = false;
+  document.getElementById("c-name").focus();
+}
+
+function closeCreate() {
+  createModal.hidden = true;
+}
+
+async function submitCreate() {
+  const name = document.getElementById("c-name").value.trim();
+  const storefront = document.getElementById("c-storefront").value.trim();
+  const proxy = document.getElementById("c-proxy").value.trim();
+  const duration = document.getElementById("c-duration").value;
+  const headed = document.getElementById("c-headed").checked;
+
+  createStatus.textContent = "creating…";
+  createStatus.removeAttribute("data-tone");
   try {
-    await api("/api/profiles", { method: "POST", body: JSON.stringify({ name }) });
-    toast(`Created ${name}`, "ok");
+    await api("/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        ...(name ? { name } : {}),
+        ...(storefront ? { storefront } : {}),
+        ...(proxy ? { proxy } : {}),
+        ...(duration ? { durationMinutes: Number(duration) } : {}),
+        ...(headed ? { headed: true } : {}),
+      }),
+    });
+    toast(`Created ${name || "profile"}`, "ok");
+    closeCreate();
   } catch (err) {
-    toast(err.message, "bad");
+    createStatus.textContent = err.message;
+    createStatus.dataset.tone = "bad";
   }
 }
 
-document.getElementById("new-profile").addEventListener("click", createProfile);
-document.getElementById("empty-create").addEventListener("click", createProfile);
+document.getElementById("new-profile").addEventListener("click", openCreate);
+document.getElementById("empty-create").addEventListener("click", openCreate);
+document.getElementById("create-dismiss").addEventListener("click", closeCreate);
+document.getElementById("create-cancel").addEventListener("click", closeCreate);
+createModal.addEventListener("click", (e) => { if (e.target === createModal) closeCreate(); });
+document.getElementById("create-save").addEventListener("click", () => void submitCreate());
+for (const id of ["c-name", "c-storefront", "c-proxy", "c-duration"]) {
+  document.getElementById(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); void submitCreate(); }
+  });
+}
+
+// ---- delete confirmation (replaces window.confirm) ----------------------
+
+const confirmOverlay = document.getElementById("confirm");
+
+function confirmModal(title, copy, onAccept) {
+  document.getElementById("confirm-title").textContent = title;
+  document.getElementById("confirm-copy").textContent = copy;
+  confirmOverlay.hidden = false;
+  const accept = document.getElementById("confirm-accept");
+  accept.focus();
+  accept.onclick = () => {
+    confirmOverlay.hidden = true;
+    void onAccept().catch((err) => toast(err.message, "bad"));
+  };
+}
+
+function closeConfirm() {
+  confirmOverlay.hidden = true;
+}
+
+document.getElementById("confirm-cancel").addEventListener("click", closeConfirm);
+confirmOverlay.addEventListener("click", (e) => { if (e.target === confirmOverlay) closeConfirm(); });
 
 document.getElementById("filter").addEventListener("input", (event) => {
   textFilter = event.target.value.trim().toLowerCase();
@@ -631,9 +902,30 @@ try {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    if (!overlay.hidden) closeViewer();
+    if (!confirmOverlay.hidden) closeConfirm();
+    else if (!createModal.hidden) closeCreate();
+    else if (!overlay.hidden) closeViewer();
     else if (!settings.hidden) closeSettings();
     return;
+  }
+  // While the enlarged viewer is open: arrows step between profiles in wall
+  // order, Space pauses/resumes — no reaching for the mouse.
+  if (!overlay.hidden && overlayFor) {
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      const live = latestState.filter((v) => tiles.get(v.profile.id)?.streamKey);
+      const index = live.findIndex((v) => v.profile.id === overlayFor);
+      if (index >= 0) {
+        const next = live[(index + (event.key === "ArrowRight" ? 1 : live.length - 1)) % live.length];
+        openViewer(next.profile.id);
+        event.preventDefault();
+      }
+      return;
+    }
+    if (event.key === " ") {
+      event.preventDefault();
+      void debouncedRun(overlayFor, statusOf(latestState.find((v) => v.profile.id === overlayFor) ?? {}) === "paused" ? "continue" : "pause");
+      return;
+    }
   }
   // "/" focuses the filter, unless the operator is already typing somewhere.
   if (event.key === "/" && !/^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName ?? "")) {
@@ -647,6 +939,10 @@ document.addEventListener("keydown", (event) => {
 function setConnected(live) {
   conn.dataset.live = live ? "1" : "0";
   connLabel.textContent = live ? "live" : "reconnecting";
+  // The wall keeps rendering its last state while offline, so the banner —
+  // not just the tiny dot — has to say the data is stale.
+  document.getElementById("offline-banner").hidden = Boolean(live);
+  document.body.classList.toggle("is-offline", !live);
 }
 
 // State arrives only when something happens, but a clock has to move every

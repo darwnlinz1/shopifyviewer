@@ -4,9 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Storefront Simulator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='1' y='1' width='22' height='22' rx='5' fill='%230f1420'/%3E%3Cg fill='none' stroke='%237c6cff' stroke-width='1.7'%3E%3Crect x='4.5' y='5.5' width='7' height='5.5' rx='1.2'/%3E%3Crect x='12.5' y='5.5' width='7' height='5.5' rx='1.2'/%3E%3Crect x='4.5' y='13' width='7' height='5.5' rx='1.2'/%3E%3Crect x='12.5' y='13' width='7' height='5.5' rx='1.2'/%3E%3C/g%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -36,19 +39,20 @@
   </div>
 </header>
 
-  <section class="fleet-hero" aria-label="Fleet overview">
-    <div>
-      <p class="eyebrow">LIVE QA CONTROL ROOM</p>
-      <h1>See the visit. Trust the signal.</h1>
-      <p class="fleet-hero__copy">Every profile stays in its lane: safe routes only, deterministic page checks, and explicit stops when the storefront is not actually available.</p>
-    </div>
-    <div class="fleet-hero__signal" id="fleet-signal">
-      <span class="signal-orb"></span>
-      <div><b>Awaiting fleet state</b><small>Connecting to local dashboard</small></div>
-    </div>
-  </section>
+<!-- Shown when the SSE channel drops: the wall keeps its last state, so say so. -->
+<div class="offline-banner" id="offline-banner" hidden>
+  <svg viewBox="0 0 16 16" class="ico"><path d="M8 1.5L15 14H1L8 1.5zM8 6v4M8 12.2v.1"/></svg>
+  <span><b>Connection lost</b> — showing the last known state, reconnecting…</span>
+</div>
 
-  <div class="toolbar">
+<!-- Fleet signal lives in the toolbar now: one compact strip instead of a
+     hero band that repeated marketing copy on every screen. -->
+<div class="toolbar">
+  <div class="fleet-signal" id="fleet-signal" data-tone="muted">
+    <span class="signal-orb"></span>
+    <div><b id="signal-title">Fleet is ready</b><small id="signal-sub">Connecting…</small></div>
+  </div>
+
   <div class="search">
     <svg viewBox="0 0 16 16" class="ico"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
     <input type="search" id="filter" placeholder="Filter profiles…" autocomplete="off">
@@ -68,6 +72,7 @@
       <button class="btn btn--sm" id="bulk-start">Start all</button>
       <button class="btn btn--sm" id="bulk-pause">Pause all</button>
       <button class="btn btn--sm" id="bulk-close">Close all</button>
+      <button class="btn btn--sm btn--danger" id="bulk-delete">Delete idle</button>
     </div>
     <label class="density" title="Tile size">
       <svg viewBox="0 0 16 16" class="ico"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
@@ -76,11 +81,10 @@
   </div>
 </div>
 
-  <main>
-    <div class="section-head">
-      <div><p class="eyebrow">PROFILE WALL</p><h2>Live sessions</h2></div>
-      <p id="fleet-insight" class="section-head__hint">Profiles are pinned in creation order.</p>
-    </div>
+<main>
+  <div class="section-head">
+    <div><p class="eyebrow">PROFILE WALL</p><h2>Live sessions</h2></div>
+  </div>
   <!-- Tiles are created once and patched in place. They are never re-created
        on a state push, and never sorted on anything mutable, so a tile keeps
        its position in the grid for its whole life. -->
@@ -125,7 +129,7 @@
   <div class="panel">
     <header class="panel__head">
       <strong id="settings-name"></strong>
-      <button class="iconbtn" id="settings-dismiss" title="Close (Esc)">
+      <button class="iconbtn" id="settings-dismiss" title="Close (Esc)" style="margin-left:auto">
         <svg viewBox="0 0 16 16" class="ico"><path d="M4 4l8 8M12 4l-8 8"/></svg>
       </button>
     </header>
@@ -183,6 +187,68 @@
   </div>
 </div>
 
+<!-- Create a profile. Replaces the old window.prompt() with real inputs for
+     everything a profile can be configured with at creation time. -->
+<div class="overlay" id="create" hidden>
+  <div class="panel panel--narrow">
+    <header class="panel__head">
+      <strong>New profile</strong>
+      <button class="iconbtn" id="create-dismiss" title="Close (Esc)" style="margin-left:auto">
+        <svg viewBox="0 0 16 16" class="ico"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </header>
+    <div class="form">
+      <label class="field">
+        <span>Name</span>
+        <input type="text" id="c-name" autocomplete="off" placeholder="Profile N">
+      </label>
+      <label class="field">
+        <span>Storefront <em>optional · per-profile site</em></span>
+        <input type="text" id="c-storefront" autocomplete="off" spellcheck="false"
+               placeholder="empty = follow the global shop">
+        <p class="note">Host must already be in <code>safety.allowedHosts</code>.</p>
+      </label>
+      <label class="field">
+        <span>Proxy <em>optional</em></span>
+        <input type="text" id="c-proxy" autocomplete="off" spellcheck="false"
+               placeholder="http://user:pass@host:8080">
+      </label>
+      <div class="grid2">
+        <label class="field">
+          <span>Session length <em>minutes</em></span>
+          <input type="number" id="c-duration" min="1" step="1" placeholder="global default">
+        </label>
+        <label class="field">
+          <span>&nbsp;</span>
+          <span class="checkline"><input type="checkbox" id="c-headed"> Open on desktop</span>
+        </label>
+      </div>
+      <p class="hint" id="create-status"></p>
+      <div class="row row--end">
+        <button class="btn btn--sm" id="create-cancel">Cancel</button>
+        <button class="btn btn--primary btn--sm" id="create-save">Create profile</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Destructive confirmation. Replaces window.confirm() so the ask matches
+     the rest of the dashboard instead of breaking out of it. -->
+<div class="overlay" id="confirm" hidden>
+  <div class="panel panel--narrow">
+    <header class="panel__head">
+      <strong id="confirm-title">Are you sure?</strong>
+    </header>
+    <div class="form">
+      <p class="note" id="confirm-copy" style="font-size:12px;color:var(--dim)"></p>
+      <div class="row row--end">
+        <button class="btn btn--sm" id="confirm-cancel">Cancel</button>
+        <button class="btn btn--danger btn--sm" id="confirm-accept">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <template id="tile-template">
@@ -221,6 +287,16 @@
     <div class="tile__health">
       <span class="health-pill tile__qa">QA pending</span>
       <span class="tile__issue"></span>
+    </div>
+
+    <div class="tile__spark">
+      <!-- Page-load timings of recent navigations. Hidden until there is
+           something to draw. -->
+      <svg class="tile__spark-svg" viewBox="0 0 100 20" preserveAspectRatio="none" hidden>
+        <line class="tile__spark-base" x1="0" y1="19.5" x2="100" y2="19.5"/>
+        <polyline class="tile__spark-line" points=""/>
+      </svg>
+      <span class="tile__spark-label" hidden></span>
     </div>
 
     <div class="tile__stats">
