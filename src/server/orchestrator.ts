@@ -224,23 +224,38 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       return null;
     }
 
-    // Carry the unspent budget across so reopening a window mid-visit does not
-    // hand the profile a fresh fifteen minutes.
-    const remainingMs = live.handle.snapshot().remainingMs;
+    // Carry the whole session state across: the unspent budget AND the clock
+    // already spent (so elapsed keeps counting, not reset), plus the page the
+    // visitor was on, which the desktop window reopens. The tile and the
+    // desktop window are two views of ONE visit — never two visits.
+    const snap = live.handle.snapshot();
+    const remainingMs = snap.remainingMs;
+    const elapsedOffsetMs = snap.elapsedMs;
+    const resumeUrl = snap.url && snap.url !== "about:blank" ? snap.url : undefined;
     await this.closeSession(profileId);
 
     this.logger.info(
       "profile_relaunch",
-      `${profile.name} â†’ ${headed ? "desktop window" : "background"}`,
-      { data: { profileId, remainingMs } },
+      `${profile.name} → ${headed ? "desktop window" : "background"}`,
+      { data: { profileId, remainingMs, elapsedOffsetMs, resumeUrl } },
     );
-    return this.startProfile(profileId, { remainingMs });
+    return this.startProfile(profileId, {
+      remainingMs,
+      elapsedOffsetMs,
+      ...(resumeUrl ? { resumeUrl } : {}),
+    });
   }
 
   /** Launch a browser for a profile and start browsing. */
   async startProfile(
     profileId: string,
-    options: { remainingMs?: number } = {},
+    options: {
+      remainingMs?: number;
+      /** Clock already spent by the visit this launch continues. */
+      elapsedOffsetMs?: number;
+      /** Page to reopen — a relaunch continues where the visitor was. */
+      resumeUrl?: string;
+    } = {},
   ): Promise<SessionSnapshot> {
     if (this.sessions.has(profileId)) {
       throw new Error("This profile already has a browser open");
@@ -259,10 +274,15 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     const sessionId = `${profile.ordinal}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
     let screencast: Screencast | undefined;
 
-    // A per-profile storefront overrides the global one for this session. No
-    // allowlist gate here — the operator decides which shop a profile browses,
-    // and the session stays pinned to whatever it was pointed at.
+    // Each session is pinned to its own shop: a per-profile storefront wins,
+    // and without one there is nothing to browse — fail fast instead of
+    // opening a browser aimed at an empty URL.
     const storefront = profile.storefront ?? this.config.storefront;
+    if (!storefront) {
+      throw new Error(
+        `Profile "${profile.name}" has no storefront set. Open its settings in the dashboard and pick a shop.`,
+      );
+    }
     let storefrontHost = "";
     try {
       storefrontHost = new URL(storefront).host;
@@ -272,6 +292,14 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     // A profile marked "show on desktop" opens a real window; everything else
     // about the launch is identical.
+    const bareStorefrontHost = storefrontHost.startsWith("www.")
+      ? storefrontHost.slice(4)
+      : `www.${storefrontHost}`;
+    // Widen this session's allowlist to its own shop: with no global
+    // storefront the base allowlist is empty and would block every page.
+    const sessionAllowedHosts = Array.from(
+      new Set([...this.config.safety.allowedHosts, storefrontHost, bareStorefrontHost]),
+    );
     const config = {
       ...this.config,
       storefront,
@@ -279,6 +307,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         storefront === this.config.storefront
           ? this.config.seedCollections
           : ["/collections/all"],
+      safety: {
+        ...this.config.safety,
+        allowedHosts: sessionAllowedHosts,
+      },
       // Default headless; operator can toggle per-profile via Show Desktop button
       browser: { ...this.config.browser, headless: !profile.headed },
       ...(options.remainingMs && options.remainingMs > 0
@@ -313,6 +345,12 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           profile,
           userDataDir: this.store.userDataDir(profile),
           lingerMs: -1,
+          // Relaunch continuity: the resumed clock and the page the visitor
+          // was on travel with the session to its new window.
+          ...(options.elapsedOffsetMs && options.elapsedOffsetMs > 0
+            ? { elapsedOffsetMs: options.elapsedOffsetMs }
+            : {}),
+          ...(options.resumeUrl ? { resumeUrl: options.resumeUrl } : {}),
           onPage: async (page) => {
             screencast = new Screencast(page);
             await screencast.start();

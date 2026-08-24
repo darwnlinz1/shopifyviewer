@@ -20,12 +20,16 @@ export class SessionTimer {
   hardDeadline: number;
   plannedDurationMs: number;
 
-  constructor(config: SessionConfig, rng: Rng) {
-    this.startedAt = Date.now();
+  constructor(config: SessionConfig, rng: Rng, elapsedOffsetMs = 0) {
+    // `elapsedOffsetMs` back-dates the clock: a session relaunched onto the
+    // desktop mid-visit resumes the ORIGINAL clock, so 10 minutes spent in
+    // the background stays 10 minutes spent — elapsed keeps counting from
+    // where it was and only the remaining budget carries forward.
+    this.startedAt = Date.now() - Math.max(0, elapsedOffsetMs);
     const jitter = config.durationJitterMs
       ? rng.int(-config.durationJitterMs, config.durationJitterMs)
       : 0;
-    this.plannedDurationMs = Math.max(30_000, config.durationMs + jitter);
+    this.plannedDurationMs = Math.max(30_000, elapsedOffsetMs + config.durationMs + jitter);
     this.deadline = this.startedAt + this.plannedDurationMs;
     this.hardDeadline = this.startedAt + Math.max(config.hardTimeoutMs, this.plannedDurationMs + 60_000);
   }
