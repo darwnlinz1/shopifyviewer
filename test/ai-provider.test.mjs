@@ -236,3 +236,73 @@ test("detector: a Cloudflare 403 does not permanently quarantine a good cookie",
     assert.equal(stats.cooldown, 1);
   } finally { await cf.close(); }
 });
+
+test("detector hybrid: an open breaker is ignored when the API is unusable (revoked key)", async () => {
+  const bad = await mockApi((req, res) => { res.writeHead(401); res.end("{}"); });
+  try {
+    let cookieCalls = 0;
+    let failCookie = true;
+    const detector = new ElementDetector(cookiePool("breaker-vs-dead-api"), logger, {
+      maxRetries: 1,
+      provider: "hybrid",
+      api: new AnthropicApiClient({ apiKey: "revoked", baseUrl: bad.url }),
+      client: {
+        send: async () => {
+          cookieCalls++;
+          if (failCookie) throw new Error("transient");
+          return { text: "", parsed: DETECTION, accountSource: "a.json", orgId: "o", elapsedMs: 1 };
+        },
+      },
+    });
+    // Call 1 kills the API key, call 2 trips the breaker (both cookie attempts fail).
+    await detector.detect("https://shop.example/1", "<html></html>", { skipCache: true }).catch(() => undefined);
+    await detector.detect("https://shop.example/2", "<html></html>", { skipCache: true }).catch(() => undefined);
+    failCookie = false;
+    const before = cookieCalls;
+    const r = await detector.detect("https://shop.example/3", "<html></html>", { skipCache: true });
+    assert.equal(cookieCalls, before + 1, "healthy pool must be consulted although the breaker is open");
+    assert.equal(r.accountSource, "a.json");
+  } finally { await bad.close(); }
+});
+
+test("detector: a long API 429 window is remembered, not re-hit on every call", async () => {
+  const limited = await mockApi((req, res) => { res.writeHead(429, { "retry-after": "60" }); res.end("{}"); });
+  try {
+    const events = [];
+    const detector = new ElementDetector(cookiePool("api-429"), logger, {
+      maxRetries: 3,
+      provider: "anthropic_api",
+      api: new AnthropicApiClient({ apiKey: "k", baseUrl: limited.url }),
+      onProviderEvent: (e) => events.push(e.kind),
+    });
+    for (let i = 0; i < 5; i++) {
+      await detector.detect(`https://shop.example/${i}`, `<a href="/products/a-b-c">A</a>`, { skipCache: true }).catch(() => undefined);
+    }
+    assert.equal(limited.seen.length, 1, "after the first 429 the API is skipped for the retry-after window");
+    assert.equal(events.filter((k) => k === "api_rate_limited").length, 1);
+  } finally { await limited.close(); }
+});
+
+test("detector: empty-pool alert only fires when a pool drains, never for cookie-less runs", async () => {
+  // Never had cookies: silent.
+  const emptyDir = join(work, "never-cookies");
+  mkdirSync(emptyDir, { recursive: true });
+  const never = [];
+  const d1 = new ElementDetector(new CookiePool(emptyDir), logger, { onProviderEvent: (e) => never.push(e.kind) });
+  await d1.detect("https://shop.example/", `<a href="/products/a-b-c">A</a>`, { skipCache: true }).catch(() => undefined);
+  assert.deepEqual(never, []);
+
+  // Had a cookie, then lost it: exactly one alert per drain.
+  const pool = cookiePool("drains");
+  const drained = [];
+  const d2 = new ElementDetector(pool, logger, {
+    maxRetries: 1,
+    client: { send: async () => ({ text: "", parsed: DETECTION, accountSource: "a.json", orgId: "o", elapsedMs: 1 }) },
+    onProviderEvent: (e) => drained.push(e.kind),
+  });
+  await d2.detect("https://shop.example/1", "<html></html>", { skipCache: true });
+  pool.markInvalid("a.json");
+  await d2.detect("https://shop.example/2", `<a href="/products/a-b-c">A</a>`, { skipCache: true }).catch(() => undefined);
+  await d2.detect("https://shop.example/3", `<a href="/products/a-b-c">A</a>`, { skipCache: true }).catch(() => undefined);
+  assert.deepEqual(drained, ["cookie_pool_empty"]);
+});

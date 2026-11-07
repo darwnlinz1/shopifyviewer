@@ -30,7 +30,7 @@ import { Pacing } from "../behavior/timing.js";
 import { SessionTimer } from "./timer.js";
 import { CookiePool } from "../ai/cookiePool.js";
 import { ElementDetector } from "../ai/elementDetector.js";
-import { sharedRecipeCache } from "../ai/domainRecipeCache.js";
+import { DomainRecipeCache, sharedRecipeCache } from "../ai/domainRecipeCache.js";
 import { resolveAiProvider } from "../ai/provider.js";
 import { storageFor } from "../storage/db.js";
 import type { AlertManager } from "../alerts/alertManager.js";
@@ -119,10 +119,6 @@ export interface SessionSnapshot {
   detectionTiers?: { tier0: number; tier1: number; tier2: number; local: number };
   blocker?: SessionBlocker;
   error?: string;
-}
-
-function hostOf(url: string): string {
-  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; }
 }
 
 export interface SessionOptions {
@@ -758,7 +754,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
         const wafState = await WafChallengeDetector.inspectPage(page, logger);
         if (wafState.engine !== "none") {
           logger.warn("waf_challenge_detected", `WAF challenge encountered: ${wafState.engine}`, { data: { url: currentUrl } });
-          options.alerts?.recordChallenge(profile?.proxy ?? "", hostOf(currentUrl));
+          options.alerts?.recordChallenge(profile?.proxy ?? "", DomainRecipeCache.hostOf(currentUrl));
           const solveRes = await WafChallengeDetector.resolveChallenge(page, wafState, logger);
           if (solveRes.resolved) {
             logger.info("waf_challenge_cleared", `WAF challenge ${wafState.engine} cleared successfully via ${solveRes.actionTaken}`);
@@ -919,7 +915,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       recordView(decision, outcome, Date.now() - actionStartedAt);
       if (decision.action === "add_to_cart") {
         engine.notifyAtcResult(outcome.atcVerified === true, { url: atcProductUrl });
-        options.alerts?.recordAtc(hostOf(currentUrl), outcome.atcVerified === true);
+        options.alerts?.recordAtc(DomainRecipeCache.hostOf(currentUrl), outcome.atcVerified === true);
       }
       if (outcome.atcVerified) {
         atcVerified = true;

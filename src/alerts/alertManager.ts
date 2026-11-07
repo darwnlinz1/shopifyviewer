@@ -18,6 +18,7 @@
 import type { AlertSinkConfig, AlertsConfig } from "../config.js";
 import type { SiteViewerDb } from "../storage/db.js";
 import type { AiProviderEvent } from "../ai/elementDetector.js";
+import { parseProxy } from "../profiles/proxy.js";
 
 export type AlertSeverity = "info" | "warning" | "critical";
 
@@ -127,10 +128,14 @@ export function buildSinks(cfg: AlertSinkConfig[], env: NodeJS.ProcessEnv = proc
 export function proxyLabel(raw: string): string {
   const t = (raw ?? "").trim();
   if (!t) return "direct";
-  const noScheme = t.replace(/^[a-z0-9+.-]+:\/\//i, "");
-  const afterAt = noScheme.includes("@") ? noScheme.slice(noScheme.lastIndexOf("@") + 1) : noScheme;
-  const parts = afterAt.split(/[/?#]/)[0]!.split(":");
-  return parts.length >= 2 ? `${parts[0]}:${parts[1]}` : parts[0] || "proxy";
+  // Built on the same parser the rest of the app uses, so every proxy format it
+  // accepts is handled here too. An unparseable string is never echoed back.
+  try {
+    const p = parseProxy(t);
+    return `${p.host}:${p.port}`;
+  } catch {
+    return "proxy";
+  }
 }
 
 interface Sample { at: number; ok: boolean }

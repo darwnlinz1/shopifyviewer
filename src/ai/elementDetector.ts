@@ -82,6 +82,10 @@ export class ElementDetector {
   private cookieBreakerUntil = 0;
   /** A rejected API key stays rejected; stop spending requests (and alert noise) on it. */
   private apiDisabled = false;
+  /** The API told us to wait (429 / retry-after): skip it, don't re-hit it, until then. */
+  private apiCooldownUntil = 0;
+  /** True once the pool had cookies, so "empty" can mean "drained", not "never configured". */
+  private poolHadCookies = false;
   private excludeSet = new Set<string>();
   /** Product cache keyed by domain+pathname, TTL-based */
   private cache = new Map<string, CacheEntry>();
@@ -176,13 +180,21 @@ export class ElementDetector {
 
     // No healthy cookies: skip the AI entirely and classify locally, caching the result so
     // subsequent turns on the same URL resolve in 0ms without re-triggering prefetch.
+    const apiUsable =
+      this.mode !== "cookie_pool" && !!this.api && !this.apiDisabled && Date.now() >= this.apiCooldownUntil;
+    const poolHasCookies = this.pool.hasCookies();
+    // The breaker only exists to steer traffic to the API; with no usable API
+    // it would just push a possibly-recovered pool out in favour of local rules.
     const cookiesUsable =
       this.mode !== "anthropic_api" &&
-      this.pool.hasCookies() &&
-      !(this.mode === "hybrid" && Date.now() < this.cookieBreakerUntil);
-    const apiUsable = this.mode !== "cookie_pool" && !!this.api && !this.apiDisabled;
-    if (this.mode !== "anthropic_api" && !this.pool.hasCookies()) {
-      this.emit({ kind: "cookie_pool_empty", detail: "no healthy cookies in the pool" });
+      poolHasCookies &&
+      !(this.mode === "hybrid" && apiUsable && Date.now() < this.cookieBreakerUntil);
+    if (poolHasCookies) {
+      this.poolHadCookies = true;
+    } else if (this.mode !== "anthropic_api" && this.poolHadCookies) {
+      // Alert on a drained pool, once per drain — not for runs that never had cookies.
+      this.poolHadCookies = false;
+      this.emit({ kind: "cookie_pool_empty", detail: "every cookie in the pool is quarantined or gone" });
     }
 
     if (!cookiesUsable && !apiUsable) {
@@ -329,11 +341,18 @@ export class ElementDetector {
         let waitMs = Math.min(4000, 400 * 2 ** attempt + Math.floor(Math.random() * 150));
         if (err instanceof ClaudeRateLimitError) {
           this.emit({ kind: "api_rate_limited", detail: `retry after ${err.retryAfter}s` });
-          // A long server-side window is not worth blocking a live browser session for.
-          if (err.retryAfter > 10) return null;
+          // A long server-side window is not worth blocking a live browser session for;
+          // remember it so the next detections skip the API instead of re-hitting it.
+          if (err.retryAfter > 10) {
+            this.apiCooldownUntil = Date.now() + err.retryAfter * 1000;
+            return null;
+          }
           waitMs = err.retryAfter * 1000;
         } else if (err instanceof ClaudeTransientError && err.retryAfterMs) {
-          if (err.retryAfterMs > 10_000) return null;
+          if (err.retryAfterMs > 10_000) {
+            this.apiCooldownUntil = Date.now() + err.retryAfterMs;
+            return null;
+          }
           waitMs = err.retryAfterMs;
         }
         if (attempt + 1 < this.maxRetries) await new Promise<void>((r) => setTimeout(r, waitMs));

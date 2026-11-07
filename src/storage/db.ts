@@ -69,7 +69,7 @@ export class SiteViewerDb {
   private readonly db: DatabaseSync;
   private readonly stmts = new Map<string, StatementSync>();
   private txDepth = 0;
-  private appendsSincePrune = 0;
+  private readonly appendsSincePrune = new Map<string, number>();
   private closed = false;
 
   constructor(path: string, private readonly maxEventsPerNs = 100_000) {
@@ -175,9 +175,14 @@ export class SiteViewerDb {
 
   appendEvent(ns: string, kind: string, data: unknown, ts: number = Date.now()): void {
     this.stmt("INSERT INTO events (ts, ns, kind, json) VALUES (?, ?, ?, ?)").run(ts, ns, kind, JSON.stringify(data));
-    if (++this.appendsSincePrune >= 1000) {
-      this.appendsSincePrune = 0;
+    // Counted per namespace: a busy one (cookie_audit) must reach its own
+    // threshold however many appends other namespaces interleave.
+    const n = (this.appendsSincePrune.get(ns) ?? 0) + 1;
+    if (n >= 1000) {
+      this.appendsSincePrune.set(ns, 0);
       this.pruneEvents(ns, this.maxEventsPerNs);
+    } else {
+      this.appendsSincePrune.set(ns, n);
     }
   }
 
@@ -255,10 +260,13 @@ export function storageFor(
   config: { storage?: { dbPath?: string } },
   onError?: (err: unknown) => void,
 ): SiteViewerDb | undefined {
-  // SITEVIEWER_DB_PATH wins when set: lets a container or a test harness point
-  // the database at a scratch location without editing config files.
+  // An explicit `dbPath: ""` disables storage outright: an environment variable
+  // must not re-enable it for some processes and leave others on JSON files.
+  if (config.storage?.dbPath === "") return undefined;
+  // Otherwise SITEVIEWER_DB_PATH wins when set: lets a container or a test
+  // harness point the database at a scratch location without editing config.
   const path = process.env.SITEVIEWER_DB_PATH || config.storage?.dbPath;
-  if (path === undefined || path === "") return undefined;
+  if (!path) return undefined;
   try {
     return openDb(path);
   } catch (err) {

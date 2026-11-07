@@ -360,3 +360,12 @@ test("returns device catalog and manages device emulation on profiles", async ()
     assert.deepEqual(v.profile.device, { kind: "iphone", model: "iPhone 15 Pro Max" });
   }
 });
+
+test("geo hint needs the <email>_<CC> filename shape", async () => {
+  const { resolveGeoFromFilename } = await import("../dist/profiles/geo.js");
+  assert.equal(resolveGeoFromFilename("1dbeachamm@gmail.com_US.txt")?.countryCode, "US");
+  assert.equal(resolveGeoFromFilename("zunzun05@outlook.jp_jp.json")?.timezone, "Asia/Tokyo");
+  for (const name of ["backup_in.json", "cookies_it.txt", "acct_de.txt", "plain.json", ""]) {
+    assert.equal(resolveGeoFromFilename(name), null, name);
+  }
+});

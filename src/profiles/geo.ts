@@ -71,13 +71,15 @@ const COUNTRIES: Record<string, Omit<GeoInfo, "countryCode">> = {
 };
 
 /**
- * Read a trailing `_CC` country code from a cookie file name or path.
- * `1abc@gmail.com_US.txt` → US. Case-insensitive; returns null when the
- * suffix is missing or the code is not in the table.
+ * Read the `_CC` country code from a cookie file named `<email>_<CC>.<ext>`.
+ * `1abc@gmail.com_US.txt` → US. The account part must look like an email (it
+ * contains "@"), so an ordinary name such as `backup_in.json` or
+ * `cookies_it.txt` is not mistaken for India or Italy. Case-insensitive on the
+ * code; returns null when the shape does not match or the code is unknown.
  */
 export function resolveGeoFromFilename(name: string): GeoInfo | null {
   const base = (name ?? "").split(/[\\/]/).pop() ?? "";
-  const match = /_([A-Za-z]{2})(?:\.[A-Za-z0-9]+)?$/.exec(base);
+  const match = /@[^_\s]+_([A-Za-z]{2})(?:\.[A-Za-z0-9]+)?$/.exec(base);
   if (!match) return null;
   const code = match[1]!.toUpperCase();
   const entry = COUNTRIES[code];

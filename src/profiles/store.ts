@@ -102,8 +102,8 @@ export class ProfileStore {
   private readonly path: string;
   private data: StoreFile;
   private readonly db: SiteViewerDb | undefined;
-  /** Serialised form last written per profile id, so a save skips unchanged rows. */
-  private readonly saved = new Map<string, string>();
+  /** Ids currently persisted, so a full reconcile can delete rows that vanished. */
+  private readonly known = new Set<string>();
   /**
    * Profiles are namespaced by their profile directory, so two stores with
    * different directories (a second dashboard, a test fixture) sharing one
@@ -151,7 +151,7 @@ export class ProfileStore {
       try { renameSync(this.path, `${this.path}.migrated`); } catch { /* backup is best effort */ }
       rows = legacy.profiles;
     }
-    for (const p of rows) this.saved.set(p.id, JSON.stringify(p));
+    for (const p of rows) this.known.add(p.id);
     return {
       version: 1,
       nextOrdinal: Math.max(1, ...rows.map((p) => (p.ordinal ?? 0) + 1)),
@@ -184,26 +184,25 @@ export class ProfileStore {
    * Persist atomically. A half-written profiles.json would take every profile
    * with it — including cookie jars the operator may not be able to re-export.
    */
-  private write(): void {
+  private write(id?: string): void {
     if (this.db) {
       const db = this.db;
-      const live = new Set<string>();
-      const changed: Array<[string, string, Profile]> = [];
-      for (const p of this.data.profiles) {
-        live.add(p.id);
-        const json = JSON.stringify(p);
-        if (this.saved.get(p.id) !== json) changed.push([p.id, json, p]);
+      const one = id ? this.data.profiles.find((p) => p.id === id) : undefined;
+      if (one) {
+        // The common case (a stat or status update on one profile): serialise
+        // and write only that row, never the whole store.
+        db.putDoc(this.ns, one.id, one);
+        this.known.add(one.id);
+        return;
       }
-      const removed = [...this.saved.keys()].filter((id) => !live.has(id));
-      if (changed.length === 0 && removed.length === 0) return;
+      // Create/remove/rollback: reconcile every row, then drop the vanished ones.
+      const live = new Set(this.data.profiles.map((p) => p.id));
       db.transaction(() => {
-        for (const [id, , p] of changed) db.putDoc(this.ns, id, p);
-        for (const id of removed) db.deleteDoc(this.ns, id);
+        for (const p of this.data.profiles) db.putDoc(this.ns, p.id, p);
+        for (const known of this.known) if (!live.has(known)) db.deleteDoc(this.ns, known);
       });
-      // Only after the commit: a failed transaction leaves `saved` untouched,
-      // so the next write retries the same rows.
-      for (const [id, json] of changed) this.saved.set(id, json);
-      for (const id of removed) this.saved.delete(id);
+      this.known.clear();
+      for (const k of live) this.known.add(k);
       return;
     }
     const temporary = `${this.path}.tmp`;
@@ -280,7 +279,7 @@ export class ProfileStore {
       }
     }
 
-    this.write();
+    this.write(profile.id);
     return this.require(profile.id);
   }
 
@@ -390,7 +389,7 @@ export class ProfileStore {
       }
     }
 
-    this.write();
+    this.write(id);
     return profile;
   }
 
@@ -418,7 +417,7 @@ export class ProfileStore {
       profile.identity.locale = geo.locale;
     }
 
-    this.write();
+    this.write(id);
     return profile;
   }
 
@@ -451,14 +450,14 @@ export class ProfileStore {
       domains: cookieDomains(merged),
       cookies: merged,
     };
-    this.write();
+    this.write(id);
     return profile;
   }
 
   clearCookies(id: string): Profile {
     const profile = this.require(id);
     delete profile.cookies;
-    this.write();
+    this.write(id);
     return profile;
   }
 
@@ -476,7 +475,7 @@ export class ProfileStore {
     profile.bitBrowserManaged = link.managed;
     if (link.proxySig) profile.bitBrowserProxySig = link.proxySig;
     else delete profile.bitBrowserProxySig;
-    this.write();
+    this.write(id);
     return profile;
   }
 
@@ -485,14 +484,14 @@ export class ProfileStore {
     if (!profile) return undefined;
     if (pending) profile.pendingCookieWrite = true;
     else delete profile.pendingCookieWrite;
-    this.write();
+    this.write(id);
     return profile;
   }
 
   recordProxyCheck(id: string, check: ProxyCheck): Profile {
     const profile = this.require(id);
     profile.proxyCheck = check;
-    this.write();
+    this.write(id);
     return profile;
   }
 
@@ -509,7 +508,7 @@ export class ProfileStore {
     profile.stats.jsErrors += run.jsErrors;
     profile.stats.lastRunAt = new Date().toISOString();
     profile.stats.lastExitReason = run.exitReason;
-    this.write();
+    this.write(id);
     return profile;
   }
 

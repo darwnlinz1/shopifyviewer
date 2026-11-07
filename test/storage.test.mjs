@@ -168,3 +168,37 @@ test("CookiePool on SQLite: audit trail + health survive in the db, no side file
   db.close();
 });
 
+
+test("event pruning is per namespace: a busy namespace is pruned however appends interleave", () => {
+  const db = new SiteViewerDb(join(work, "prune-ns.db"), 50);
+  // Interleave so the global 1000th append lands on the quiet namespace.
+  for (let i = 0; i < 1100; i++) {
+    db.appendEvent("busy", "k", { i });
+    if (i % 10 === 0) db.appendEvent("quiet", "k", { i });
+  }
+  assert.ok(db.countEvents("busy") <= 50 + 999, "busy namespace must have been pruned at least once");
+  assert.ok(db.countEvents("busy") < 1100, "pruning never ran for the busy namespace");
+  db.close();
+});
+
+test("storageFor: dbPath \"\" disables storage even when SITEVIEWER_DB_PATH is set", async () => {
+  const { storageFor } = await import("../dist/storage/db.js");
+  assert.equal(process.env.SITEVIEWER_DB_PATH !== undefined, true, "test preload sets the env var");
+  assert.equal(storageFor({ storage: { dbPath: "" } }), undefined);
+  assert.ok(storageFor({ storage: { dbPath: "./ignored-by-env.db" } }), "env still redirects a normal path");
+});
+
+test("ProfileStore writes only the profile that changed", () => {
+  const dir = join(work, "narrow-writes");
+  const db = fresh("narrow-writes");
+  const store = new ProfileStore(dir, { db });
+  const a = store.create({ name: "A" });
+  const b = store.create({ name: "B" });
+  // Mutate B in memory without saving it; a write for A must not drag B along.
+  store.get(b.id).name = "B-unsaved";
+  store.update(a.id, { name: "A2" });
+  const reloaded = new ProfileStore(dir, { db });
+  assert.equal(reloaded.get(a.id).name, "A2");
+  assert.equal(reloaded.get(b.id).name, "B", "an unrelated row must not be rewritten by update(A)");
+  db.close();
+});
