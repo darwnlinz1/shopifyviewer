@@ -16,7 +16,7 @@
         "prestart": "node scripts/download-ungoogled.mjs",
         "start": "node --enable-source-maps dist/cli.js dashboard --host 127.0.0.1 --port 7317",
         "dev": "tsx src/cli.ts dashboard --host 127.0.0.1 --port 7317",
-        "test": "node --test \"test/*.test.mjs\"",
+        "test": "node --test test/",
         "setup:browser": "node scripts/download-ungoogled.mjs",
         "ai": "tsx src/cli.ts run --storefront"
     },
