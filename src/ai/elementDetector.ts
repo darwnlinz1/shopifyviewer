@@ -3,6 +3,8 @@
  */
 import type { CookiePool, CookieEntry } from "./cookiePool.js";
 import { ClaudeClient, ClaudeAuthError, ClaudeRateLimitError, ClaudePayloadError, type ClaudeResponse } from "./claudeClient.js";
+import { ClaudeTransientError, type AnthropicApiClient } from "./anthropicApiClient.js";
+import type { AiProvider } from "../config.js";
 import { buildDetectionPrompt, preprocessHtml } from "./promptTemplates.js";
 import { localDetect, sanitizeProductPath, hasProductSlug } from "./localFallback.js";
 import type { Logger } from "../logging/logger.js";
@@ -47,6 +49,16 @@ function plausiblyNavigable(url: string): boolean {
   return !NON_PRODUCT.test(url);
 }
 
+/** Provider-health signal for the alert layer. */
+export interface AiProviderEvent {
+  kind: "cookie_pool_empty" | "cookie_path_failed" | "api_auth_failed" | "api_rate_limited" | "api_failed" | "failover_to_api";
+  detail: string;
+}
+
+/** After this many back-to-back cookie-path failures, hybrid skips the pool for a while. */
+const COOKIE_BREAKER_FAILS = 2;
+const COOKIE_BREAKER_OPEN_MS = 60_000;
+
 interface CacheEntry {
   products: DetectedProduct[];
   addToCart: DetectedAddToCart | null;
@@ -63,14 +75,25 @@ export class ElementDetector {
   private readonly detectionCooldownMs: number;
   private lastCallAt = 0;
   private readonly model?: string;
+  private readonly mode: AiProvider;
+  private readonly api: AnthropicApiClient | undefined;
+  private readonly onProviderEvent: ((e: AiProviderEvent) => void) | undefined;
+  private cookieFailStreak = 0;
+  private cookieBreakerUntil = 0;
+  /** A rejected API key stays rejected; stop spending requests (and alert noise) on it. */
+  private apiDisabled = false;
   private excludeSet = new Set<string>();
   /** Product cache keyed by domain+pathname, TTL-based */
   private cache = new Map<string, CacheEntry>();
   /** In-flight background analyses keyed like the cache — prefetch dedupe. */
   private pending = new Map<string, Promise<PageDetectionResult>>();
 
-  constructor(pool: CookiePool, logger: Logger, options: { maxRetries?: number; maxHtmlChars?: number; detectionCooldownMs?: number; model?: string; baseUrl?: string; client?: ClaudeClient } = {}) {
+  constructor(pool: CookiePool, logger: Logger, options: { maxRetries?: number; maxHtmlChars?: number; detectionCooldownMs?: number; model?: string; baseUrl?: string; client?: ClaudeClient; provider?: AiProvider; api?: AnthropicApiClient; onProviderEvent?: (e: AiProviderEvent) => void } = {}) {
     this.pool = pool;
+    this.api = options.api;
+    // Without an API client every mode is, in effect, the cookie pool.
+    this.mode = options.api ? (options.provider ?? "hybrid") : "cookie_pool";
+    this.onProviderEvent = options.onProviderEvent;
     this.logger = logger;
     this.maxRetries = options.maxRetries ?? 3;
     this.maxHtmlChars = options.maxHtmlChars ?? 60000;
@@ -153,7 +176,16 @@ export class ElementDetector {
 
     // No healthy cookies: skip the AI entirely and classify locally, caching the result so
     // subsequent turns on the same URL resolve in 0ms without re-triggering prefetch.
-    if (!this.pool.hasCookies()) {
+    const cookiesUsable =
+      this.mode !== "anthropic_api" &&
+      this.pool.hasCookies() &&
+      !(this.mode === "hybrid" && Date.now() < this.cookieBreakerUntil);
+    const apiUsable = this.mode !== "cookie_pool" && !!this.api && !this.apiDisabled;
+    if (this.mode !== "anthropic_api" && !this.pool.hasCookies()) {
+      this.emit({ kind: "cookie_pool_empty", detail: "no healthy cookies in the pool" });
+    }
+
+    if (!cookiesUsable && !apiUsable) {
       const local = localDetect(digest);
       if (!options.skipCache && local.products.length > 0) {
         this.cache.set(key, {
@@ -170,9 +202,11 @@ export class ElementDetector {
     this.excludeSet.clear();
     let lastError: Error | null = null;
 
-    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+    let cookieAttempted = false;
+    for (let attempt = 0; attempt < this.maxRetries && cookiesUsable; attempt++) {
       const cookie = this.pool.getNext(this.excludeSet);
       if (!cookie) break;
+      cookieAttempted = true;
 
       if (this.detectionCooldownMs > 0) {
         const sinceLast = Date.now() - this.lastCallAt;
@@ -190,7 +224,8 @@ export class ElementDetector {
         });
         const result = this.parseResponse(response, url, digest);
         this.pool.markSuccess(cookie.source);
-        
+        this.cookieFailStreak = 0;
+
         // Cache the result
         if (!options.skipCache) {
           this.cache.set(key, { products: result.products, addToCart: result.addToCart, ...(result.plan ? { plan: result.plan } : {}), timestamp: Date.now() });
@@ -228,6 +263,24 @@ export class ElementDetector {
         this.pool.endRequest(cookie.source);
       }
     }
+    if (cookieAttempted) {
+      if (++this.cookieFailStreak >= COOKIE_BREAKER_FAILS && this.mode === "hybrid") {
+        this.cookieBreakerUntil = Date.now() + COOKIE_BREAKER_OPEN_MS;
+        this.cookieFailStreak = 0;
+        this.emit({ kind: "cookie_path_failed", detail: `cookie path failing (${lastError?.message ?? "unknown"}); using the official API for ${COOKIE_BREAKER_OPEN_MS / 1000}s` });
+      }
+    }
+
+    // Official API: the only path in anthropic_api mode, the failover in hybrid.
+    if (apiUsable && this.api) {
+      if (cookieAttempted || !cookiesUsable) {
+        if (this.mode === "hybrid") this.emit({ kind: "failover_to_api", detail: lastError?.message ?? "cookie pool unavailable" });
+      }
+      const viaApi = await this.runApiAttempts(prompt, digest, url, key, options);
+      if (viaApi) return viaApi;
+      lastError = this.lastApiError ?? lastError;
+    }
+
     // Every AI attempt failed: fall back to the local classifier rather than
     // dead-ending the session. Only surfaces an error when even that is empty.
     const local = localDetect(digest);
@@ -236,6 +289,58 @@ export class ElementDetector {
       return { url, products: local.products, addToCart: local.addToCart, accountSource: "local", elapsedMs: 0, cached: false };
     }
     throw new Error("Detection failed after " + this.maxRetries + ": " + (lastError?.message ?? "no accounts"));
+  }
+
+  private lastApiError: Error | null = null;
+
+  private emit(e: AiProviderEvent): void {
+    try { this.onProviderEvent?.(e); } catch { /* alerting must never break detection */ }
+  }
+
+  private async runApiAttempts(
+    prompt: string,
+    digest: string,
+    url: string,
+    key: string,
+    options: { skipCache?: boolean },
+  ): Promise<PageDetectionResult | null> {
+    const api = this.api!;
+    this.lastApiError = null;
+    for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      try {
+        const response = await api.send(prompt);
+        const result = this.parseResponse(response, url, digest);
+        if (!options.skipCache) {
+          this.cache.set(key, { products: result.products, addToCart: result.addToCart, ...(result.plan ? { plan: result.plan } : {}), timestamp: Date.now() });
+        }
+        this.logger.debug("api_ok", response.elapsedMs + "ms products=" + result.products.length + (response.usage ? " tokens=" + response.usage.input + "/" + response.usage.output : ""), { url });
+        return { ...result, cached: false };
+      } catch (err) {
+        this.lastApiError = err as Error;
+        if (err instanceof ClaudeAuthError) {
+          this.apiDisabled = true;
+          this.emit({ kind: "api_auth_failed", detail: err.message });
+          return null;
+        }
+        if (err instanceof ClaudePayloadError) {
+          this.emit({ kind: "api_failed", detail: err.message });
+          return null;
+        }
+        let waitMs = Math.min(4000, 400 * 2 ** attempt + Math.floor(Math.random() * 150));
+        if (err instanceof ClaudeRateLimitError) {
+          this.emit({ kind: "api_rate_limited", detail: `retry after ${err.retryAfter}s` });
+          // A long server-side window is not worth blocking a live browser session for.
+          if (err.retryAfter > 10) return null;
+          waitMs = err.retryAfter * 1000;
+        } else if (err instanceof ClaudeTransientError && err.retryAfterMs) {
+          if (err.retryAfterMs > 10_000) return null;
+          waitMs = err.retryAfterMs;
+        }
+        if (attempt + 1 < this.maxRetries) await new Promise<void>((r) => setTimeout(r, waitMs));
+      }
+    }
+    if (this.lastApiError) this.emit({ kind: "api_failed", detail: this.lastApiError.message });
+    return null;
   }
 
   clearCache(): void { this.cache.clear(); }

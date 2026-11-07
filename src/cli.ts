@@ -242,6 +242,18 @@ async function main(): Promise<number> {
     const host = one(flags, "host") ?? "127.0.0.1";
     const token = one(flags, "token");
 
+    // The dashboard can drive real browsers and holds imported cookie jars. On
+    // anything but loopback an open dashboard is remote control for whoever can
+    // reach the port, so a token is mandatory there.
+    const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(host);
+    if (!loopback && !token) {
+      process.stderr.write(
+        `Refusing to bind the dashboard to ${host} without --token <secret>. ` +
+          `Use the default 127.0.0.1, or pass a token.\n`,
+      );
+      return 1;
+    }
+
     const orchestrator = new Orchestrator(config);
     const dashboard = await startDashboard(orchestrator, port, host, token);
 

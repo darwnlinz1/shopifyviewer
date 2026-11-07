@@ -20,6 +20,18 @@ import type { ParsedCookieFile, StoredCookie } from "./cookies.js";
 import { buildProfileCookies, cookieDomains } from "./cookies.js";
 import { validateProxy } from "./proxy.js";
 import { resolveGeoFromFilename } from "./geo.js";
+import type { SiteViewerDb } from "../storage/db.js";
+
+
+export interface ProfileStoreOptions {
+  /**
+   * Persist profiles (cookie jars included) as one row each in SQLite. A save
+   * then writes only the profiles that changed, inside one transaction,
+   * instead of rewriting every profile into profiles.json. An existing
+   * profiles.json is imported once and renamed to profiles.json.migrated.
+   */
+  db?: SiteViewerDb;
+}
 import { isRestrictedStorefrontUrl } from "../config.js";
 
 /** Viewports a new profile can be assigned. */
@@ -89,12 +101,23 @@ interface StoreFile {
 export class ProfileStore {
   private readonly path: string;
   private data: StoreFile;
+  private readonly db: SiteViewerDb | undefined;
+  /** Serialised form last written per profile id, so a save skips unchanged rows. */
+  private readonly saved = new Map<string, string>();
+  /**
+   * Profiles are namespaced by their profile directory, so two stores with
+   * different directories (a second dashboard, a test fixture) sharing one
+   * database file stay as isolated as they were with one profiles.json each.
+   */
+  private readonly ns: string;
 
-  constructor(private readonly profileDir: string) {
+  constructor(private readonly profileDir: string, options: ProfileStoreOptions = {}) {
     const base = resolve(process.cwd(), profileDir);
     mkdirSync(base, { recursive: true });
     this.path = join(base, "profiles.json");
-    this.data = this.read();
+    this.db = options.db;
+    this.ns = `profile:${base}`;
+    this.data = this.db ? this.readDb(this.db) : this.read();
     this.cleanupOrphanDirs();
   }
 
@@ -113,6 +136,27 @@ export class ProfileStore {
         } catch {}
       }
     }
+  }
+
+  private readDb(db: SiteViewerDb): StoreFile {
+    let rows = db.listDocs<Profile>(this.ns).map((r) => r.value);
+    if (rows.length === 0 && existsSync(this.path)) {
+      // First run on SQLite: bring the old JSON profiles across, then keep the
+      // file as a backup rather than deleting a cookie jar the operator may
+      // not be able to re-export.
+      const legacy = this.read();
+      db.transaction(() => {
+        for (const p of legacy.profiles) db.putDoc(this.ns, p.id, p);
+      });
+      try { renameSync(this.path, `${this.path}.migrated`); } catch { /* backup is best effort */ }
+      rows = legacy.profiles;
+    }
+    for (const p of rows) this.saved.set(p.id, JSON.stringify(p));
+    return {
+      version: 1,
+      nextOrdinal: Math.max(1, ...rows.map((p) => (p.ordinal ?? 0) + 1)),
+      profiles: rows,
+    };
   }
 
   private read(): StoreFile {
@@ -141,6 +185,27 @@ export class ProfileStore {
    * with it — including cookie jars the operator may not be able to re-export.
    */
   private write(): void {
+    if (this.db) {
+      const db = this.db;
+      const live = new Set<string>();
+      const changed: Array<[string, string, Profile]> = [];
+      for (const p of this.data.profiles) {
+        live.add(p.id);
+        const json = JSON.stringify(p);
+        if (this.saved.get(p.id) !== json) changed.push([p.id, json, p]);
+      }
+      const removed = [...this.saved.keys()].filter((id) => !live.has(id));
+      if (changed.length === 0 && removed.length === 0) return;
+      db.transaction(() => {
+        for (const [id, , p] of changed) db.putDoc(this.ns, id, p);
+        for (const id of removed) db.deleteDoc(this.ns, id);
+      });
+      // Only after the commit: a failed transaction leaves `saved` untouched,
+      // so the next write retries the same rows.
+      for (const [id, json] of changed) this.saved.set(id, json);
+      for (const id of removed) this.saved.delete(id);
+      return;
+    }
     const temporary = `${this.path}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
     renameSync(temporary, this.path);

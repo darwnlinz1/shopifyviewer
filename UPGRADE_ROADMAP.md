@@ -86,6 +86,49 @@ gantt
 
 ---
 
+## Tiến độ thực hiện (cập nhật 07/11/2026)
+
+| # | Hạng mục | Trạng thái | Ghi chú |
+| :-- | :--- | :--- | :--- |
+| 0 | Sửa lỗi nền | **Xong** | `src/profiles/geo.ts` bị `.gitignore` (`profiles/`) nuốt nên **bản clone sạch không build được** → khôi phục file, neo ignore thành `/profiles/`. `npm test` hỏng trên Node 22 (`node --test test/`) → dùng glob. `engines` nâng lên `>=22.13` |
+| 1 | Anthropic API chính thức + `hybrid` | **Xong** | `ai.provider`: `cookie_pool` \| `anthropic_api` \| `hybrid`; key lấy từ `ANTHROPIC_API_KEY`. Hybrid có circuit-breaker (2 lần hỏng → bỏ qua cookie 60 s). Mặc định model API: `claude-haiku-5-5` |
+| 1b | Sửa 403 Cloudflare | **Xong** | Trước đây một trang challenge Cloudflare bị coi là lỗi auth → cookie tốt bị **cách ly vĩnh viễn**. Nay là cooldown 5 phút |
+| 2 | SQLite (`node:sqlite`, WAL) | **Xong** | `data/siteviewer.db`: profile (kèm cookie jar), recipe, health/cooldown/quarantine/audit của cookie pool. Ghi theo hàng thay vì ghi lại cả `profiles.json`; tự nhập file JSON cũ một lần và giữ bản `.migrated`. `storage.dbPath: ""` để tắt |
+| 5 | Cảnh báo Telegram / Discord / webhook | **Xong** | `alerts` trong config. Dedup theo cooldown, cửa sổ trượt cho tỉ lệ ATC và challenge, **không bao giờ gửi credential proxy**. `GET /api/alerts` |
+| 7 | Bảo mật dashboard | **Xong** | Token không còn bị nhúng công khai vào `index.html`; so sánh constant-time; chặn DNS-rebinding (Host) và CSRF (Origin); từ chối bind ngoài loopback khi không có `--token` |
+| 3 | Captcha solver (CapSolver/2Captcha…) | **Không thực hiện** | Xem mục dưới |
+| 4 | Handler Shopify app bên thứ ba cho ATC | **Không thực hiện** | Xem mục dưới |
+| 6 | Hạm đội phân tán | **Không thực hiện** | Xem mục dưới |
+
+### Vì sao không làm 3, 4, 6
+
+Cả ba nhằm làm công cụ **vượt hàng rào chống bot của shop khác** và **nhân rộng** lưu lượng giả lập đó: giải
+DataDome/Akamai bằng dịch vụ giải mã thuê ngoài, tự điền dữ liệu giả để ATC thành công trên shop không phải của
+mình, và điều phối hàng trăm trình duyệt trên nhiều VPS. Ở quy mô và với mục đích đó, đây là né kiểm soát truy cập
+chứ không còn là QA. Nếu mục tiêu thật là QA storefront **của chính bạn** (hoặc có thoả thuận bằng văn bản), cách
+đúng là nhờ shop whitelist IP/header của runner trong WAF thay vì giải captcha, và khi đó phần phân tán (6) hoàn
+toàn có thể làm được — hãy nói rõ phạm vi và có thể bổ sung `safety.allowedHosts` bắt buộc cho từng shop.
+
+### Cấu hình mới
+
+```jsonc
+{
+  "ai":      { "provider": "hybrid", "anthropic": { "apiKeyEnv": "ANTHROPIC_API_KEY", "model": "claude-haiku-5-5" } },
+  "storage": { "dbPath": "./data/siteviewer.db" },
+  "alerts":  {
+    "enabled": true,
+    "sinks": [
+      { "type": "telegram", "chatId": "-100123", "botTokenEnv": "TELEGRAM_BOT_TOKEN" },
+      { "type": "discord",  "webhookUrlEnv": "DISCORD_WEBHOOK_URL" }
+    ],
+    "atcMinAttempts": 8, "atcMinSuccessRate": 0.4, "challengeThreshold": 5, "cooldownMs": 600000
+  }
+}
+```
+Bí mật (API key, token bot, webhook) chỉ đọc từ biến môi trường; `SITEVIEWER_DB_PATH` ghi đè đường dẫn DB.
+
+---
+
 ## III. Hướng Dẫn Kích Hoạt & Sử Dụng Hiện Tại
 
 1. **Cài đặt thư viện**:

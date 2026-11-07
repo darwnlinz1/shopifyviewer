@@ -9,7 +9,10 @@
  * failures so the shop is simply re-learned by the tiers below.
  */
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { openDb, type SiteViewerDb } from "../storage/db.js";
+
+const NS_RECIPES = "recipe";
 
 export type RecipePageType = "home" | "collection" | "product" | "cart" | "search" | "other";
 
@@ -54,6 +57,12 @@ export interface RecipeCacheOptions {
   maxFieldFailures?: number;
   /** Recipes kept; the least recently updated go first. */
   maxRecipes?: number;
+  /**
+   * Persist to this database (one row per recipe, only changed rows written)
+   * instead of rewriting the whole JSON file. `path` is then only the legacy
+   * file imported once when the table is empty.
+   */
+  db?: SiteViewerDb;
 }
 
 export const DEFAULT_RECIPE_PATH = "./data/domain-recipes.json";
@@ -66,9 +75,13 @@ export class DomainRecipeCache {
   private readonly maxRecipes: number;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
+  private readonly db: SiteViewerDb | undefined;
+  /** Keys changed since the last flush; null value = deleted. */
+  private readonly pending = new Map<string, DomainSelectorRecipe | null>();
 
   constructor(path: string = DEFAULT_RECIPE_PATH, options: RecipeCacheOptions = {}) {
     this.path = resolve(process.cwd(), path);
+    this.db = options.db;
     this.flushDelayMs = options.flushDelayMs ?? 400;
     this.maxFieldFailures = Math.max(1, options.maxFieldFailures ?? 2);
     this.maxRecipes = Math.max(10, options.maxRecipes ?? 5000);
@@ -170,6 +183,7 @@ export class DomainRecipeCache {
     recipe.confidence = Math.min(1, Math.max(0, confidence));
     recipe.updatedAt = now;
     this.recipes.set(key, recipe);
+    this.pending.set(key, recipe);
     this.evict();
     this.scheduleFlush();
     return recipe;
@@ -183,6 +197,7 @@ export class DomainRecipeCache {
     if (field && recipe.fieldFailures?.[field]) delete recipe.fieldFailures[field];
     recipe.confidence = Math.min(1, recipe.confidence + 0.02);
     recipe.updatedAt = new Date().toISOString();
+    this.pending.set(DomainRecipeCache.keyOf(recipe.hostname, recipe.pageType), recipe);
     this.scheduleFlush();
   }
 
@@ -205,13 +220,19 @@ export class DomainRecipeCache {
       dropped = true;
     }
     recipe.updatedAt = new Date().toISOString();
+    this.pending.set(DomainRecipeCache.keyOf(recipe.hostname, recipe.pageType), recipe);
     this.scheduleFlush();
     return dropped;
   }
 
   forget(url: string, pageType: RecipePageType): void {
     const host = DomainRecipeCache.hostOf(url);
-    if (host && this.recipes.delete(DomainRecipeCache.keyOf(host, pageType))) this.scheduleFlush();
+    if (!host) return;
+    const key = DomainRecipeCache.keyOf(host, pageType);
+    if (this.recipes.delete(key)) {
+      this.pending.set(key, null);
+      this.scheduleFlush();
+    }
   }
 
   /** Write pending changes now (atomic: temp file + rename). */
@@ -222,6 +243,22 @@ export class DomainRecipeCache {
     }
     if (!this.dirty) return;
     this.dirty = false;
+    if (this.db) {
+      const db = this.db;
+      const batch = [...this.pending];
+      try {
+        db.transaction(() => {
+          for (const [key, recipe] of batch) {
+            if (recipe) db.putDoc(NS_RECIPES, key, recipe);
+            else db.deleteDoc(NS_RECIPES, key);
+          }
+        });
+        for (const [key, recipe] of batch) if (this.pending.get(key) === recipe) this.pending.delete(key);
+      } catch {
+        this.dirty = true; // keep the batch; retried on the next change or exit
+      }
+      return;
+    }
     const file: RecipeFile = { version: 1, recipes: [...this.recipes.values()] };
     try {
       mkdirSync(dirname(this.path), { recursive: true });
@@ -246,13 +283,37 @@ export class DomainRecipeCache {
     const oldest = [...this.recipes.entries()]
       .sort((a, b) => a[1].updatedAt.localeCompare(b[1].updatedAt))
       .slice(0, this.recipes.size - this.maxRecipes);
-    for (const [key] of oldest) this.recipes.delete(key);
+    for (const [key] of oldest) {
+      this.recipes.delete(key);
+      this.pending.set(key, null);
+    }
   }
 
   private load(): void {
-    if (!existsSync(this.path)) return;
+    if (this.db) {
+      for (const { key, value } of this.db.listDocs<DomainSelectorRecipe>(NS_RECIPES)) this.recipes.set(key, value);
+      if (this.recipes.size === 0) this.importLegacyJson();
+      return;
+    }
+    this.loadJsonFile(this.path);
+  }
+
+  /** Seed an empty database from the old data/domain-recipes.json, once. */
+  private importLegacyJson(): void {
+    const legacy = join(dirname(this.path), "domain-recipes.json");
+    if (!existsSync(legacy)) return;
+    this.loadJsonFile(legacy);
+    for (const [key, recipe] of this.recipes) this.pending.set(key, recipe);
+    if (this.pending.size > 0) {
+      this.dirty = true;
+      this.flush();
+    }
+  }
+
+  private loadJsonFile(file: string): void {
+    if (!existsSync(file)) return;
     try {
-      const raw = readFileSync(this.path, "utf8").replace(/^\uFEFF/, "");
+      const raw = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
       const parsed = JSON.parse(raw) as Partial<RecipeFile>;
       for (const r of Array.isArray(parsed.recipes) ? parsed.recipes : []) {
         if (!r || typeof r.hostname !== "string" || typeof r.pageType !== "string") continue;
@@ -270,16 +331,21 @@ let exitHookInstalled = false;
 /** One cache per file for the whole process, flushed on exit. */
 export function sharedRecipeCache(path: string = DEFAULT_RECIPE_PATH): DomainRecipeCache {
   const abs = resolve(process.cwd(), path);
-  let cache = shared.get(abs);
-  if (!cache) {
-    cache = new DomainRecipeCache(abs);
-    shared.set(abs, cache);
-  }
+  // Registered before the database opens: exit listeners run in registration
+  // order, and the final flush must land before the connection is closed.
   if (!exitHookInstalled) {
     exitHookInstalled = true;
     process.once("exit", () => {
       for (const c of shared.values()) c.flush();
     });
+  }
+  let cache = shared.get(abs);
+  if (!cache) {
+    // A .db / .sqlite path selects the SQLite backend; anything else stays JSON.
+    cache = /\.(db|sqlite3?)$/i.test(abs)
+      ? new DomainRecipeCache(abs, { db: openDb(abs) })
+      : new DomainRecipeCache(abs);
+    shared.set(abs, cache);
   }
   return cache;
 }

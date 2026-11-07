@@ -2,7 +2,7 @@ node_modules/
 dist/
 logs/
 tempprofolio/
-profiles/
+/profiles/
 Cookies/
 reports/
 logs-shops/
@@ -13,3 +13,6 @@ bin/
 .DS_Store
 .env
 plan.md
+data/*.db
+data/*.db-wal
+data/*.db-shm

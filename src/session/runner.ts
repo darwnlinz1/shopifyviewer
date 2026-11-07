@@ -12,6 +12,8 @@ import { randomUUID } from "node:crypto";
 import type { SimulatorConfig } from "../config.js";
 import { startSession, type SessionSnapshot } from "./aiManager.js";
 import { CookiePool } from "../ai/cookiePool.js";
+import { storageFor } from "../storage/db.js";
+import { AlertManager } from "../alerts/alertManager.js";
 import type { SessionResult } from "../types.js";
 import { Rng, randomSeed } from "../util/random.js";
 
@@ -49,8 +51,10 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
   const seedRng = new Rng(config.seed ?? randomSeed());
   // One pool per run: a rate limit discovered by session 3 immediately
   // shields that cookie from sessions 4..N.
-  const aiCfg = (config as any).ai ?? {};
-  const sharedPool = aiCfg.cookiesDir ? new CookiePool(aiCfg.cookiesDir) : undefined;
+  const aiCfg = config.ai ?? ({} as Partial<NonNullable<typeof config.ai>>);
+  const db = storageFor(config);
+  const alerts = new AlertManager(config.alerts, db);
+  const sharedPool = aiCfg.cookiesDir ? new CookiePool(aiCfg.cookiesDir, db ? { db } : {}) : undefined;
 
   const queue = Array.from({ length: count }, (_, index) => ({
     slot: index,
@@ -75,6 +79,7 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
           config,
           lingerMs: config.session.lingerMs,
           ...(sharedPool ? { cookiePool: sharedPool } : {}),
+          alerts,
           ...(signal ? { signal } : {}),
         });
         results.push(result);

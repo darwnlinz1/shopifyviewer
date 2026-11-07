@@ -5,7 +5,7 @@
     "description": "AI-driven Shopify storefront simulator — uses Claude for adaptive element detection",
     "type": "module",
     "engines": {
-        "node": ">=20"
+        "node": ">=22.13"
     },
     "bin": {
         "storefront-sim": "./dist/cli.js"
@@ -14,9 +14,9 @@
         "prebuild": "node scripts/check-unicode.mjs",
         "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
         "prestart": "node scripts/download-ungoogled.mjs",
-        "start": "node --enable-source-maps dist/cli.js dashboard --host 127.0.0.1 --port 7317",
+        "start": "node --disable-warning=ExperimentalWarning --enable-source-maps dist/cli.js dashboard --host 127.0.0.1 --port 7317",
         "dev": "tsx src/cli.ts dashboard --host 127.0.0.1 --port 7317",
-        "test": "node --test test/",
+        "test": "node --disable-warning=ExperimentalWarning --import ./test/_setup.mjs --test --test-concurrency=1 \"test/*.test.mjs\"",
         "setup:browser": "node scripts/download-ungoogled.mjs",
         "ai": "tsx src/cli.ts run --storefront"
     },

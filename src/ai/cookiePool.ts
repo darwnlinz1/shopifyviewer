@@ -10,9 +10,24 @@
  * <cookiesDir>/cookie-health.json (debounced) and reloaded on startup, so a
  * restart does not forget which cookies were failing.
  */
-import { readFileSync, readdirSync, existsSync, writeFileSync, renameSync, mkdirSync, appendFileSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, writeFileSync, renameSync, mkdirSync, appendFileSync, statSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import type { SiteViewerDb } from "../storage/db.js";
+
+const NS_HEALTH = "cookie_health";
+const NS_QUARANTINE = "cookie_quarantine";
+const NS_COOLDOWN = "cookie_cooldown";
+const NS_AUDIT = "cookie_audit";
+
+export interface CookiePoolOptions {
+  /**
+   * Persist health, cooldowns, quarantine and the audit trail in SQLite
+   * instead of side files in the cookies directory. Legacy files are imported
+   * once, then left alone.
+   */
+  db?: SiteViewerDb;
+}
 
 export interface CookieEntry {
   source: string;
@@ -108,8 +123,11 @@ export class CookiePool {
   private healthDirty = false;
   private lastHealthFlush = 0;
 
-  constructor(private readonly cookiesDir: string) {
+  private readonly db: SiteViewerDb | undefined;
+
+  constructor(private readonly cookiesDir: string, options: CookiePoolOptions = {}) {
     this.baseDir = resolve(cookiesDir);
+    this.db = options.db;
     mkdirSync(this.baseDir, { recursive: true });
     this.loadAll();
   }
@@ -117,6 +135,13 @@ export class CookiePool {
   // ── Audit plumbing ──
 
   private audit(entry: AuditEvent): void {
+    if (this.db) {
+      try {
+        const { event, ...rest } = entry;
+        this.db.appendEvent(NS_AUDIT, event, rest);
+      } catch { /* auditing must never break the pool */ }
+      return;
+    }
     try {
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
       appendFileSync(join(this.baseDir, AUDIT_FILE), line, "utf8");
@@ -142,6 +167,22 @@ export class CookiePool {
     if (!this.healthDirty) return;
     this.healthDirty = false;
     this.lastHealthFlush = Date.now();
+    if (this.db) {
+      try {
+        const db = this.db;
+        db.transaction(() => {
+          for (const [source, h] of this.health) db.putDoc(NS_HEALTH, source, h);
+          const now = Date.now();
+          for (const { key } of db.listDocs(NS_COOLDOWN)) {
+            if ((this.cooldownUntil.get(key) ?? 0) <= now) db.deleteDoc(NS_COOLDOWN, key);
+          }
+          for (const [source, until] of this.cooldownUntil) {
+            if (until > now) db.putDoc(NS_COOLDOWN, source, until);
+          }
+        });
+      } catch { this.healthDirty = true; /* retry on the next tick */ }
+      return;
+    }
     try {
       const data = {
         version: 2,
@@ -352,6 +393,16 @@ export class CookiePool {
   }
 
   private loadQuarantine(): void {
+    if (this.db) {
+      this.importLegacyFiles(this.db);
+      for (const { key, value } of this.db.listDocs<any>(NS_QUARANTINE)) this.quarantined.set(key, value);
+      for (const { key, value } of this.db.listDocs<CookieHealth>(NS_HEALTH)) this.persistedHealth.set(key, value);
+      const now = Date.now();
+      for (const { key, value } of this.db.listDocs<number>(NS_COOLDOWN)) {
+        if (Number.isFinite(value) && value > now) this.cooldownUntil.set(key, value);
+      }
+      return;
+    }
     try {
       const d = JSON.parse(readFileSync(join(this.baseDir, QUARANTINE_FILE), "utf8"));
       for (const [s, m] of Object.entries(d)) this.quarantined.set(s, m);
@@ -375,7 +426,42 @@ export class CookiePool {
 
   private readonly persistedHealth = new Map<string, CookieHealth>();
 
+  /** One-time import of the pre-SQLite side files; the files are renamed, never deleted. */
+  private importLegacyFiles(db: SiteViewerDb): void {
+    if (db.countDocs(NS_HEALTH) + db.countDocs(NS_QUARANTINE) > 0) return;
+    const quarantineFile = join(this.baseDir, QUARANTINE_FILE);
+    const healthFile = join(this.baseDir, HEALTH_FILE);
+    try {
+      db.transaction(() => {
+        if (existsSync(quarantineFile)) {
+          const q = JSON.parse(readFileSync(quarantineFile, "utf8"));
+          for (const [source, meta] of Object.entries(q ?? {})) db.putDoc(NS_QUARANTINE, source, meta);
+        }
+        if (existsSync(healthFile)) {
+          const raw = JSON.parse(readFileSync(healthFile, "utf8"));
+          const health = raw && raw.version === 2 ? raw.health ?? {} : raw ?? {};
+          for (const [source, h] of Object.entries(health)) db.putDoc(NS_HEALTH, source, h);
+          for (const [source, until] of Object.entries(raw?.cooldowns ?? {})) db.putDoc(NS_COOLDOWN, source, Number(until));
+        }
+      });
+      for (const f of [quarantineFile, healthFile]) {
+        if (existsSync(f)) renameSync(f, f + ".migrated");
+      }
+    } catch { /* unreadable legacy state is only lost history */ }
+  }
+
   private persistQuarantine(): void {
+    if (this.db) {
+      try {
+        const db = this.db;
+        db.transaction(() => {
+          const known = new Set(this.quarantined.keys());
+          for (const { key } of db.listDocs(NS_QUARANTINE)) if (!known.has(key)) db.deleteDoc(NS_QUARANTINE, key);
+          for (const [source, meta] of this.quarantined) db.putDoc(NS_QUARANTINE, source, meta);
+        });
+      } catch { /* best effort */ }
+      return;
+    }
     const p = join(this.baseDir, QUARANTINE_FILE);
     const tmp = p + "." + randomUUID().slice(0, 8) + ".tmp";
     const data: Record<string, any> = {};
@@ -383,7 +469,7 @@ export class CookiePool {
     try {
       writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
       renameSync(tmp, p);
-    } catch { try { require("node:fs").unlinkSync(tmp); } catch {} }
+    } catch { try { unlinkSync(tmp); } catch {} }
   }
 
   private quarantine(source: string, reason: string, mtimeMs?: number): void {

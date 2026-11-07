@@ -271,6 +271,13 @@ export class ClaudeClient {
       });
 
       // --- Error checking (exact from Python _check_response) ---
+      if (resp.status === 403 && (await this.isEdgeChallenge(resp))) {
+        // A Cloudflare interstitial says nothing about the cookie. Quarantining
+        // it for good (as an auth failure would) turns one transient challenge
+        // into a permanently lost account; a cooldown keeps it and lets the
+        // caller fail over to another transport meanwhile.
+        throw new ClaudeRateLimitError(cookie.source, 300);
+      }
       if (resp.status === 401 || resp.status === 403) {
         throw new ClaudeAuthError(cookie.source, "API rejected auth (" + resp.status + ")");
       }
@@ -423,6 +430,15 @@ export class ClaudeClient {
   }
 
   // --- Error classification ---
+
+  /** True for a Cloudflare managed-challenge response rather than an API-level refusal. */
+  private async isEdgeChallenge(resp: Response): Promise<boolean> {
+    if ((resp.headers.get("cf-mitigated") ?? "").toLowerCase() === "challenge") return true;
+    const type = resp.headers.get("content-type") ?? "";
+    if (!type.includes("text/html")) return false;
+    const body = (await resp.clone().text().catch(() => "")).slice(0, 4000).toLowerCase();
+    return body.includes("just a moment") || body.includes("cf-chl") || body.includes("challenge-platform");
+  }
 
   private looksLikeAccountError(message: string): boolean {
     const lower = message.toLowerCase();

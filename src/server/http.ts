@@ -19,6 +19,7 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, extname, normalize, resolve, sep } from "node:path";
+import { timingSafeEqual } from "node:crypto";
 import type { Orchestrator } from "./orchestrator.js";
 import { DEVICE_CATALOG } from "../browser/identity.js";
 
@@ -146,8 +147,63 @@ function engineFields(body: Record<string, unknown>): { browserProvider?: "built
   };
 }
 
+/** Constant-time string comparison; unequal lengths fail without leaking where they differ. */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) {
+    // Still burn a comparison so the length mismatch is not a faster path.
+    timingSafeEqual(ab, ab);
+    return false;
+  }
+  return timingSafeEqual(ab, bb);
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+/** Hostname part of a Host header, port stripped (IPv6 literals keep their brackets). */
+function hostnameOf(hostHeader: string): string {
+  const h = hostHeader.trim().toLowerCase();
+  if (h.startsWith("[")) return h.slice(0, h.indexOf("]") + 1);
+  return h.split(":")[0] ?? "";
+}
+
+/**
+ * DNS-rebinding and cross-site request guard.
+ *
+ * A dashboard bound to loopback is still reachable from any web page the
+ * operator opens: the page's JavaScript can aim `fetch` at 127.0.0.1, or point
+ * an attacker-owned hostname at it (DNS rebinding) and read the answers. Two
+ * cheap, standard checks close that:
+ *   - the Host header must be a loopback name (or the exact host the server was
+ *     told to bind to) — a rebound hostname carries the attacker's name;
+ *   - a state-changing request that carries an Origin must come from the same
+ *     host it is addressed to — a cross-site form or fetch carries a foreign one.
+ */
+function crossSiteVerdict(req: IncomingMessage, boundHost: string): string | null {
+  const hostHeader = String(req.headers.host ?? "");
+  const hostname = hostnameOf(hostHeader);
+  const bound = boundHost.trim().toLowerCase();
+  const wildcard = bound === "0.0.0.0" || bound === "::";
+  const loopbackBound = LOOPBACK_HOSTS.has(bound) || bound === "";
+  if (loopbackBound && !LOOPBACK_HOSTS.has(hostname)) {
+    return `Host "${hostHeader}" is not allowed on a loopback dashboard`;
+  }
+  if (!loopbackBound && !wildcard && hostname !== bound && !LOOPBACK_HOSTS.has(hostname)) {
+    return `Host "${hostHeader}" is not allowed`;
+  }
+  const method = req.method ?? "GET";
+  const origin = req.headers.origin;
+  if (origin && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+    let originHost = "";
+    try { originHost = new URL(origin).host.toLowerCase(); } catch { return "Malformed Origin"; }
+    if (originHost !== hostHeader.trim().toLowerCase()) return `Cross-site request from ${origin} refused`;
+  }
+  return null;
+}
+
 /** Serve a static asset from the bundled public directory. */
-async function serveStatic(res: ServerResponse, pathname: string, token?: string): Promise<void> {
+async function serveStatic(res: ServerResponse, pathname: string, injectToken?: string): Promise<void> {
   const relative = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
   // Resolve inside PUBLIC_DIR and verify the result stayed there, so a
   // traversal like /../../etc/passwd cannot escape.
@@ -163,9 +219,11 @@ async function serveStatic(res: ServerResponse, pathname: string, token?: string
   }
 
   // Hand the page its token before app.js runs, so every API call it makes
-  // can carry it without any extra operator step.
-  if (token && target.endsWith("index.html")) {
-    const inject = `<script>window.__DASH_TOKEN__=${JSON.stringify(token)};</script>`;
+  // can carry it. The caller passes a token ONLY for a request that already
+  // proved it knows it; the shell is never a way to obtain it.
+  if (injectToken && target.endsWith("index.html")) {
+    // "<" is escaped so the value can never close the script element.
+    const inject = `<script>window.__DASH_TOKEN__=${JSON.stringify(injectToken).replace(/</g, "\\u003c")};</script>`;
     const html = contents.toString("utf8");
     const headAt = html.indexOf("<head>");
     const patched =
@@ -319,7 +377,7 @@ function streamMultiplexedScreens(orchestrator: Orchestrator, req: IncomingMessa
 }
 
 /** Build (but do not start) the dashboard HTTP server. */
-export function createDashboardServer(orchestrator: Orchestrator, token?: string): Server {
+export function createDashboardServer(orchestrator: Orchestrator, token?: string, boundHost = "127.0.0.1"): Server {
   /** Open SSE connections. */
   const sseClients = new Set<ServerResponse>();
 
@@ -356,13 +414,18 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
     // When a token is configured, every API call must carry it — query param
     // (so <img>, EventSource and fetch all work) or a Bearer header. The
     // static shell stays open: it holds no state and cannot act.
-    if (token && path.startsWith("/api/")) {
-      const presented = url.searchParams.get("token") ?? "";
-      const bearer = /^Bearer\s+(.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
-      if (presented !== token && bearer !== token) {
-        sendJson(res, 401, { error: "Invalid or missing dashboard token" });
-        return;
-      }
+    const refused = crossSiteVerdict(req, boundHost);
+    if (refused) {
+      sendJson(res, 403, { error: refused });
+      return;
+    }
+
+    const presentedToken = url.searchParams.get("token") ?? "";
+    const bearerToken = /^Bearer\s+(.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
+    const authed = !token || safeEqual(presentedToken, token) || safeEqual(bearerToken, token);
+    if (token && path.startsWith("/api/") && !authed) {
+      sendJson(res, 401, { error: "Invalid or missing dashboard token" });
+      return;
     }
 
     // ---- live state -----------------------------------------------------
@@ -378,6 +441,12 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
 
     if (path === "/api/devices" && method === "GET") {
       sendJson(res, 200, { catalog: thisCatalog() });
+      return;
+    }
+
+    if (path === "/api/alerts" && method === "GET") {
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? 50) || 50));
+      sendJson(res, 200, { active: orchestrator.alerts.active, history: orchestrator.alerts.history(limit) });
       return;
     }
 
@@ -661,7 +730,9 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
 
     if (path.startsWith("/api/")) throw new HttpError(404, `No such endpoint: ${method} ${path}`);
     if (method !== "GET") throw new HttpError(405, "Method not allowed");
-    await serveStatic(res, path, token);
+    // The shell gets the token injected only when the visitor already holds it
+    // (opened via /?token=…); without it the page loads but every API call 401s.
+    await serveStatic(res, path, token && authed ? token : undefined);
   }
 }
 
@@ -672,7 +743,7 @@ export async function startDashboard(
   host: string,
   token?: string,
 ): Promise<DashboardServer> {
-  const server = createDashboardServer(orchestrator, token);
+  const server = createDashboardServer(orchestrator, token, host);
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

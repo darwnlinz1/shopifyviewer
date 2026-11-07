@@ -31,6 +31,9 @@ import { SessionTimer } from "./timer.js";
 import { CookiePool } from "../ai/cookiePool.js";
 import { ElementDetector } from "../ai/elementDetector.js";
 import { sharedRecipeCache } from "../ai/domainRecipeCache.js";
+import { resolveAiProvider } from "../ai/provider.js";
+import { storageFor } from "../storage/db.js";
+import type { AlertManager } from "../alerts/alertManager.js";
 import { DetectionWaterfall, featuresOf, type BuyBoxResolution } from "../ai/detectionWaterfall.js";
 import { AiBehaviorEngine, type Personality, type ShopperState, type VisitStateSnapshot } from "../behavior/aiEngine.js";
 import type { Profile } from "../profiles/types.js";
@@ -118,6 +121,10 @@ export interface SessionSnapshot {
   error?: string;
 }
 
+function hostOf(url: string): string {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; }
+}
+
 export interface SessionOptions {
   slot: number;
   sessionId: string;
@@ -147,6 +154,8 @@ export interface SessionOptions {
    * Omitted, each session builds its own and learns limits the hard way.
    */
   cookiePool?: CookiePool;
+  /** Health alerts (ATC collapse, challenge storms, AI provider failures). */
+  alerts?: AlertManager;
   /**
    * A second tab opened alongside the storefront on launch, showing an account
    * page for the imported cookies (default https://shop.app/account). The
@@ -467,7 +476,10 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     ...(((config as any).ai ?? {}) as Partial<typeof DEFAULT_AI_CONFIG>),
     ...(profileAtcMs !== undefined ? { advanceActionTimeMs: profileAtcMs } : {}),
   };
-  const cookiePool = options.cookiePool ?? new CookiePool(aiConfig.cookiesDir);
+  const storageDb = storageFor(config);
+  const cookiePool = options.cookiePool ?? new CookiePool(aiConfig.cookiesDir, storageDb ? { db: storageDb } : {});
+  const aiProvider = resolveAiProvider(aiConfig);
+  logger.info("ai_provider", `mode=${aiProvider.mode} (${aiProvider.reason})`);
   const poolStats = cookiePool.stats();
   logger.info("cookie_pool", `loaded=` + poolStats.totalLoaded + ` active=` + poolStats.active + ` quarantined=` + poolStats.quarantined, {
     data: { ...poolStats },
@@ -479,12 +491,19 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     detectionCooldownMs: aiConfig.detectionCooldownMs,
     model: aiConfig.model,
     ...(aiConfig.claudeBaseUrl ? { baseUrl: aiConfig.claudeBaseUrl } : {}),
+    provider: aiProvider.mode,
+    ...(aiProvider.api ? { api: aiProvider.api } : {}),
+    onProviderEvent: (e) => {
+      logger.warn("ai_provider_event", `${e.kind}: ${e.detail}`);
+      options.alerts?.providerEvent(e);
+    },
   });
   // Tier 0 recipes are shared by every session in the process (and on disk);
   // Tier 2 (the detector above) is only consulted where Tiers 0/1 fall short.
   const waterfall = new DetectionWaterfall(
     detector,
-    sharedRecipeCache(aiConfig.recipeCachePath ?? DEFAULT_AI_CONFIG.recipeCachePath),
+    // Unset → the storage database; an explicit .json path keeps the legacy file.
+    sharedRecipeCache(aiConfig.recipeCachePath || (storageDb ? storageDb.path : undefined)),
     logger,
     { threshold: aiConfig.tier1ConfidenceThreshold ?? 0.8, maxHtmlChars: aiConfig.maxHtmlChars },
   );
@@ -739,6 +758,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
         const wafState = await WafChallengeDetector.inspectPage(page, logger);
         if (wafState.engine !== "none") {
           logger.warn("waf_challenge_detected", `WAF challenge encountered: ${wafState.engine}`, { data: { url: currentUrl } });
+          options.alerts?.recordChallenge(profile?.proxy ?? "", hostOf(currentUrl));
           const solveRes = await WafChallengeDetector.resolveChallenge(page, wafState, logger);
           if (solveRes.resolved) {
             logger.info("waf_challenge_cleared", `WAF challenge ${wafState.engine} cleared successfully via ${solveRes.actionTaken}`);
@@ -899,6 +919,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       recordView(decision, outcome, Date.now() - actionStartedAt);
       if (decision.action === "add_to_cart") {
         engine.notifyAtcResult(outcome.atcVerified === true, { url: atcProductUrl });
+        options.alerts?.recordAtc(hostOf(currentUrl), outcome.atcVerified === true);
       }
       if (outcome.atcVerified) {
         atcVerified = true;

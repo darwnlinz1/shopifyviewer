@@ -232,6 +232,15 @@ export interface LoggingConfig {
   console: boolean;
 }
 
+export interface StorageConfig {
+  /**
+   * SQLite database holding profiles, selector recipes, cookie-pool health and
+   * the audit trail. Empty string disables it and falls back to the legacy
+   * JSON side files.
+   */
+  dbPath: string;
+}
+
 export interface SimulatorConfig {
   /** Storefront under test, e.g. "https://your-shop.com". Empty = per-profile only. */
   storefront: string;
@@ -250,6 +259,9 @@ export interface SimulatorConfig {
   safety: SafetyConfig;
   logging: LoggingConfig;
   ai?: AiConfig;
+  storage?: StorageConfig;
+  /** Realtime health alerts (Telegram / Discord / generic webhook). */
+  alerts?: AlertsConfig;
 }
 
 export const DEFAULT_CONFIG: SimulatorConfig = {
@@ -353,6 +365,8 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
     jsonl: true,
     console: true,
   },
+  storage: { dbPath: "./data/siteviewer.db" },
+  alerts: { enabled: false, sinks: [] },
 };
 
 /** Deep-merge a partial config over a base, arrays replaced wholesale. */
@@ -476,7 +490,30 @@ export function loadConfig(
 export const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5";
 
 /** Default AI configuration for element detection. */
+export type AiProvider = "cookie_pool" | "anthropic_api" | "hybrid";
+
+export interface AnthropicApiConfig {
+  /** Environment variable holding the key. The key itself is never read from a file by default. */
+  apiKeyEnv?: string;
+  /** Literal key; discouraged — prefer the environment variable so it stays out of config files and git. */
+  apiKey?: string;
+  baseUrl?: string;
+  /** Model for the official API (default: the small, fast tier). */
+  model?: string;
+  maxTokens?: number;
+  timeoutMs?: number;
+}
+
 export interface AiConfig {
+  /**
+   * Which transport answers Tier-2 detection.
+   *   cookie_pool    the claude.ai session-cookie pool only
+   *   anthropic_api  the official API only (needs ANTHROPIC_API_KEY)
+   *   hybrid         cookie pool first, official API when it fails or is empty
+   * Unset: hybrid when an API key is available, otherwise cookie_pool.
+   */
+  provider?: AiProvider;
+  anthropic?: AnthropicApiConfig;
   cookiesDir: string;
   claudeBaseUrl?: string;
   model?: string;
@@ -484,7 +521,10 @@ export interface AiConfig {
   maxRetries: number;
   advanceActionTimeMs: number;
   detectionCooldownMs: number;
-  /** Tier 0 selector memory, keyed by hostname + page type. */
+  /**
+   * Tier 0 selector memory, keyed by hostname + page type. Unset = the storage
+   * database; a path ending in .json keeps the legacy single-file cache.
+   */
   recipeCachePath?: string;
   /** Tier 1 buy-box confidence below which the AI tier is consulted. */
   tier1ConfidenceThreshold?: number;
@@ -497,7 +537,7 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   maxRetries: 3,
   advanceActionTimeMs: 6 * 60 * 1000,  // 6 minutes (base ATC mark)
   detectionCooldownMs: 500,               // 500ms between AI calls
-  recipeCachePath: "./data/domain-recipes.json",
+  // Unset: Tier 0 recipes live in the storage database (config.storage.dbPath).
   tier1ConfidenceThreshold: 0.8,
 };
 
@@ -512,3 +552,28 @@ export const DEFAULT_AI_DRIVEN_CONFIG: AiDrivenConfig = {
   ...DEFAULT_CONFIG,
   ai: DEFAULT_AI_CONFIG,
 };
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS (realtime health notifications)
+// ═══════════════════════════════════════════════════════════════════════
+
+export type AlertSinkConfig =
+  | { type: "telegram"; botTokenEnv?: string; botToken?: string; chatId: string }
+  | { type: "discord"; webhookUrlEnv?: string; webhookUrl?: string }
+  | { type: "webhook"; url?: string; urlEnv?: string; headers?: Record<string, string> };
+
+export interface AlertsConfig {
+  enabled: boolean;
+  sinks: AlertSinkConfig[];
+  /** Same alert key is delivered at most once per this window. Default 10 min. */
+  cooldownMs?: number;
+  /** ATC success-rate alert: needs this many attempts on a host in the window. */
+  atcMinAttempts?: number;
+  /** Alert when a host's ATC success rate over the window drops below this (0-1). */
+  atcMinSuccessRate?: number;
+  /** Rolling window for ATC / challenge rates. Default 30 min. */
+  windowMs?: number;
+  /** Alert after this many WAF challenges on one proxy within the window. */
+  challengeThreshold?: number;
+}

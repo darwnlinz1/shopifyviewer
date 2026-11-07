@@ -26,6 +26,8 @@ import {
 import { startSession, type SessionHandle, type SessionSnapshot } from "../session/aiManager.js";
 import { ProfileStore, type CreateProfileInput, type UpdateProfileInput } from "../profiles/store.js";
 import { CookiePool } from "../ai/cookiePool.js";
+import { storageFor, type SiteViewerDb } from "../storage/db.js";
+import { AlertManager } from "../alerts/alertManager.js";
 import { parseCookieText, type ParsedCookieFile } from "../profiles/cookies.js";
 import { testProxy } from "../profiles/proxy.js";
 import { resolveGeoFromFilename, type GeoInfo } from "../profiles/geo.js";
@@ -77,11 +79,18 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   /** One cookie pool for the whole dashboard process — rate limits learned by
    * any profile's session immediately protect every other profile. */
   private sharedPool?: CookiePool;
+  /** Shared SQLite storage; undefined when disabled or unavailable (legacy files are used). */
+  readonly db: SiteViewerDb | undefined;
+  readonly alerts: AlertManager;
 
   constructor(readonly config: SimulatorConfig) {
     super();
     this.setMaxListeners(150);
-    this.store = new ProfileStore(config.browser.profileDir);
+    this.db = storageFor(config, (err) =>
+      console.warn(`[storage] SQLite unavailable, using legacy JSON files: ${err instanceof Error ? err.message : String(err)}`),
+    );
+    this.alerts = new AlertManager(config.alerts, this.db);
+    this.store = new ProfileStore(config.browser.profileDir, this.db ? { db: this.db } : {});
     this.cleanupStaleProfiles();
     this.logger = new Logger("dashboard", { ...config.logging, jsonl: false }, "dash");
     this.hibernator = new TabHibernationEngine(this.logger);
@@ -598,6 +607,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       ...(options.resumeUrl ? { resumeUrl: options.resumeUrl } : {}),
       ...(options.visitState ? { inherited: options.visitState } : {}),
       cookiePool: this.ensureSharedPool(),
+      alerts: this.alerts,
       launchHooks: {
         bitBrowserLinked: (link) => {
           this.store.recordBitBrowserLink(profileId, {
@@ -696,7 +706,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   /** One lazily-built pool shared by every profile's session. */
   private ensureSharedPool(): CookiePool {
     if (!this.sharedPool) {
-      this.sharedPool = new CookiePool((this.config as any).ai?.cookiesDir ?? "./Cookies");
+      this.sharedPool = new CookiePool(
+        this.config.ai?.cookiesDir ?? "./Cookies",
+        this.db ? { db: this.db } : {},
+      );
     }
     return this.sharedPool;
   }
