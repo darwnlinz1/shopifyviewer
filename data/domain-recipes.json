@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "recipes": [
+    {
+      "hostname": "127.0.0.1",
+      "pageType": "home",
+      "source": "tier1",
+      "confidence": 0.85,
+      "hits": 0,
+      "failures": 0,
+      "learnedAt": "2026-10-16T17:31:08.928Z",
+      "updatedAt": "2026-10-16T17:31:08.928Z",
+      "productCard": "h3.card__heading a[href*=\"/products/\"]"
+    },
+    {
+      "hostname": "127.0.0.1",
+      "pageType": "collection",
+      "source": "tier1",
+      "confidence": 0.85,
+      "hits": 0,
+      "failures": 0,
+      "learnedAt": "2026-10-16T17:31:15.890Z",
+      "updatedAt": "2026-10-16T17:31:15.890Z",
+      "productCard": "h3.card__heading a[href*=\"/products/\"]"
+    },
+    {
+      "hostname": "127.0.0.1",
+      "pageType": "product",
+      "source": "tier1",
+      "confidence": 1,
+      "hits": 0,
+      "failures": 0,
+      "learnedAt": "2026-10-16T17:31:29.685Z",
+      "updatedAt": "2026-10-16T17:31:29.685Z",
+      "addToCart": "form[action*=\"/cart/add\"] button[name=\"add\"]",
+      "variantGroups": [
+        "variant-selects fieldset",
+        "variant-selects fieldset"
+      ],
+      "gallery": "[data-thumbnail-id]",
+      "sections": "details > summary",
+      "cartDrawer": "cart-drawer"
+    }
+  ]
+}

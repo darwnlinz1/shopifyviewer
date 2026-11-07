@@ -18,8 +18,18 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join, extname, normalize } from "node:path";
+import { dirname, join, extname, normalize, resolve, sep } from "node:path";
 import type { Orchestrator } from "./orchestrator.js";
+import { DEVICE_CATALOG } from "../browser/identity.js";
+
+/** Shape the device catalog for the dashboard: kinds → model labels. */
+function thisCatalog(): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [kind, list] of Object.entries(DEVICE_CATALOG)) {
+    out[kind] = list.map((d) => d.model);
+  }
+  return out;
+}
 
 const PUBLIC_DIR = join(dirname(fileURLToPath(import.meta.url)), "public");
 
@@ -87,13 +97,63 @@ function requireString(body: Record<string, unknown>, key: string): string {
   return value;
 }
 
+/** Parse a device emulation pick from a request body; undefined = not set. */
+function readDevice(body: Record<string, unknown>): import("../profiles/types.js").ProfileDevice | null | undefined {
+  if (body.device === null) return null;
+  if (typeof body.device !== "object" || body.device === null) return undefined;
+  const d = body.device as Record<string, unknown>;
+  const kind = d.kind;
+  if (kind === "desktop") return null;
+  if (kind === "android" || kind === "iphone" || kind === "ipad") {
+    let model = typeof d.model === "string" ? d.model.trim() : "";
+    if (!model) {
+      if (kind === "android") model = "Pixel 7";
+      else if (kind === "iphone") model = "iPhone 14 Pro";
+      else if (kind === "ipad") model = "iPad Pro 11";
+    }
+    return { kind, model } as import("../profiles/types.js").ProfileDevice;
+  }
+  return undefined;
+}
+
+/**
+ * Browser engine pick from a request body. Absent → undefined (untouched);
+ * null / "" / "default" → null (follow the config default).
+ */
+function readProvider(body: Record<string, unknown>): "builtin" | "bitbrowser" | null | undefined {
+  if (!("browserProvider" in body)) return undefined;
+  const value = body.browserProvider;
+  if (value === null || value === "" || value === "default") return null;
+  if (value === "builtin" || value === "bitbrowser") return value;
+  throw new HttpError(400, `Invalid browser provider: ${String(value)} (expected builtin or bitbrowser)`);
+}
+
+/** BitBrowser profile id from a request body; null/"" unlinks. */
+function readBitBrowserId(body: Record<string, unknown>): string | null | undefined {
+  if (!("bitBrowserId" in body)) return undefined;
+  const value = body.bitBrowserId;
+  if (value === null || value === "") return null;
+  if (typeof value === "string") return value;
+  throw new HttpError(400, `"bitBrowserId" must be a string or null`);
+}
+
+function engineFields(body: Record<string, unknown>): { browserProvider?: "builtin" | "bitbrowser" | null; bitBrowserId?: string | null } {
+  const provider = readProvider(body);
+  const bitBrowserId = readBitBrowserId(body);
+  return {
+    ...(provider !== undefined ? { browserProvider: provider } : {}),
+    ...(bitBrowserId !== undefined ? { bitBrowserId } : {}),
+  };
+}
+
 /** Serve a static asset from the bundled public directory. */
-async function serveStatic(res: ServerResponse, pathname: string): Promise<void> {
+async function serveStatic(res: ServerResponse, pathname: string, token?: string): Promise<void> {
   const relative = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
   // Resolve inside PUBLIC_DIR and verify the result stayed there, so a
   // traversal like /../../etc/passwd cannot escape.
-  const target = join(PUBLIC_DIR, normalize(relative));
-  if (!target.startsWith(PUBLIC_DIR)) throw new HttpError(403, "Forbidden");
+  const root = resolve(PUBLIC_DIR);
+  const target = resolve(root, normalize(relative));
+  if (target !== root && !target.startsWith(root + sep)) throw new HttpError(403, "Forbidden");
 
   let contents: Buffer;
   try {
@@ -101,6 +161,20 @@ async function serveStatic(res: ServerResponse, pathname: string): Promise<void>
   } catch {
     throw new HttpError(404, "Not found");
   }
+
+  // Hand the page its token before app.js runs, so every API call it makes
+  // can carry it without any extra operator step.
+  if (token && target.endsWith("index.html")) {
+    const inject = `<script>window.__DASH_TOKEN__=${JSON.stringify(token)};</script>`;
+    const html = contents.toString("utf8");
+    const headAt = html.indexOf("<head>");
+    const patched =
+      headAt >= 0
+        ? html.slice(0, headAt + 6) + inject + html.slice(headAt + 6)
+        : inject + html;
+    contents = Buffer.from(patched, "utf8");
+  }
+
   res.writeHead(200, {
     "content-type": CONTENT_TYPES[extname(target)] ?? "application/octet-stream",
     "content-length": contents.length,
@@ -180,26 +254,95 @@ function streamMjpeg(
   res.on("error", finish);
 }
 
+/**
+ * Stream ALL profiles' screens over ONE multipart connection.
+ * Each part has X-Profile-Id header so the client knows which tile to update.
+ * Replaces N individual MJPEG connections with a single one.
+ */
+function streamMultiplexedScreens(orchestrator: Orchestrator, req: IncomingMessage, res: ServerResponse): void {
+  const BOUNDARY = "multiprofile";
+
+  res.writeHead(200, {
+    "content-type": `multipart/x-mixed-replace; boundary=${BOUNDARY}`,
+    "cache-control": "no-store, no-transform",
+    connection: "close",
+  });
+
+  const unsubs: Array<() => void> = [];
+  const lastSentByProfile = new Map<string, number>();
+  let closed = false;
+
+  const sendFrame = (profileId: string, frame: Buffer): void => {
+    if (closed || res.writableEnded || res.writableNeedDrain) return;
+    res.write(
+      `--${BOUNDARY}\r\nX-Profile-Id: ${profileId}\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`
+    );
+    res.write(frame);
+    res.write("\r\n");
+    lastSentByProfile.set(profileId, Date.now());
+  };
+
+  // Subscribe to each active screencast
+  for (const view of orchestrator.snapshot()) {
+    const sc = orchestrator.screencastFor(view.profile.id);
+    if (!sc) continue;
+    try {
+      const unsub = sc.subscribe((frame) => {
+        sendFrame(view.profile.id, frame);
+      }, "thumb");
+      unsubs.push(unsub);
+    } catch {}
+  }
+
+  // Heartbeat: re-send last frames to keep connection warm
+  const heartbeat = setInterval(() => {
+    if (closed || res.writableEnded) return;
+    const now = Date.now();
+    for (const view of orchestrator.snapshot()) {
+      const sc = orchestrator.screencastFor(view.profile.id);
+      if (!sc?.lastFrame) continue;
+      if (now - (lastSentByProfile.get(view.profile.id) ?? 0) >= 2500) {
+        sendFrame(view.profile.id, sc.lastFrame);
+      }
+    }
+  }, 3000);
+
+  const cleanup = (): void => {
+    closed = true;
+    clearInterval(heartbeat);
+    unsubs.forEach(u => u());
+    if (!res.writableEnded) res.end();
+  };
+  req.on("close", cleanup);
+  req.on("error", cleanup);
+  res.on("error", cleanup);
+}
+
 /** Build (but do not start) the dashboard HTTP server. */
-export function createDashboardServer(orchestrator: Orchestrator): Server {
+export function createDashboardServer(orchestrator: Orchestrator, token?: string): Server {
   /** Open SSE connections. */
   const sseClients = new Set<ServerResponse>();
 
   orchestrator.on("update", (state) => {
     const payload = `event: state\ndata: ${JSON.stringify(state)}\n\n`;
     for (const client of sseClients) {
-      if (!client.writableEnded) client.write(payload);
+      if (!client.writableEnded && !client.writableNeedDrain) client.write(payload);
     }
   });
 
   return createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
-      const status = err instanceof HttpError ? err.status : 500;
-      const message = err instanceof Error ? err.message : String(err);
-      if (res.headersSent) {
-        res.end();
-        return;
+      let status = 500;
+      if (err instanceof HttpError) {
+        status = err.status;
+      } else if (err instanceof Error) {
+        const msg = err.message;
+        if (msg.startsWith("No such profile")) status = 404;
+        else if (/^(Invalid|cannot|must|empty|greater|Storefront)/i.test(msg)) status = 400;
+        else if (/already has a browser open/i.test(msg)) status = 409;
       }
+      const message = err instanceof Error ? err.message : String(err);
+      if (res.headersSent) { res.end(); return; }
       sendJson(res, status, { error: message });
     });
   });
@@ -209,14 +352,67 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
     const path = url.pathname;
     const method = req.method ?? "GET";
 
+    // ---- auth ------------------------------------------------------------
+    // When a token is configured, every API call must carry it — query param
+    // (so <img>, EventSource and fetch all work) or a Bearer header. The
+    // static shell stays open: it holds no state and cannot act.
+    if (token && path.startsWith("/api/")) {
+      const presented = url.searchParams.get("token") ?? "";
+      const bearer = /^Bearer\s+(.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
+      if (presented !== token && bearer !== token) {
+        sendJson(res, 401, { error: "Invalid or missing dashboard token" });
+        return;
+      }
+    }
+
     // ---- live state -----------------------------------------------------
+    if (path === "/api/health" && method === "GET") {
+      sendJson(res, 200, { ok: true, uptime: process.uptime() });
+      return;
+    }
+
     if (path === "/api/meta" && method === "GET") {
       sendJson(res, 200, orchestrator.meta());
       return;
     }
 
+    if (path === "/api/devices" && method === "GET") {
+      sendJson(res, 200, { catalog: thisCatalog() });
+      return;
+    }
+
+    if (path === "/api/bitbrowser/status" && method === "GET") {
+      sendJson(res, 200, await orchestrator.bitBrowserStatus());
+      return;
+    }
+
+    if (path === "/api/bitbrowser/profiles" && method === "GET") {
+      const page = Math.max(0, Number(url.searchParams.get("page") ?? 0) || 0);
+      const pageSize = Math.min(100, Math.max(1, Number(url.searchParams.get("pageSize") ?? 50) || 50));
+      try {
+        sendJson(res, 200, await orchestrator.listBitBrowserProfiles(page, pageSize));
+      } catch (err) {
+        throw new HttpError(502, err instanceof Error ? err.message : String(err));
+      }
+      return;
+    }
+
     if (path === "/api/state" && method === "GET") {
       sendJson(res, 200, orchestrator.snapshot());
+      return;
+    }
+
+    if (path === "/api/config/privacy" && method === "GET") {
+      sendJson(res, 200, orchestrator.getPrivacyConfig());
+      return;
+    }
+
+    if (path === "/api/config/privacy" && method === "PATCH") {
+      const body = await readJsonBody(req);
+      const allowed = ["disableWebRTC", "disableGeolocation", "enableDoNotTrack", "disableWebGL", "disableCanvas"] as const;
+      const patch: Record<string, boolean> = {};
+      for (const k of allowed) if (typeof body[k] === "boolean") patch[k] = body[k] as boolean;
+      sendJson(res, 200, orchestrator.updatePrivacyConfig(patch));
       return;
     }
 
@@ -255,8 +451,72 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
           : {}),
         ...(typeof body.timezone === "string" ? { timezone: body.timezone } : {}),
         ...(typeof body.locale === "string" ? { locale: body.locale } : {}),
+        // Per-profile ATC schedule: number of minutes, or null for default.
+        ...(body.atcMinutes === null || typeof body.atcMinutes === "number"
+          ? { atcMinutes: body.atcMinutes as number | null }
+          : {}),
+        // Same fields the edit path accepts, so the create modal can configure
+        // everything a profile has without a follow-up PATCH.
+        ...(body.storefront === null || typeof body.storefront === "string"
+          ? { storefront: body.storefront as string | null }
+          : {}),
+        ...(typeof body.headed === "boolean" ? { headed: body.headed } : {}),
+        ...(() => { const d = readDevice(body); return d === undefined ? {} : { device: d }; })(),
+        ...engineFields(body),
       });
       sendJson(res, 201, profile);
+      return;
+    }
+
+    // ---- batch operations -------------------------------------------
+    if (path === "/api/profiles/batch-delete" && method === "POST") {
+      const body = await readJsonBody(req);
+      const ids = Array.isArray(body.ids) ? body.ids.filter((x: unknown) => typeof x === "string") : [];
+      const results = await Promise.allSettled(ids.map((id: string) => orchestrator.deleteProfile(id)));
+      const failed = results.filter((r) => r.status === "rejected").length;
+      sendJson(res, 200, { deleted: ids.length - failed, failed });
+      return;
+    }
+
+    // ---- bulk create: paste N sites + M proxies, get profiles fast ------
+    // One profile per proxy (M profiles), each pinned to a site round-robin
+    // from the pasted list. Sites and proxies need not match in count.
+    if (path === "/api/profiles/bulk-create" && method === "POST") {
+      const body = await readJsonBody(req);
+      const sites = Array.isArray(body.sites)
+        ? body.sites.filter((x: unknown): x is string => typeof x === "string" && x.trim() !== "")
+        : [];
+      const proxies = Array.isArray(body.proxies)
+        ? body.proxies.filter((x: unknown): x is string => typeof x === "string" && x.trim() !== "")
+        : [];
+      const durationMinutes = typeof body.durationMinutes === "number" ? body.durationMinutes : undefined;
+      const atcMinutes =
+        body.atcMinutes === null || typeof body.atcMinutes === "number"
+          ? (body.atcMinutes as number | null)
+          : undefined;
+      const device = readDevice(body);
+      const browserProvider = readProvider(body);
+      const result = orchestrator.bulkCreateProfiles({
+        sites,
+        proxies,
+        durationMinutes,
+        atcMinutes,
+        device,
+        ...(browserProvider !== undefined ? { browserProvider } : {}),
+      });
+      sendJson(res, 201, result);
+      return;
+    }
+
+    // ---- bulk device: apply a device emulation config to ALL profiles -----
+    if (path === "/api/profiles/bulk-device" && method === "POST") {
+      const body = await readJsonBody(req);
+      const device = readDevice(body);
+      const profiles = orchestrator.listProfiles();
+      for (const p of profiles) {
+        orchestrator.updateProfile(p.id, { device });
+      }
+      sendJson(res, 200, { updated: profiles.length, device });
       return;
     }
 
@@ -279,11 +539,17 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
               : {}),
             ...(typeof body.timezone === "string" ? { timezone: body.timezone } : {}),
             ...(typeof body.locale === "string" ? { locale: body.locale } : {}),
+            // null clears the override; a number sets minutes (0 = off).
+            ...(body.atcMinutes === null || typeof body.atcMinutes === "number"
+              ? { atcMinutes: body.atcMinutes as number | null }
+              : {}),
             // null clears the override; a string sets it. Absent = untouched.
             ...(body.storefront === null || typeof body.storefront === "string"
               ? { storefront: body.storefront as string | null }
               : {}),
             ...(typeof body.notes === "string" ? { notes: body.notes } : {}),
+            ...(() => { const d = readDevice(body); return d === undefined ? {} : { device: d }; })(),
+            ...engineFields(body),
           }),
         );
         return;
@@ -299,11 +565,12 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
         const body = await readJsonBody(req);
         const text = requireString(body, "contents");
         const name = typeof body.filename === "string" ? body.filename : "cookies";
-        const parsed = orchestrator.importCookies(id, text, name);
+        const { parsed, geo } = await orchestrator.importCookies(id, text, name);
         sendJson(res, 200, {
           format: parsed.format,
           imported: parsed.cookies.length,
           warnings: parsed.warnings.slice(0, 10),
+          geoSync: geo ? { country: geo.countryCode, countryName: geo.countryName, timezone: geo.timezone, locale: geo.locale } : null,
         });
         return;
       }
@@ -321,7 +588,12 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
       }
 
       if (action === "/start" && method === "POST") {
-        sendJson(res, 200, await orchestrator.startProfile(id));
+        // Fire-and-forget: don't block the HTTP response waiting for browser launch.
+        // The dashboard polls /api/state via SSE to see status changes.
+        orchestrator.startProfile(id).catch(err => {
+          console.error("start failed:", err.message);
+        });
+        sendJson(res, 202, { queued: true });
         return;
       }
 
@@ -362,6 +634,12 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
         return;
       }
 
+      if (action === "/force-atc" && method === "POST") {
+        const ok = orchestrator.forceAddToCart(id);
+        sendJson(res, 200, { forced: ok });
+        return;
+      }
+
       if (action === "/close" && method === "POST") {
         await orchestrator.closeSession(id);
         sendJson(res, 200, { closed: id });
@@ -375,9 +653,15 @@ export function createDashboardServer(orchestrator: Orchestrator): Server {
       }
     }
 
+    // ---- Multiplexed screen stream: ALL profiles over ONE connection ----
+    if (path === "/api/screens.mjpg" && method === "GET") {
+      streamMultiplexedScreens(orchestrator, req, res);
+      return;
+    }
+
     if (path.startsWith("/api/")) throw new HttpError(404, `No such endpoint: ${method} ${path}`);
     if (method !== "GET") throw new HttpError(405, "Method not allowed");
-    await serveStatic(res, path);
+    await serveStatic(res, path, token);
   }
 }
 
@@ -386,8 +670,9 @@ export async function startDashboard(
   orchestrator: Orchestrator,
   port: number,
   host: string,
+  token?: string,
 ): Promise<DashboardServer> {
-  const server = createDashboardServer(orchestrator);
+  const server = createDashboardServer(orchestrator, token);
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

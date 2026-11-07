@@ -62,20 +62,20 @@ test("reads an EditThisCookie array, including its own field spellings", () => {
         hostOnly: false,
         secure: true,
       },
-      {
-        name: "hostonly",
-        value: "1",
-        // … and a leading dot even on host-only cookies.
-        domain: ".shop.example",
-        hostOnly: true,
-      },
-    ]),
+    {
+      name: "hostonly",
+      value: "1",
+      // … and a leading dot even on host-only cookies.
+      domain: ".shop.example",
+      hostOnly: true,
+    },
+  ]),
   );
 
   assert.equal(parsed.format, "json-array");
   assert.equal(parsed.cookies[0].expires, 1893456000);
   assert.equal(parsed.cookies[0].sameSite, "None");
-  // hostOnly strips the leading dot so the browser scopes it correctly.
+  // Host-only scope is kept exactly as the export wrote it.
   assert.equal(parsed.cookies[1].domain, "shop.example");
 });
 
@@ -112,9 +112,35 @@ test("reads a Netscape cookies.txt, honouring the #HttpOnly_ prefix", () => {
   assert.equal(parsed.cookies[1].name, "_secure");
   assert.equal(parsed.cookies[1].httpOnly, true);
 
-  // includeSubdomains FALSE must not gain a leading dot.
+  // includeSubdomains FALSE stays host-only, exactly as the file says.
   assert.equal(parsed.cookies[2].domain, "shop.example");
   assert.equal(parsed.cookies[2].expires, -1);
+});
+
+test("keeps every row verbatim — no merging across scopes or snapshots", () => {
+  // OpenBullet-style export: metadata line up top, then the same session name
+  // present at BOTH scopes and twice with different values. A real browser
+  // holds all of these side by side; the jar must too.
+  const text = [
+    "Email: someone@example.com; Country: US",
+    "shop.example\tFALSE\t/\tTRUE\t1893456001\tshopify_essential\tnewer",
+    ".shop.example\tTRUE\t/\tTRUE\t1893456000\tshopify_essential\tolder",
+    "shop.example\tFALSE\t/\tTRUE\t1893456001\t__Host-stay\tfixed",
+    ".shop.example\tTRUE\t/\tTRUE\t1893456002\tshopify_essential\tdotted-new",
+  ].join("\n");
+
+  const parsed = parseCookieText(text);
+  assert.equal(parsed.format, "netscape");
+  assert.equal(parsed.warnings.length, 0); // metadata lines are ignored silently
+  const essentials = parsed.cookies.filter((c) => c.name === "shopify_essential");
+  assert.deepEqual(essentials.map((c) => `${c.domain}:${c.value}`).sort(), [
+    ".shop.example:dotted-new",
+    ".shop.example:older",
+    "shop.example:newer",
+  ]);
+  // __Host- cookies keep their host-only scope.
+  const host = parsed.cookies.find((c) => c.name === "__Host-stay");
+  assert.equal(host.domain, "shop.example");
 });
 
 test("detects the format from content, not the file extension", () => {
@@ -123,16 +149,49 @@ test("detects the format from content, not the file extension", () => {
   assert.equal(parsed.format, "netscape");
 });
 
-test("keeps an empty cookie value but rejects a missing one", () => {
+test("keeps cookies with an empty or absent value — nothing is dropped", () => {
   const parsed = parseCookieText(
     JSON.stringify([
       { name: "empty", value: "", domain: "x.example" },
       { name: "absent", domain: "x.example" },
     ]),
   );
-  assert.equal(parsed.cookies.length, 1);
+  assert.equal(parsed.warnings.length, 0);
+  assert.equal(parsed.cookies.length, 2);
   assert.equal(parsed.cookies[0].name, "empty");
-  assert.match(parsed.warnings[0], /absent/);
+  assert.equal(parsed.cookies[1].name, "absent");
+  assert.equal(parsed.cookies[1].value, "");
+});
+
+test("rescues a Netscape row whose empty value lost its trailing tab", () => {
+  // Six fields: the value column is gone entirely. This used to be skipped
+  // wholesale; now it imports with an empty value.
+  const parsed = parseCookieText(
+    ".shop.example\tTRUE\t/\tTRUE\t1893456000\tflag_cookie",
+  );
+  assert.equal(parsed.warnings.length, 0);
+  assert.equal(parsed.cookies.length, 1);
+  assert.equal(parsed.cookies[0].name, "flag_cookie");
+  assert.equal(parsed.cookies[0].value, "");
+});
+
+test("reads a space-separated cookies.txt written without tabs", () => {
+  const parsed = parseCookieText(
+    ".shop.example TRUE / TRUE 1893456000 cart abc123",
+  );
+  assert.equal(parsed.warnings.length, 0);
+  assert.equal(parsed.cookies.length, 1);
+  assert.equal(parsed.cookies[0].name, "cart");
+  assert.equal(parsed.cookies[0].value, "abc123");
+});
+
+test("derives the domain from url when a JSON export omits it", () => {
+  const parsed = parseCookieText(
+    JSON.stringify([{ name: "session", value: "tok", url: "https://shop.example/" }]),
+  );
+  assert.equal(parsed.warnings.length, 0);
+  assert.equal(parsed.cookies.length, 1);
+  assert.equal(parsed.cookies[0].domain, "shop.example");
 });
 
 test("fails loudly rather than returning an empty jar", () => {

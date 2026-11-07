@@ -47,11 +47,16 @@ export class Logger {
   private readonly threshold: number;
   private readonly useColor: boolean;
 
+  /** Optional callback that returns a formatted elapsed/total time string */
+  private timerFn?: () => string;
+
   constructor(
     private readonly sessionId: string,
     private readonly config: LoggingConfig,
     private readonly label = sessionId,
+    timerFn?: () => string,
   ) {
+    this.timerFn = timerFn;
     this.threshold = LEVEL_ORDER[config.level];
     this.useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
 
@@ -85,14 +90,22 @@ export class Logger {
     this.stream?.write(`${JSON.stringify(entry)}\n`);
 
     if (this.config.console && LEVEL_ORDER[level] >= this.threshold) {
-      const time = entry.ts.slice(11, 23);
       const color = this.useColor ? COLORS[level] : "";
       const reset = this.useColor ? RESET : "";
+      const dim = this.useColor ? "\x1b[90m" : "";
+      const bright = this.useColor ? "\x1b[97m" : "";
       const where = entry.url ? ` ${shorten(entry.url)}` : "";
-      const state = entry.state ? ` [${entry.state}]` : "";
       const detail = msg ? ` ${msg}` : "";
+      
+      // Build the countdown from the timer callback
+      const timer = this.timerFn ? ` ${dim}${this.timerFn()}${reset}` : "";
+      
+      // Pretty block format:
+      // [Gymshark     ] 02:31/05:00  ai_scan   discover products=13 /collections/all
+      const paddedLabel = this.label.padEnd(14).slice(0, 14);
+      
       process.stdout.write(
-        `${color}${time} ${this.label}${state} ${event}${reset}${detail}${where}\n`,
+        `${bright}[${paddedLabel}]${reset}${timer} ${color}${event}${reset}${detail}${where}\n`,
       );
     }
   }

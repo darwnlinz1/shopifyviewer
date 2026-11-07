@@ -9,7 +9,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 
-import { chromium } from "playwright-core";
+import { chromium } from "rebrowser-playwright";
 import { loadConfig } from "../dist/config.js";
 import { PageNavigator } from "../dist/navigator/pageNavigator.js";
 import { Pacing } from "../dist/behavior/timing.js";
@@ -20,6 +20,9 @@ import { startMockStorefront } from "./mockStorefront.mjs";
 function findChromium() {
   return [
     process.env.CHROMIUM_PATH,
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
     "/usr/bin/chromium",
     "/usr/bin/google-chrome",

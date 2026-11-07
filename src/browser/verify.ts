@@ -12,11 +12,11 @@
  * which is the actionable part: a browser claiming one timezone while its exit
  * IP is somewhere else is a configuration bug regardless of who is looking.
  */
-import type { Page } from "playwright-core";
+import type { Page } from "rebrowser-playwright";
 import type { SimulatorConfig } from "../config.js";
 import { Logger } from "../logging/logger.js";
 import { Rng, randomSeed } from "../util/random.js";
-import { launchBrowser, cloakBinaryStatus } from "./cloak.js";
+import { launchBrowser, browserBinaryStatus } from "./chrome.js";
 import { openSessionPage } from "../navigator/pageNavigator.js";
 import type { Profile } from "../profiles/types.js";
 
@@ -185,7 +185,7 @@ export async function verifyBrowser(
 ): Promise<FingerprintReport> {
   const logger = new Logger("verify", { ...config.logging, jsonl: false }, "verify");
   const rng = new Rng(config.seed ?? randomSeed());
-  const binary = await cloakBinaryStatus();
+  const binary = await browserBinaryStatus();
 
   const browser = await launchBrowser({
     slot: 0,
@@ -207,8 +207,8 @@ export async function verifyBrowser(
       engine: browser.engine,
       binary: {
         installed: binary.installed,
-        ...(binary.version ? { version: binary.version } : {}),
-        ...(binary.tier ? { tier: binary.tier } : {}),
+        ...(binary.chromePath ? { version: "chrome" } : {}),
+        
       },
       ...readings,
       inconsistencies: findInconsistencies(readings, config, profile),

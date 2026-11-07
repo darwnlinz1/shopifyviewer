@@ -23,7 +23,11 @@
       <rect x="13" y="13" width="9" height="7"  rx="1.5"/>
     </svg>
     <div class="brand__text">
-      <span class="brand__name">Storefront Simulator</span>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span class="brand__name">Storefront Simulator</span>
+        <span class="badge" id="engine-badge" style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(74,222,128,0.3)">🚀 Ungoogled-Chromium</span>
+        <span class="badge" id="bitbrowser-badge" style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px" hidden>BitBrowser</span>
+      </div>
       <span class="brand__sub" id="storefront">—</span>
     </div>
   </div>
@@ -32,9 +36,17 @@
 
   <div class="topbar__right">
     <span class="conn" id="conn"><i></i><span id="conn-label">connecting</span></span>
+    <button class="btn btn--sm" id="privacy-btn" title="Privacy hardening">
+      <svg viewBox="0 0 16 16" class="ico"><path d="M8 1.5L3 5v4c0 3.5 2.2 6.7 5 7.5 2.8-.8 5-4 5-7.5V5L8 1.5z"/></svg>
+      Privacy
+    </button>
     <button class="btn btn--primary" id="new-profile">
       <svg viewBox="0 0 16 16" class="ico"><path d="M8 3v10M3 8h10"/></svg>
       New profile
+    </button>
+    <button class="btn" id="bulk-create-btn" title="Paste sites + proxies, create many at once">
+      <svg viewBox="0 0 16 16" class="ico"><path d="M2 4h12M2 8h12M2 12h7"/></svg>
+      Bulk create
     </button>
   </div>
 </header>
@@ -68,6 +80,10 @@
   </div>
 
   <div class="toolbar__right">
+    <button class="btn btn--sm" id="stream-toggle" style="display:flex;align-items:center;gap:6px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.3);color:#a5b4fc" title="Bật/tắt truyền hình ảnh nền trên toàn bộ lưới (Mặc định TẮT để tiết kiệm 100% CPU)">
+      <svg viewBox="0 0 16 16" class="ico"><path d="M2 3.5A1.5 1.5 0 013.5 2h6A1.5 1.5 0 0111 3.5v2.379l3.146-1.573A.5.5 0 0115 4.75v6.5a.5.5 0 01-.854.444L11 10.121v2.379A1.5 1.5 0 019.5 14h-6A1.5 1.5 0 012 12.5v-9z"/></svg>
+      <span id="stream-toggle-label">Video Grid: TẮT (0% CPU)</span>
+    </button>
     <div class="bulk">
       <button class="btn btn--sm" id="bulk-start">Start all</button>
       <button class="btn btn--sm" id="bulk-pause">Pause all</button>
@@ -85,6 +101,18 @@
   <div class="section-head">
     <div><p class="eyebrow">PROFILE WALL</p><h2>Live sessions</h2></div>
   </div>
+
+  <!-- Workflow: terminal fleet log -->
+  <section class="workflow" id="workflow" hidden>
+    <div class="workflow__head">
+      <span class="wf-dot"></span>
+      <span class="eyebrow">WORKFLOW</span>
+      <strong>live — trình tự fleet</strong>
+      <span class="workflow__legend">tail -f fleet.log</span>
+    </div>
+    <div class="workflow__rows" id="wf-rows"></div>
+  </section>
+
   <!-- Tiles are created once and patched in place. They are never re-created
        on a state push, and never sorted on anything mutable, so a tile keeps
        its position in the grid for its whole life. -->
@@ -144,6 +172,10 @@
           <span>Session length <em>minutes</em></span>
           <input type="number" id="f-duration" min="1" step="1" placeholder="global default">
         </label>
+        <label class="field field--atc">
+          <span>Add-to-cart after <span class="field__flag" data-flag></span><em>minutes · 0 = off</em></span>
+          <input type="number" id="f-atc" min="0" step="1" placeholder="global default" title="Timed add-to-cart requires safety.allowCart in config">
+        </label>
       </div>
 
       <div class="field">
@@ -155,10 +187,27 @@
            profile override.</p>
       </div>
 
+      <div class="grid2">
+        <label class="field">
+          <span>Browser engine <em>kernel</em></span>
+          <select id="f-provider" class="engine-select">
+            <option value="">Theo config (mặc định)</option>
+            <option value="builtin">Built-in Chromium</option>
+            <option value="bitbrowser">BitBrowser (C++ kernel)</option>
+          </select>
+        </label>
+        <label class="field" data-bit-only id="f-bitbrowser-field">
+          <span>BitBrowser Profile ID <em>trống = tự tạo</em></span>
+          <input type="text" id="f-bitbrowser-id" autocomplete="off" spellcheck="false"
+                 placeholder="empty = auto-create on first launch">
+        </label>
+      </div>
+      <p class="note" id="f-bitbrowser-note" hidden>BitBrowser mở profile qua Local API và tự giả lập vân tay bằng nhân C++ — SiteViewer không tiêm script stealth trong chế độ này. Đổi engine áp dụng ở lần mở trình duyệt tiếp theo.</p>
+
       <div class="field">
         <span>Proxy</span>
         <input type="text" id="f-proxy" autocomplete="off" spellcheck="false"
-               placeholder="http://user:pass@host:8080   ·   host:port:user:pass">
+               placeholder="1.2.3.4:8080 · host:port:user:pass · http://user:pass@host:8080 · socks5://…">
         <div class="row">
           <button class="btn btn--primary btn--sm" id="save-proxy">Save</button>
           <button class="btn btn--sm" id="test-proxy">Test connection</button>
@@ -178,8 +227,32 @@
           <button class="btn btn--sm" id="clear-cookies">Clear</button>
           <span class="hint" id="cookie-status"></span>
         </div>
-        <p class="note">Proxy and imported-cookie changes apply on the next browser start. Accepts Playwright <code>storageState</code>, EditThisCookie / Cookie-Editor
+        <p class="note">Proxy changes apply on the next browser start; an imported cookie is applied immediately, even to a running browser. Accepts Playwright <code>storageState</code>, EditThisCookie / Cookie-Editor
            exports, and Netscape <code>cookies.txt</code>. Detected by content, not file name.</p>
+      </div>
+
+      <div class="field">
+        <span>Thiết bị <em>giả lập UA + màn hình</em></span>
+        <div class="device-picker" id="s-device-kinds">
+          <button type="button" class="device-chip is-on" data-kind="desktop">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="2" y="4" width="20" height="13" rx="1.5"/><path d="M8 21h8M12 17v4"/></svg>
+            <span>Laptop</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="android">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 19h4"/></svg>
+            <span>Android</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="iphone">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10 5h4"/></svg>
+            <span>iPhone</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="ipad">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="4" y="3" width="16" height="18" rx="1.5"/><path d="M11 18h2"/></svg>
+            <span>iPad</span>
+          </button>
+        </div>
+        <select id="s-device-model" class="device-model" hidden></select>
+        <p class="note">Đổi thiết bị áp dụng ở lần mở trình duyệt tiếp theo cho profile này. Mobile thu nhỏ viewport + đổi UA/UA-CH đồng bộ.</p>
       </div>
 
       <div class="identity" id="settings-identity"></div>
@@ -211,22 +284,185 @@
       <label class="field">
         <span>Proxy <em>optional</em></span>
         <input type="text" id="c-proxy" autocomplete="off" spellcheck="false"
-               placeholder="http://user:pass@host:8080">
+               placeholder="1.2.3.4:8080 · host:port:user:pass · socks5://…">
       </label>
+      <div class="grid2">
+        <label class="field">
+          <span>Browser engine <em>kernel</em></span>
+          <select id="c-provider" class="engine-select">
+            <option value="">Theo config (mặc định)</option>
+            <option value="builtin">Built-in Chromium</option>
+            <option value="bitbrowser">BitBrowser (C++ kernel)</option>
+          </select>
+        </label>
+        <label class="field" data-bit-only id="c-bitbrowser-field">
+          <span>BitBrowser Profile ID <em>trống = tự tạo</em></span>
+          <input type="text" id="c-bitbrowser-id" autocomplete="off" spellcheck="false"
+                 placeholder="empty = auto-create on first launch">
+        </label>
+      </div>
       <div class="grid2">
         <label class="field">
           <span>Session length <em>minutes</em></span>
           <input type="number" id="c-duration" min="1" step="1" placeholder="global default">
+        </label>
+        <label class="field field--atc">
+          <span>Add-to-cart after <span class="field__flag" data-flag></span><em>minutes · 0 = off</em></span>
+          <input type="number" id="c-atc" min="0" step="1" placeholder="global default" title="Timed add-to-cart requires safety.allowCart in config">
         </label>
         <label class="field">
           <span>&nbsp;</span>
           <span class="checkline"><input type="checkbox" id="c-headed"> Open on desktop</span>
         </label>
       </div>
+
+      <div class="field">
+        <span>Thiết bị <em>giả lập UA + màn hình</em></span>
+        <div class="device-picker" id="c-device-kinds">
+          <button type="button" class="device-chip is-on" data-kind="desktop">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="2" y="4" width="20" height="13" rx="1.5"/><path d="M8 21h8M12 17v4"/></svg>
+            <span>Laptop</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="android">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 19h4"/></svg>
+            <span>Android</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="iphone">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10 5h4"/></svg>
+            <span>iPhone</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="ipad">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="4" y="3" width="16" height="18" rx="1.5"/><path d="M11 18h2"/></svg>
+            <span>iPad</span>
+          </button>
+        </div>
+        <select id="c-device-model" class="device-model" hidden></select>
+      </div>
+
       <p class="hint" id="create-status"></p>
       <div class="row row--end">
         <button class="btn btn--sm" id="create-cancel">Cancel</button>
         <button class="btn btn--primary btn--sm" id="create-save">Create profile</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Bulk create: paste sites + proxies, one profile per proxy -->
+<div class="overlay" id="bulk-create" hidden>
+  <div class="panel panel--narrow">
+    <header class="panel__head">
+      <strong>Bulk create profiles</strong>
+      <button class="iconbtn" id="bulk-create-dismiss" title="Close (Esc)" style="margin-left:auto">
+        <svg viewBox="0 0 16 16" class="ico"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </header>
+    <div class="form">
+      <p class="note">Một profile cho mỗi proxy. Dán 8 proxy → 8 profile. Site chia vòng tròn,
+         không cần bằng số proxy (8 proxy + 3 site = 8 profile luân phiên 3 site).
+         Không có proxy thì một profile cho mỗi site.</p>
+      <div class="grid2">
+        <label class="field">
+          <span>Sites <em>mỗi dòng 1 site</em></span>
+          <textarea id="bc-sites" rows="8" spellcheck="false"
+            placeholder="https://shop-a.com&#10;https://shop-b.com&#10;https://shop-c.com"
+            style="resize:vertical;font-family:var(--mono,monospace);font-size:12px"></textarea>
+        </label>
+        <label class="field">
+          <span>Proxies <em>mỗi dòng 1 proxy</em></span>
+          <textarea id="bc-proxies" rows="8" spellcheck="false"
+            placeholder="host:port:user:pass&#10;1.2.3.4:8080&#10;socks5://user:pass@host:port"
+            style="resize:vertical;font-family:var(--mono,monospace);font-size:12px"></textarea>
+        </label>
+      </div>
+      <div class="grid2">
+        <label class="field">
+          <span>Session length <em>minutes</em></span>
+          <input type="number" id="bc-duration" min="1" step="1" placeholder="15 (global default)">
+        </label>
+        <label class="field field--atc">
+          <span>Add-to-cart after <span class="field__flag" data-flag></span><em>minutes · 0 = off</em></span>
+          <input type="number" id="bc-atc" min="0" step="1" placeholder="6 (global default)">
+        </label>
+      </div>
+      <label class="field">
+        <span>Browser engine <em>cho toàn bộ profile · BitBrowser tự tạo 1 profile cho mỗi dòng</em></span>
+        <select id="bc-provider" class="engine-select">
+          <option value="">Theo config (mặc định)</option>
+          <option value="builtin">Built-in Chromium</option>
+          <option value="bitbrowser">BitBrowser (C++ kernel)</option>
+        </select>
+      </label>
+      <div class="field">
+        <span>Thiết bị <em>giả lập UA + màn hình cho toàn bộ profile</em></span>
+        <div class="device-picker" id="bc-device-kinds">
+          <button type="button" class="device-chip is-on" data-kind="desktop">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="2" y="4" width="20" height="13" rx="1.5"/><path d="M8 21h8M12 17v4"/></svg>
+            <span>Laptop</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="android">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 19h4"/></svg>
+            <span>Android</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="iphone">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10 5h4"/></svg>
+            <span>iPhone</span>
+          </button>
+          <button type="button" class="device-chip" data-kind="ipad">
+            <svg viewBox="0 0 24 24" class="dev-ico"><rect x="4" y="3" width="16" height="18" rx="1.5"/><path d="M11 18h2"/></svg>
+            <span>iPad</span>
+          </button>
+        </div>
+        <select id="bc-device-model" class="device-model" hidden></select>
+      </div>
+      <div class="bc-preview" id="bc-preview">Dán site và proxy để xem trước</div>
+      <p class="hint" id="bulk-create-status"></p>
+      <div class="row row--end">
+        <button class="btn btn--sm" id="bulk-create-cancel">Cancel</button>
+        <button class="btn btn--primary btn--sm" id="bulk-create-save">Create all</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Privacy hardening — separate setting with 5 toggles -->
+<div class="overlay" id="privacy" hidden>
+  <div class="panel panel--narrow">
+    <header class="panel__head">
+      <strong>Privacy hardening</strong>
+      <span class="badge" style="margin-left:8px;background:var(--accent)">separate setting</span>
+      <button class="iconbtn" id="privacy-dismiss" title="Close (Esc)" style="margin-left:auto">
+        <svg viewBox="0 0 16 16" class="ico"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </header>
+    <div class="form">
+      <p class="note">Áp dụng khi mở browser mới (profile mới hoặc Close rồi Start lại). Lưu vào <code>storefront-sim.config.json:browser.privacy</code></p>
+      <div class="privacy-grid">
+        <label class="privacy-row">
+          <input type="checkbox" id="p-webrtc">
+          <div><b>Tắt WebRTC</b><small>Chặn leak IP qua ICE candidates</small></div>
+        </label>
+        <label class="privacy-row">
+          <input type="checkbox" id="p-geo">
+          <div><b>Tắt Geolocation</b><small>Chặn truy cập vị trí</small></div>
+        </label>
+        <label class="privacy-row">
+          <input type="checkbox" id="p-dnt">
+          <div><b>Bật Do Not Track</b><small>Gửi header DNT: 1</small></div>
+        </label>
+        <label class="privacy-row">
+          <input type="checkbox" id="p-webgl">
+          <div><b>Tắt WebGL Image</b><small>Chặn fingerprint GPU/WebGL</small></div>
+        </label>
+        <label class="privacy-row">
+          <input type="checkbox" id="p-canvas">
+          <div><b>Tắt Canvas</b><small>Chặn fingerprint Canvas (getContext 2d, toDataURL)</small></div>
+        </label>
+      </div>
+      <p class="hint" id="privacy-status"></p>
+      <div class="row row--end">
+        <button class="btn btn--sm" id="privacy-cancel">Hủy</button>
+        <button class="btn btn--primary btn--sm" id="privacy-save">Lưu Privacy</button>
       </div>
     </div>
   </div>
@@ -279,6 +515,11 @@
 
     <div class="tile__progress"><i></i></div>
 
+    <div class="tile__live-feed" title="Hành vi theo thời gian thực">
+      <span class="pulse-dot"></span>
+      <span class="tile__live-text">Chờ khởi động...</span>
+    </div>
+
     <div class="tile__meta">
       <code class="tile__url"></code>
       <span class="tile__action"></span>
@@ -286,7 +527,13 @@
 
     <div class="tile__health">
       <span class="health-pill tile__qa">QA pending</span>
+      <span class="tile__login" data-logged="0" hidden></span>
+      <span class="tile__atc-pill" data-verified="0" hidden></span>
       <span class="tile__issue"></span>
+    </div>
+
+    <div class="tile__meta tile__meta--atc">
+      <span class="tile__atc-countdown" hidden></span>
     </div>
 
     <div class="tile__spark">

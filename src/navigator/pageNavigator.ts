@@ -10,7 +10,7 @@
  * The Behaviour Engine consumes observations from here and never queries the
  * DOM itself, which keeps the state machine testable and theme-agnostic.
  */
-import type { BrowserContext, Locator, Page, Response } from "playwright-core";
+import type { BrowserContext, Locator, Page, Response } from "rebrowser-playwright";
 import type { SimulatorConfig } from "../config.js";
 import type { Logger } from "../logging/logger.js";
 import { Rng, sleep } from "../util/random.js";
@@ -41,6 +41,23 @@ const SHOPIFY_PAGE_TYPES: Record<string, PageType> = {
   page: "page",
   "404": "not_found",
 };
+
+/** Timeout for page.evaluate() */
+const EVAL_MS = 8_000;
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.finally(() => { if (timer) clearTimeout(timer); }),
+    new Promise<T>((resolve) => { timer = setTimeout(() => resolve(fallback), ms); }),
+  ]);
+}
+
+/** Mouse action with hard timeout */
+async function withMouse<T>(fn: () => Promise<T>, ms = 6_000): Promise<T | null> {
+  try { return await Promise.race([fn(), new Promise<null>((r) => setTimeout(() => r(null), ms))]); }
+  catch { return null; }
+}
 
 export class PageNavigator {
   private readonly selectors: SelectorSet;
@@ -192,7 +209,7 @@ export class PageNavigator {
    * `page.goto()` is the address bar. A person on a collection page does not
    * type a product URL — they click the card, which fires pointer and click
    * events on the anchor, carries a Referer, and (because click is one of the
-   * methods CloakBrowser's human layer patches) arrives via a real cursor
+   * methods the human layer patches) arrives via a real cursor
    * movement rather than instantaneously.
    *
    * Not every destination is reachable that way: the engine sometimes returns
@@ -282,7 +299,7 @@ export class PageNavigator {
         .waitForURL(() => true, { timeout, waitUntil: "domcontentloaded" })
         .catch(() => undefined);
 
-      await link.click({ timeout: 5_000 });
+      await link.click({ timeout: 3_000 });
       const [response] = await Promise.all([responsePromise, navigationPromise]);
 
       // The click may have gone somewhere else entirely — a theme intercepting
@@ -376,7 +393,7 @@ export class PageNavigator {
     // Give the main content region a chance to appear before observing.
     const main = this.selectors.mainContent.join(", ");
     await this.page
-      .waitForSelector(main, { timeout: 2_500, state: "attached" })
+      .waitForSelector(main, { timeout: 3_000, state: "attached" })
       .catch(() => undefined);
   }
 
@@ -550,14 +567,17 @@ export class PageNavigator {
     const path = (() => {
       try { return new URL(this.safeUrl()).pathname.toLowerCase(); } catch { return ""; }
     })();
-    const signal = await this.page.evaluate(() => {
+    const signal = await withTimeout(this.page.evaluate(() => {
       const text = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 12000).toLowerCase();
       const dialogs = Array.from(document.querySelectorAll<HTMLElement>("[role='dialog'], dialog, .modal, .popup"));
       const consentDialog = dialogs.some((node) => /cookie|consent|privacy/.test(node.innerText ?? ""));
       const overflowLocked = getComputedStyle(document.body).overflow === "hidden" ||
         getComputedStyle(document.documentElement).overflow === "hidden";
       return { text, consentDialog, overflowLocked, bodyLength: text.length };
-    }).catch(() => ({ text: "", consentDialog: false, overflowLocked: false, bodyLength: 0 }));
+    }).catch(() => ({ text: "", consentDialog: false, overflowLocked: false, bodyLength: 0 })),
+    EVAL_MS,
+    { text: "", consentDialog: false, overflowLocked: false, bodyLength: 0 },
+  ).catch(() => ({ text: "", consentDialog: false, overflowLocked: false, bodyLength: 0 }));
 
     if (/verify you are human|checking your browser|security check|captcha|cf-chl|just a moment/.test(signal.text)) {
       return { kind: "challenge", detail: "anti-bot or verification interstitial" };
@@ -625,53 +645,76 @@ export class PageNavigator {
     viewportHeight: number;
     scrollY: number;
   }> {
-    return this.page
-      .evaluate(() => ({
+    return withTimeout(
+      this.page.evaluate(() => ({
         scrollHeight: Math.max(
           document.body?.scrollHeight ?? 0,
           document.documentElement?.scrollHeight ?? 0,
         ),
         viewportHeight: window.innerHeight,
         scrollY: window.scrollY,
-      }))
-      .catch(() => ({ scrollHeight: 0, viewportHeight: 0, scrollY: 0 }));
+      })),
+      EVAL_MS,
+      { scrollHeight: 0, viewportHeight: 0, scrollY: 0 },
+    ).catch(() => ({ scrollHeight: 0, viewportHeight: 0, scrollY: 0 }));
   }
 
   /**
    * Collect same-shop links matching the first candidate selector that hits.
    * Results are de-duplicated, safety-filtered, and capped.
    */
+  /**
+   * Collect same-shop links by scanning ALL <a> tags for a href pattern.
+   * Works across every Shopify theme — no class names needed.
+   * Falls back to CSS selectors if the href scan finds nothing.
+   */
   private async collectLinks(
     candidates: string[],
     kind: PageType,
     limit = 60,
   ): Promise<DiscoveredLink[]> {
-    for (const selector of candidates) {
-      const found = await this.page
-        .evaluate(
-          ({ sel, max }) =>
-            Array.from(document.querySelectorAll<HTMLAnchorElement>(sel))
-              .slice(0, max)
-              .map((a) => ({ url: a.href, text: (a.textContent ?? "").trim().slice(0, 120) })),
-          { sel: selector, max: limit * 3 },
-        )
-        .catch(() => [] as Array<{ url: string; text: string }>);
+    const pattern = kind === "product"
+      ? this.selectors.productLinkPattern
+      : this.selectors.collectionLinkPattern;
 
-      if (found.length === 0) continue;
+    // Single evaluate: scan all <a> tags, match by href substring
+    const found = await withTimeout(
+      this.page.evaluate(
+        ({ pattern, max }) => {
+          const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
+          const results: Array<{ url: string; text: string }> = [];
+          for (const a of anchors) {
+            if (!a.href.includes(pattern)) continue;
+            // Skip hidden/forbidden anchors
+            if (a.closest("form[action*='cart/add']")) continue;
+            if (a.getAttribute("href")?.startsWith("#")) continue;
+            results.push({
+              url: a.href,
+              text: (a.textContent ?? "").trim().slice(0, 120),
+            });
+            if (results.length >= max) break;
+          }
+          return results;
+        },
+        { pattern, max: limit * 3 },
+      ),
+      EVAL_MS,
+      [] as Array<{ url: string; text: string }>,
+    ).catch(() => [] as Array<{ url: string; text: string }>);
 
-      const seen = new Set<string>();
-      const links: DiscoveredLink[] = [];
-      for (const item of found) {
-        const normalised = this.normaliseUrl(item.url);
-        if (!normalised || seen.has(normalised)) continue;
-        if (!this.isAllowed(normalised)) continue;
-        seen.add(normalised);
-        links.push({ url: normalised, text: item.text, kind });
-        if (links.length >= limit) break;
-      }
-      if (links.length > 0) return links;
+    if (found.length === 0) return [];
+
+    const seen = new Set<string>();
+    const links: DiscoveredLink[] = [];
+    for (const item of found) {
+      const normalised = this.normaliseUrl(item.url);
+      if (!normalised || seen.has(normalised)) continue;
+      if (!this.isAllowed(normalised)) continue;
+      seen.add(normalised);
+      links.push({ url: normalised, text: item.text, kind });
+      if (links.length >= limit) break;
     }
-    return [];
+    return links;
   }
 
   private async countFirstMatching(candidates: string[]): Promise<number> {
@@ -693,8 +736,8 @@ export class PageNavigator {
     concepts: Record<string, string[]>,
   ): Promise<Record<string, number>> {
     const empty = Object.fromEntries(Object.keys(concepts).map((key) => [key, 0]));
-    const counts = await this.page
-      .evaluate((groups: Record<string, string[]>) => {
+    const counts = await withTimeout(
+      this.page.evaluate((groups: Record<string, string[]>) => {
         const out: Record<string, number> = {};
         for (const [name, candidates] of Object.entries(groups)) {
           out[name] = 0;
@@ -713,8 +756,10 @@ export class PageNavigator {
           }
         }
         return out;
-      }, concepts)
-      .catch(() => empty);
+      }, concepts),
+      EVAL_MS,
+      empty,
+    ).catch(() => empty);
     return counts;
   }
 
@@ -764,7 +809,7 @@ export class PageNavigator {
    * This drives `mouse.wheel`, not `window.scrollBy`. The distinction matters:
    * `page.evaluate(() => window.scrollBy(...))` moves the viewport without
    * dispatching a single `wheel` event, so nothing on the page can observe the
-   * input that supposedly caused it — and CloakBrowser's human-input layer,
+   * input that supposedly caused it — and the human-input layer,
    * which patches interaction methods rather than anything reached through
    * `evaluate`, never sees the gesture at all. Since scrolling is by far the
    * most frequent action in a session, routing it through the real input path
@@ -886,7 +931,7 @@ export class PageNavigator {
       );
 
       try {
-        await this.page.mouse.wheel(0, step * direction);
+        await withMouse(() => this.page.mouse.wheel(0, step * direction), 4_000);
       } catch {
         // A navigation mid-gesture detaches the page; the session loop will
         // re-observe and carry on.
@@ -907,9 +952,9 @@ export class PageNavigator {
     if (this.rng.chance(0.18)) {
       const overshoot = this.rng.int(30, 110);
       try {
-        await this.page.mouse.wheel(0, overshoot * direction);
+        await withMouse(() => this.page.mouse.wheel(0, overshoot * direction), 4_000);
         await sleep(this.rng.int(90, 260));
-        await this.page.mouse.wheel(0, -overshoot * direction);
+        await withMouse(() => this.page.mouse.wheel(0, -overshoot * direction), 4_000);
       } catch {
         return moved * direction;
       }
@@ -930,7 +975,7 @@ export class PageNavigator {
       x: Math.round(size.width * this.rng.float(0.3, 0.7)),
       y: Math.round(size.height * this.rng.float(0.35, 0.65)),
     };
-    await this.page.mouse.move(target.x, target.y).catch(() => undefined);
+    await withMouse(() => this.page.mouse.move(target.x, target.y), 3_000);
     this.cursor = target;
   }
 
@@ -964,7 +1009,7 @@ export class PageNavigator {
         x: clamp(cursor.x + this.rng.int(-9, 9), 2, size.width - 2),
         y: clamp(cursor.y + this.rng.int(-7, 7), 2, size.height - 2),
       };
-      await this.page.mouse.move(next.x, next.y).catch(() => undefined);
+      await withMouse(() => this.page.mouse.move(next.x, next.y), 3_000);
       cursor.x = next.x;
       cursor.y = next.y;
     }
@@ -981,7 +1026,7 @@ export class PageNavigator {
       return 0;
     }
 
-    await gallery.first().scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
+    await gallery.first().scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
     await this.idle(this.pacing.mediaDwell());
     let viewed = 1;
 
@@ -995,7 +1040,7 @@ export class PageNavigator {
         const thumb = thumbs.nth(i);
         const visible = await thumb.isVisible().catch(() => false);
         if (!visible) continue;
-        await thumb.click({ timeout: 2_500 }).catch(() => undefined);
+        await thumb.click({ timeout: 3_000 }).catch(() => undefined);
         await this.idle(this.pacing.mediaDwell());
         viewed++;
       }
@@ -1021,10 +1066,10 @@ export class PageNavigator {
       if (total > 0) {
         const index = this.rng.int(0, total - 1);
         const section = sections.nth(index);
-        await section.scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
+        await section.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
         const summary = section.locator("summary").first();
         const target = (await summary.count().catch(() => 0)) > 0 ? summary : section;
-        await target.click({ timeout: 2_500 }).catch(() => undefined);
+        await target.click({ timeout: 3_000 }).catch(() => undefined);
         // Time the read against the section that was actually opened, not a
         // fixed range: a shipping blurb and an ingredient list are not the
         // same amount of reading.
@@ -1042,7 +1087,7 @@ export class PageNavigator {
     const description = await this.firstMatchingLocator(this.selectors.productDescription);
     if (description) {
       const block = description.first();
-      await block.scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
+      await block.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
       const readMs = await this.readingTimeFor(block);
       await this.idle(readMs);
       this.logger.info("read_section", "read description block", {
@@ -1060,7 +1105,7 @@ export class PageNavigator {
       if (total > 0) {
         const index = this.rng.int(0, total - 1);
         const block = content.nth(index);
-        await block.scrollIntoViewIfNeeded({ timeout: 2_500 }).catch(() => undefined);
+        await block.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
         const readMs = await this.readingTimeFor(block);
         await this.idle(readMs);
         this.logger.info("read_section", `viewed content section #${index + 1}/${total}`, {
@@ -1127,7 +1172,7 @@ export class PageNavigator {
       const option = options.nth(this.rng.int(0, total - 1));
       const visible = await option.isVisible().catch(() => false);
       if (!visible) continue;
-      await option.hover({ timeout: 2_000 }).catch(() => undefined);
+      await option.hover({ timeout: 3_000 }).catch(() => undefined);
       // A hover moves the real cursor, so keep our idea of where it is honest.
       this.cursor = null;
       await sleep(this.rng.int(400, 1400));
@@ -1139,6 +1184,91 @@ export class PageNavigator {
       data: { hovered, total },
     });
     return hovered;
+  }
+
+  async dismissOverlays(): Promise<void> {
+    const closeBtns = [
+      ".quick-add-modal__close",
+      ".menu-drawer__close-button",
+      ".cart-drawer__close-button",
+      ".predictive-search__close-modal-button",
+    ];
+    for (const sel of closeBtns) {
+      const btn = this.page.locator(sel).first();
+      const visible = await btn.isVisible().catch(() => false);
+      if (visible) {
+        await btn.click({ timeout: 2_000 }).catch(() => undefined);
+        await sleep(this.rng.int(200, 500));
+      }
+    }
+  }
+
+  async hoverCard(): Promise<boolean> {
+    for (const sel of this.selectors.productLink) {
+      const cards = this.page.locator(sel);
+      const count = await cards.count().catch(() => 0);
+      if (count === 0) continue;
+      const index = this.rng.int(0, Math.min(count - 1, 8));
+      const card = cards.nth(index);
+      const visible = await card.isVisible().catch(() => false);
+      if (!visible) continue;
+      await card.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
+      await sleep(this.rng.int(150, 400));
+      await card.hover({ timeout: 3_000 }).catch(() => undefined);
+      this.cursor = null;
+      await this.idle(this.rng.int(600, 1_800));
+      this.logger.info("hover_card", "hovered a product card", {
+        url: this.safeUrl(),
+        data: { selector: sel, index },
+      });
+      return true;
+    }
+    this.logger.debug("hover_card_skip", "no hoverable cards found", { url: this.safeUrl() });
+    return false;
+  }
+
+  async selectText(targetSelector?: string): Promise<boolean> {
+    const selectors = targetSelector
+      ? [targetSelector]
+      : [...this.selectors.productDescription, ...this.selectors.contentSection, ...this.selectors.productTitle];
+    for (const sel of selectors) {
+      const el = this.page.locator(sel).first();
+      const count = await el.count().catch(() => 0);
+      if (count === 0) continue;
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) continue;
+      await el.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
+      await sleep(this.rng.int(200, 500));
+      try {
+        const box = await el.boundingBox({ timeout: 2_000 });
+        if (!box) continue;
+        const startX = box.x + this.rng.int(4, Math.min(20, Math.floor(box.width * 0.15)));
+        const startY = box.y + this.rng.int(2, Math.min(12, Math.floor(box.height * 0.2)));
+        const endX = box.x + this.rng.int(Math.floor(box.width * 0.4), Math.floor(box.width * 0.85));
+        const endY = box.y + this.rng.int(Math.floor(box.height * 0.3), Math.floor(box.height * 0.8));
+        await this.page.mouse.move(startX, startY);
+        await sleep(this.rng.int(80, 200));
+        await this.page.mouse.down();
+        const steps = this.rng.int(6, 14);
+        for (let k = 1; k <= steps; k++) {
+          const t = k / steps;
+          const cx = Math.round(startX + (endX - startX) * t + this.rng.int(-2, 2));
+          const cy = Math.round(startY + (endY - startY) * t + this.rng.int(-1, 1));
+          await this.page.mouse.move(cx, cy);
+          await sleep(this.rng.int(12, 30));
+        }
+        await sleep(this.rng.int(200, 600));
+        await this.page.mouse.up();
+        await sleep(this.rng.int(300, 800));
+        this.cursor = null;
+        this.logger.info("select_text", "highlighted text", {
+          url: this.safeUrl(),
+          data: { selector: sel },
+        });
+        return true;
+      } catch { /* page may have changed */ }
+    }
+    return false;
   }
 
   /** An idle pause — a real visitor reading, not a script firing. */
@@ -1168,14 +1298,24 @@ export class PageNavigator {
   // Helpers
   // ---------------------------------------------------------------------
 
-  /** Return a locator for the first candidate selector that matches anything. */
+  /**
+   * Return a locator for the first candidate selector that matches anything.
+   * Tests ALL selectors in one page.evaluate() to avoid sequential round trips.
+   */
   private async firstMatchingLocator(candidates: string[]) {
-    for (const selector of candidates) {
-      const locator = this.page.locator(selector);
-      const count = await locator.count().catch(() => 0);
-      if (count > 0) return locator;
-    }
-    return null;
+    const matched = await withTimeout(
+      this.page.evaluate((sels: string[]) => {
+        for (const sel of sels) {
+          try {
+            if (document.querySelector(sel)) return sel;
+          } catch { /* invalid selector */ }
+        }
+        return null;
+      }, candidates),
+      EVAL_MS,
+      null as string | null,
+    );
+    return matched ? this.page.locator(matched) : null;
   }
 
   /**
@@ -1212,7 +1352,9 @@ function round(value: number | null | undefined): number | null {
 
 /** Open the working page for a session, reusing the profile's initial tab. */
 export async function openSessionPage(context: BrowserContext): Promise<Page> {
-  const existing = context.pages()[0];
+  // The BitBrowser console tab must stay open (closing it kills the window)
+  // and must not be the tab the visit drives.
+  const existing = context.pages().find((p) => !/console\.bitbrowser\.net/i.test(p.url()));
   const page = existing ?? (await context.newPage());
   return page;
 }

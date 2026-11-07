@@ -3,7 +3,7 @@
  *
  * The tool is routinely handed to someone as a folder rather than installed
  * from a registry, and the first thing they do is run it. Failing with
- * "Cannot find package 'cloakbrowser'" at that point is a bad first
+ * "Cannot find package 'x'" at that point is a bad first
  * impression and an avoidable one: we know exactly what is missing and how to
  * get it, so we do that instead of complaining.
  *
@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 
 /** Packages the tool cannot run without. */
-const RUNTIME_DEPS = ["playwright-core", "cloakbrowser"] as const;
+const RUNTIME_DEPS = ["rebrowser-playwright"] as const;
 
 /**
  * Marks a process that is already the result of a bootstrap restart.
@@ -46,7 +46,7 @@ function projectRoot(): string {
  * Whether a package can actually be imported.
  *
  * `import.meta.resolve` first, and not as a stylistic preference:
- * `cloakbrowser` is ESM-only, and its `exports` map declares `import` with no
+ * Some optional deps are ESM-only and their `exports` maps declare `import` with no
  * `require` condition. `require.resolve` therefore throws
  * ERR_PACKAGE_PATH_NOT_EXPORTED for a package that is installed and perfectly
  * usable — so a CJS-style check reports it permanently missing and this
@@ -151,3 +151,4 @@ export function ensureDependencies(options: { quiet?: boolean } = {}): boolean {
   );
   process.exit(rerun.status ?? 1);
 }
+

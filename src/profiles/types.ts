@@ -43,6 +43,20 @@ export interface ProfileIdentity {
   colorScheme?: "light" | "dark" | "no-preference";
 }
 
+/**
+ * A self-hosted mobile/desktop device emulation pick, resolved against the
+ * DEVICE_CATALOG in src/browser/identity.ts. Kept OUTSIDE ProfileIdentity so
+ * the identity shape (viewport/timezone/locale) stays stable and the
+ * dashboard.test.mjs identity-equality assertion is untouched.
+ *
+ * kind: desktop (undefined device = desktop), android, iphone, ipad.
+ * model: a key in the catalog (e.g. "Pixel 7", "iPhone 14 Pro", "iPad Pro 11").
+ */
+export interface ProfileDevice {
+  kind: "desktop" | "android" | "iphone" | "ipad";
+  model: string;
+}
+
 /** Cookies attached to a profile, imported from a file on disk. */
 export interface ProfileCookies {
   /** Original file the cookies came from, for display. */
@@ -50,6 +64,8 @@ export interface ProfileCookies {
   /** Absolute path, when imported by path rather than upload. */
   sourcePath?: string;
   importedAt: string;
+  /** Last time the jar was refreshed from a live browser (rotation adopt). */
+  updatedAt?: string;
   count: number;
   /** Hosts covered, for a quick sanity check in the UI. */
   domains: string[];
@@ -113,6 +129,31 @@ export interface Profile {
    * touch.
    */
   storefront?: string;
+  /**
+   * Per-profile add-to-cart schedule, in minutes from session start.
+   * Undefined/null = follow ai.advanceActionTimeMs from config (default 10).
+   * 0 = this profile never adds to cart on a timer. Requires
+   * safety.allowCart regardless — that remains the master switch.
+   */
+  atcMinutes?: number | null;
+  /** Mobile/desktop device emulation. Undefined = desktop (default). */
+  device?: ProfileDevice;
+  /** Browser kernel for this profile. Undefined = follow config.browser.provider. */
+  browserProvider?: "builtin" | "bitbrowser";
+  /** The profile's id inside the BitBrowser app (provider "bitbrowser"). */
+  bitBrowserId?: string;
+  /**
+   * SiteViewer created the BitBrowser profile itself, so it is deleted along
+   * with this one. An id the operator pasted in is only ever unlinked.
+   */
+  bitBrowserManaged?: boolean;
+  /** Hash of the proxy last pushed to the BitBrowser profile; a change triggers a re-sync. */
+  bitBrowserProxySig?: string;
+  /**
+   * An imported jar has not been hard-written into the browser yet. Set when
+   * cookies arrive while no BitBrowser window is open; cleared on next launch.
+   */
+  pendingCookieWrite?: boolean;
   notes?: string;
   stats: ProfileStats;
 }

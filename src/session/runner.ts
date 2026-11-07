@@ -1,18 +1,19 @@
-/**
+﻿/**
  * Multi-session runner.
  *
  * Runs N independent sessions with a bounded concurrency. Each session gets
  * its own persistent profile slot, its own seed, its own log file and its own
- * CloakBrowser instance, so sessions never share cookies or state — which is
+ * browser instance, so sessions never share cookies or state, which is
  * what makes them useful as independent samples when testing a storefront.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { SimulatorConfig } from "../config.js";
-import { runSession } from "./manager.js";
-import { Rng, randomSeed } from "../util/random.js";
+import { startSession, type SessionSnapshot } from "./aiManager.js";
+import { CookiePool } from "../ai/cookiePool.js";
 import type { SessionResult } from "../types.js";
+import { Rng, randomSeed } from "../util/random.js";
 
 export interface RunSummary {
   storefront: string;
@@ -23,6 +24,8 @@ export interface RunSummary {
     sessions: number;
     succeeded: number;
     failed: number;
+    /** Sessions stopped by a wall (challenge/login/geo/empty shell). */
+    blocked: number;
     pagesVisited: number;
     productsViewed: number;
     collectionsViewed: number;
@@ -44,6 +47,10 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
   const startedAt = new Date().toISOString();
   const { count, concurrency } = config.session;
   const seedRng = new Rng(config.seed ?? randomSeed());
+  // One pool per run: a rate limit discovered by session 3 immediately
+  // shields that cookie from sessions 4..N.
+  const aiCfg = (config as any).ai ?? {};
+  const sharedPool = aiCfg.cookiesDir ? new CookiePool(aiCfg.cookiesDir) : undefined;
 
   const queue = Array.from({ length: count }, (_, index) => ({
     slot: index,
@@ -67,6 +74,7 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
           seed: job.seed,
           config,
           lingerMs: config.session.lingerMs,
+          ...(sharedPool ? { cookiePool: sharedPool } : {}),
           ...(signal ? { signal } : {}),
         });
         results.push(result);
@@ -114,6 +122,7 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
       sessions: results.length,
       succeeded: results.filter((r) => r.exitReason !== "error").length,
       failed: results.filter((r) => r.exitReason === "error").length,
+      blocked: results.filter((r) => r.blocker).length,
       pagesVisited: sum(results.map((r) => r.pagesVisited)),
       productsViewed: sum(results.map((r) => r.productsViewed)),
       collectionsViewed: sum(results.map((r) => r.collectionsViewed)),
@@ -138,4 +147,10 @@ export async function runAll({ config, signal }: RunOptions): Promise<RunSummary
 
 function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
+}
+
+
+export async function runSession(options: any): Promise<SessionResult> {
+  const handle = await startSession(options);
+  return handle.done;
 }

@@ -1,21 +1,25 @@
-/**
- * Shopify storefront selectors.
+﻿/**
+ * Pattern-based selector system.
  *
- * Themes differ, so nothing here is a single hard-coded selector. Each concept
- * is a *candidate list*, tried in order from most-specific (Dawn / Online Store
- * 2.0 conventions) to most-generic. The navigator picks the first candidate
- * that actually matches visible elements on the page, so the simulator keeps
- * working across themes without per-shop code.
+ * Class names differ across every Shopify theme.  Instead of matching
+ * specific classes, the navigator scans the DOM for structural patterns:
+ *   - href contains /products/  → product link
+ *   - href contains /collections/ → collection link
+ *   - <details> or aria-expanded → accordion
+ *   - text contains $ or €       → price
+ *   - #MainContent, main, [role=main] → main content
  *
- * `selectorOverrides` in the config can prepend shop-specific candidates when a
- * heavily customised theme needs them.
+ * The CSS selector lists below are FALLBACKS for when the href scan
+ * misses links (e.g. JS-rendered SPA). They are tried most-generic first.
  */
-
-/** Every selector concept the navigator knows how to look for. */
 export interface SelectorSet {
-  mainContent: string[];
+  /** Structural patterns the navigator scans for (no CSS needed). */
+  productLinkPattern: string;
+  collectionLinkPattern: string;
+  /** CSS selectors as fallback when the href scan finds nothing. */
   productLink: string[];
   collectionLink: string[];
+  mainContent: string[];
   productGrid: string[];
   productCard: string[];
   productTitle: string[];
@@ -28,165 +32,39 @@ export interface SelectorSet {
   contentSection: string[];
   pagination: string[];
   navMenuLink: string[];
-  /** Elements a read-only test session must never click. */
   forbidden: string[];
 }
 
-export const SHOPIFY_SELECTORS: SelectorSet = {
-  mainContent: [
-    "#MainContent",
-    "main#MainContent",
-    'main[role="main"]',
-    "main",
-    "#main",
-    "[role='main']",
-  ],
+const DEFAULT: SelectorSet = {
+  // --- Pattern-based: match href substring, works across ALL Shopify themes ---
+  productLinkPattern: "/products/",
+  collectionLinkPattern: "/collections/",
 
+  // --- Fallback CSS selectors (generic, not theme-specific) ---
   productLink: [
-    // Dawn / OS 2.0 product cards
-    ".card__heading a[href*='/products/']",
-    ".product-card-wrapper a[href*='/products/']",
-    ".card-wrapper a[href*='/products/']",
-    ".grid__item a[href*='/products/']",
-    // Common third-party themes
-    // (aiju-cosmetique.fr and other themes built on .product-card__link)
-    "a.product-card__link[href*='/products/']",
-    ".product-grid__item a[href*='/products/']",
-    ".product-item a[href*='/products/']",
-    ".product-card a[href*='/products/']",
-    ".product-grid-item a[href*='/products/']",
-    "[data-product-card] a[href*='/products/']",
-    // Fallback: any product link in the document, skipping announcement bars,
-    // headers and footers — those carry promo links to products that would
-    // otherwise dominate the pool and pull the session out of the grid.
-    "main a[href*='/products/']",
-    "#MainContent a[href*='/products/']",
-    "a[href*='/products/']",
+    'a[href*="/products/"]',
   ],
-
   collectionLink: [
-    ".header__inline-menu a[href*='/collections/']",
-    "nav a[href*='/collections/']",
-    ".site-nav a[href*='/collections/']",
-    "header a[href*='/collections/']",
-    ".collection-list a[href*='/collections/']",
-    ".card-wrapper a[href*='/collections/']",
-    "a[href*='/collections/']",
+    'a[href*="/collections/"]',
   ],
-
-  productGrid: [
-    "#product-grid",
-    ".collection .grid--collection",
-    ".product-grid",
-    ".collection__products",
-    ".grid.product-grid",
-    "[data-product-grid]",
-  ],
-
-  productCard: [
-    ".card-wrapper",
-    ".product-card-wrapper",
-    ".product-item",
-    ".product-card",
-    ".grid__item",
-    "[data-product-card]",
-  ],
-
-  productTitle: [
-    ".product__title h1",
-    "h1.product__title",
-    "h1.product-single__title",
-    ".product-meta__title",
-    ".product__info-wrapper h1",
-    "h1",
-  ],
-
-  productPrice: [
-    ".price__regular .price-item--regular",
-    ".product__info-wrapper .price",
-    ".price-item",
-    ".price",
-    ".product-single__price",
-    ".product__price",
-    "[data-product-price]",
-    ".money",
-  ],
-
-  productDescription: [
-    ".product__description",
-    ".product-single__description",
-    ".product__info-wrapper .rte",
-    "[data-product-description]",
-    ".product-description",
-    ".rte",
-  ],
-
-  productMedia: [
-    "media-gallery .product__media-item",
-    ".product__media-wrapper .product__media",
-    ".product__media-item",
-    ".product-single__photo",
-    ".product__media img",
-    "[data-product-media]",
-    ".product-gallery__image",
-    ".swiper-slide img",
-    ".flickity-slider img",
-  ],
-
-  productMediaThumb: [
-    ".thumbnail-list__item button",
-    ".thumbnail-list__item",
-    ".product__media-thumbnail",
-    "[data-thumbnail-id]",
-    ".product-single__thumbnail",
-    ".product-gallery__thumbnail",
-  ],
-
+  mainContent: ["#MainContent", "main", '[role="main"]'],
+  productGrid: [".product-grid", ".collection__products", '[class*="product-grid"]'],
+  productCard: [".product-card", ".card-wrapper", ".product-item", '[class*="product-card"]', '[class*="card__"]'],
+  productTitle: ["h1"],
+  productPrice: [".price", '[class*="price"]', '[data-product-price]'],
+  productDescription: [".product__description", ".rte", '[class*="description"]'],
+  productMedia: [".product-media", ".product__media", '[class*="product-media"]', '[class*="gallery"]'],
+  productMediaThumb: ['[class*="thumbnail"]', "button[data-media-id]", '[class*="media-nav"]'],
   variantPicker: [
-    "variant-selects",
-    "variant-radios",
-    ".product-form__input input[type='radio']",
-    ".product-form__input select",
-    "select[name='id']",
-    ".swatch",
-    "[data-variant-option]",
-    ".product-options",
+    'input[type="radio"][name*="option"]',
+    "fieldset",
+    "select[name*='option']",
+    '[class*="variant"]',
   ],
-
-  collapsibleSection: [
-    ".product__accordion details",
-    "details.accordion",
-    ".accordion details",
-    ".product__info-wrapper details",
-    "details",
-    "[data-accordion]",
-    ".tab-title",
-  ],
-
-  contentSection: [
-    ".shopify-section",
-    "section[id^='shopify-section']",
-    "section",
-  ],
-
-  pagination: [
-    ".pagination__list a",
-    ".pagination a",
-    "a[rel='next']",
-    ".pagination-wrapper a",
-  ],
-
-  navMenuLink: [
-    ".header__inline-menu a",
-    "header nav a",
-    ".site-nav__link",
-    "nav a",
-  ],
-
-  /**
-   * Never interacted with. A storefront behaviour test reads the shop; it must
-   * not create carts, orders, or account state.
-   */
+  collapsibleSection: ["details", "details.accordion", ".accordion", '[class*="accordion"]'],
+  contentSection: [".shopify-section", "section"],
+  pagination: [".pagination a", 'a[rel="next"]', '[class*="pagination"] a'],
+  navMenuLink: ["nav a", "header a", ".header a"],
   forbidden: [
     "form[action*='/cart/add']",
     "button[name='add']",
@@ -198,16 +76,16 @@ export const SHOPIFY_SELECTORS: SelectorSet = {
   ],
 };
 
-/** Merge shop-specific overrides in front of the built-in candidates. */
-export function buildSelectors(
-  overrides?: Partial<Record<keyof SelectorSet, string[]>>,
-): SelectorSet {
-  if (!overrides) return SHOPIFY_SELECTORS;
-  const out = { ...SHOPIFY_SELECTORS };
+export function buildSelectors(overrides?: Partial<Record<keyof SelectorSet, string[]>>): SelectorSet {
+  if (!overrides) return { ...DEFAULT };
+  const out = { ...DEFAULT };
   for (const [key, extra] of Object.entries(overrides)) {
     if (!extra || extra.length === 0) continue;
     const field = key as keyof SelectorSet;
-    out[field] = [...extra, ...SHOPIFY_SELECTORS[field]];
+    const current = out[field];
+    if (Array.isArray(current) && Array.isArray(extra)) {
+      (out[field] as string[]) = [...extra, ...current];
+    }
   }
   return out;
 }

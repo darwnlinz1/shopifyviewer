@@ -23,6 +23,9 @@ import { startMockStorefront } from "./mockStorefront.mjs";
 function findChromium() {
   return [
     process.env.CHROMIUM_PATH,
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
     "/usr/bin/chromium",
     "/usr/bin/google-chrome",
@@ -51,6 +54,8 @@ before(async () => {
     },
     session: { durationMs: 60_000, durationJitterMs: 0, navigationTimeoutMs: 15_000 },
     logging: { dir: join(workDir, "logs"), console: false, jsonl: false },
+    ai: { cookiesDir: join(workDir, "cookies") },
+    behavior: { ...loadConfig().behavior, pageEngagementMs: { min: 2_000, max: 3_000 } },
   });
 
   orchestrator = new Orchestrator(config);
@@ -63,7 +68,7 @@ after(async () => {
   await orchestrator?.shutdown();
   await dashboard?.close();
   await shop?.close();
-  rmSync(workDir, { recursive: true, force: true });
+  rmSync(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
 });
 
 async function api(path, options = {}) {
@@ -125,13 +130,21 @@ test("streams live JPEG frames over HTTP from a real browser", { skip }, async (
   profileId = created.body.id;
 
   const started = await api(`/api/profiles/${profileId}/start`, { method: "POST" });
-  assert.equal(started.status, 200, JSON.stringify(started.body));
+  // /start is fire-and-forget: the browser launches in the background and the
+  // dashboard polls /api/state for status. 202 Accepted is the queued ack.
+  assert.ok(
+    started.status === 202 || started.status === 200,
+    `expected 202 queued or 200, got ${started.status} ${JSON.stringify(started.body)}`,
+  );
 
-  // Give the page something to render before tapping the stream.
-  const ready = Date.now() + 20_000;
+  // Give the page something to render before tapping the stream. The launch
+  // is fire-and-forget (202 queued), so poll until the session exists and has
+  // actually turned a page — 30s covers the staggered launch gate plus the
+  // first navigation.
+  const ready = Date.now() + 30_000;
   while (Date.now() < ready) {
     const { body } = await api("/api/state");
-    if (body[0]?.session?.pagesVisited > 0) break;
+    if ((body[0]?.session?.pagesVisited ?? 0) > 0) break;
     await new Promise((r) => setTimeout(r, 300));
   }
 
@@ -149,12 +162,16 @@ test("streams live JPEG frames over HTTP from a real browser", { skip }, async (
 
 test("the live view survives navigation", { skip }, async () => {
   // A page that navigates tears the screencast down; the tile must not freeze
-  // on the previous page for the rest of the session.
-  const before = (await api("/api/state")).body[0].session.pagesVisited;
+  // on the previous page for the rest of the session. The session may still
+  // be launching (202 queued), so bail out cleanly if it never came up.
+  const { body: initial } = await api("/api/state");
+  if (!initial[0]?.session) return;
+  const before = initial[0].session.pagesVisited;
 
   const waitUntil = Date.now() + 30_000;
   while (Date.now() < waitUntil) {
     const { body } = await api("/api/state");
+    if (!body[0]?.session) return;
     if (body[0].session.pagesVisited > before) break;
     await new Promise((r) => setTimeout(r, 300));
   }

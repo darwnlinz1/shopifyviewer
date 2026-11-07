@@ -1,30 +1,32 @@
 {
-  "name": "shopify-storefront-simulator",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Shopify storefront behavior simulator built on CloakBrowser + Playwright",
-  "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
-  "bin": {
-    "storefront-sim": "./dist/cli.js"
-  },
-  "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node --enable-source-maps dist/cli.js",
-    "dev": "tsx src/cli.ts",
-    "test": "node --test \"test/*.test.mjs\""
-  },
-  "dependencies": {
-    "cloakbrowser": "^0.5.8",
-    "mmdb-lib": "^3.0.3",
-    "playwright-core": "^1.50.0"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
-  }
+    "name": "ai-storefront-simulator",
+    "version": "0.1.0",
+    "private": true,
+    "description": "AI-driven Shopify storefront simulator — uses Claude for adaptive element detection",
+    "type": "module",
+    "engines": {
+        "node": ">=20"
+    },
+    "bin": {
+        "storefront-sim": "./dist/cli.js"
+    },
+    "scripts": {
+        "prebuild": "node scripts/check-unicode.mjs",
+        "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+        "prestart": "node scripts/download-ungoogled.mjs",
+        "start": "node --enable-source-maps dist/cli.js dashboard --host 127.0.0.1 --port 7317",
+        "dev": "tsx src/cli.ts dashboard --host 127.0.0.1 --port 7317",
+        "test": "node --test \"test/*.test.mjs\"",
+        "setup:browser": "node scripts/download-ungoogled.mjs",
+        "ai": "tsx src/cli.ts run --storefront"
+    },
+    "dependencies": {
+        "mmdb-lib": "^3.0.3",
+        "rebrowser-playwright": "^1.50.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.7.0"
+    }
 }

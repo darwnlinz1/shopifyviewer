@@ -42,6 +42,7 @@ const ACTION_COST_MS: Record<ActionKind, number> = {
   read_section: 6_000,
   inspect_details: 5_000,
   hover_variants: 4_000,
+  hover_card: 4_000,
   dwell: 4_000,
   exit: 0,
 };
@@ -63,7 +64,9 @@ export interface SessionMemory {
   productTarget: number;
   /** Navigations that failed, used to back off from a broken area. */
   consecutiveFailures: number;
-}
+    /** Pages where no product/collection links were found. */
+    emptyPageStreak: number;
+  }
 
 export class BehaviorEngine {
   state: BehaviorState = "START";
@@ -95,6 +98,7 @@ export class BehaviorEngine {
       totalActions: 0,
       productTarget: this.rng.range(this.behavior.targetProducts),
       consecutiveFailures: 0,
+      emptyPageStreak: 0,
     };
   }
 
@@ -136,13 +140,23 @@ export class BehaviorEngine {
       this.memory.visitedCollections.add(observation.url);
       this.memory.lastCollectionUrl = observation.url;
     }
+    // Track whether this page has discoverable links for navigation.
+    const hasLinks = observation.productLinks.length > 0 || observation.collectionLinks.length > 0;
+    if (hasLinks) {
+      this.memory.emptyPageStreak = 0;
+    } else {
+      this.memory.emptyPageStreak++;
+    }
   }
 
   /** Called by the session manager when the page changed. */
   resetPageActions(): void {
     this.memory.pageActions = [];
     this.pageEnteredAt = Date.now();
-    this.pageBudgetMs = this.rng.range(this.behavior.pageEngagementMs);
+    // Product pages earn a longer look (40–55s) than listings (25–38s).
+    const base = this.behavior.pageEngagementMs;
+    const productBoost = this.state === "PRODUCT" ? 1.25 : this.state === "HOME" ? 0.9 : 1;
+    this.pageBudgetMs = Math.round(this.rng.float(base.min, base.max) * productBoost);
   }
 
   /** Time already spent on the current page, in ms. */
@@ -241,9 +255,9 @@ export class BehaviorEngine {
     // taper in the last few percent, and gently — the timer ends the session,
     // not an early loss of interest.
     const progress = timer.progress();
-    if (progress < 0.95) return 0;
-    const lateness = Math.min(1, (progress - 0.95) / 0.05);
-    return lateness * 0.12;
+    if (progress < 0.98) return 0;
+    const lateness = Math.min(1, (progress - 0.98) / 0.02);
+    return lateness * 0.08;
   }
 
   private exitDecision(reason: string): Decision {
@@ -356,6 +370,13 @@ export class BehaviorEngine {
       });
     }
 
+    // Hovering a product card before deciding to click
+    if (observation.pageType === "collection" || observation.pageType === "collection_list") {
+      candidates.push({
+        value: "hover_card",
+        weight: this.fading("hover_card", 4, 0.55),
+      });
+    }
     const affordable = candidates.filter(
       (c) => c.weight > 0 && timer.hasRoomFor(ACTION_COST_MS[c.value]),
     );
@@ -474,8 +495,23 @@ export class BehaviorEngine {
             // is "just looking" actually does. Dropping it to 3 used to hand
             // the turn to Back (0.28 × 10 ≈ 3) half the time, which read as
             // the session bouncing off every PDP instead of continuing.
-            weight: needsProducts ? 7 : 5,
+            weight: needsProducts ? 8 : 6,
           });
+        }
+        // Revisit a visited product — real shoppers sometimes go back
+        if (this.memory.visitedProducts.size > 1) {
+          const revisitable = observation.productLinks.filter(l => this.memory.visitedProducts.has(l.url));
+          if (revisitable.length > 0) {
+            options.push({
+              value: {
+                action: "goto_product",
+                url: this.rng.pick(revisitable)!.url,
+                why: "product => revisit a product",
+                next: "PRODUCT",
+              },
+              weight: 2,
+            });
+          }
         }
         options.push({
           value: { action: "go_back", why: "product → back to listing", next: "BROWSE" },

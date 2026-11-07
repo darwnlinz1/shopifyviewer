@@ -11,9 +11,10 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 
-import { chromium } from "playwright-core";
+import { chromium } from "rebrowser-playwright";
 import { loadConfig } from "../dist/config.js";
 import { PageNavigator } from "../dist/navigator/pageNavigator.js";
+import { wheelBy } from "../dist/navigator/wheel.js";
 import { Pacing } from "../dist/behavior/timing.js";
 import { Logger } from "../dist/logging/logger.js";
 import { Rng } from "../dist/util/random.js";
@@ -22,6 +23,9 @@ import { startMockStorefront } from "./mockStorefront.mjs";
 function findChromium() {
   return [
     process.env.CHROMIUM_PATH,
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
     "/usr/bin/chromium",
     "/usr/bin/google-chrome",
@@ -116,6 +120,30 @@ test("dispatches real wheel events the page can observe", { skip }, async () => 
   const events = await page.evaluate(() => window.__wheel);
 
   assert.ok(events > 5, `expected a burst of wheel events, got ${events}`);
+  await page.close();
+});
+
+test("a page slow to take wheel input still gets a gesture-length fling, coalesced like a busy browser", { skip }, async () => {
+  const { page } = await openPage(5);
+  // A heavy page: every wheel event costs the renderer ~120ms before it is acknowledged.
+  await page.evaluate(() => {
+    document.querySelector("main").style.minHeight = "6000px";
+    window.__wheel = 0;
+    addEventListener("wheel", () => {
+      window.__wheel++;
+      const until = performance.now() + 120;
+      while (performance.now() < until) { /* busy main thread */ }
+    }, { passive: false });
+  });
+  const before = await page.evaluate(() => window.scrollY);
+  const t0 = Date.now();
+  for (const style of ["trackpad", "detent"]) await wheelBy(page, new Rng(9), 1200, { style });
+  const tookMs = Date.now() - t0;
+  const travelled = (await page.evaluate(() => window.scrollY)) - before;
+  // Event by event, two 1200px gestures at ~120ms each would take over 10s.
+  assert.ok(tookMs < 7_000, `two gestures on a slow page took ${tookMs}ms`);
+  assert.ok(Math.abs(travelled - 2400) < 80, `the full distance is still covered (${travelled}px)`);
+  assert.ok((await page.evaluate(() => window.__wheel)) >= 6, "still a burst of real wheel events, not one jump");
   await page.close();
 });
 

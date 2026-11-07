@@ -201,6 +201,27 @@ test("imports cookies through the endpoint the file picker posts to", async () =
   assert.deepEqual(stored.domains, ["shop.example"]);
 });
 
+test("auto-syncs timezone and locale from cookie filename (_US.txt)", async () => {
+  const { body: state } = await api("/api/state");
+  const id = state[2].profile.id;
+
+  const contents = "shop.example\tTRUE\t/\tTRUE\t4102444800\tsessionKey\tuser-secret-123\n";
+  const { status, body } = await api(`/api/profiles/${id}/cookies`, {
+    method: "POST",
+    body: JSON.stringify({ filename: "1dbeachamm@gmail.com_US.txt", contents }),
+  });
+  assert.equal(status, 200);
+  assert.equal(body.imported, 1);
+  assert.ok(body.geoSync);
+  assert.equal(body.geoSync.country, "US");
+  assert.equal(body.geoSync.timezone, "America/New_York");
+  assert.equal(body.geoSync.locale, "en-US");
+
+  const prof = orchestrator.store.require(id);
+  assert.equal(prof.identity.timezone, "America/New_York");
+  assert.equal(prof.identity.locale, "en-US");
+});
+
 test("rejects a cookie file it cannot understand", async () => {
   const { body: state } = await api("/api/state");
   const id = state[1].profile.id;
@@ -281,4 +302,61 @@ test("does not serve files outside the public directory", async () => {
   const res = await fetch(`${base}/../../package.json`, { redirect: "manual" });
   assert.ok(res.status === 403 || res.status === 404, `got ${res.status}`);
   await res.body?.cancel();
+});
+
+test("returns device catalog and manages device emulation on profiles", async () => {
+  // 1. GET /api/devices returns catalog
+  const { status: devStatus, body: devBody } = await api("/api/devices");
+  assert.equal(devStatus, 200);
+  assert.ok(devBody.catalog, "expected catalog object");
+  assert.ok(Array.isArray(devBody.catalog.android), "expected android array");
+  assert.ok(Array.isArray(devBody.catalog.iphone), "expected iphone array");
+  assert.ok(devBody.catalog.iphone.includes("iPhone 14 Pro"));
+
+  // 2. Create profile with mobile device
+  const { status: createStatus, body: created } = await api("/api/profiles", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Mobile iPhone",
+      device: { kind: "iphone", model: "iPhone 14 Pro" },
+    }),
+  });
+  assert.equal(createStatus, 201);
+  assert.deepEqual(created.device, { kind: "iphone", model: "iPhone 14 Pro" });
+
+  // 3. Update device via PATCH
+  const { status: patchStatus, body: patched } = await api(`/api/profiles/${created.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      device: { kind: "android", model: "Pixel 7" },
+    }),
+  });
+  assert.equal(patchStatus, 200);
+  assert.deepEqual(patched.device, { kind: "android", model: "Pixel 7" });
+
+  // 4. Clear device back to desktop
+  const { status: clearStatus, body: cleared } = await api(`/api/profiles/${created.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      device: null,
+    }),
+  });
+  assert.equal(clearStatus, 200);
+  assert.equal(cleared.device, undefined);
+
+  // 5. Bulk apply device to all profiles
+  const { status: bulkDevStatus, body: bulkDevBody } = await api("/api/profiles/bulk-device", {
+    method: "POST",
+    body: JSON.stringify({
+      device: { kind: "iphone", model: "iPhone 15 Pro Max" },
+    }),
+  });
+  assert.equal(bulkDevStatus, 200);
+  assert.ok(bulkDevBody.updated > 0);
+  assert.deepEqual(bulkDevBody.device, { kind: "iphone", model: "iPhone 15 Pro Max" });
+
+  const { body: stateAfterBulk } = await api("/api/state");
+  for (const v of stateAfterBulk) {
+    assert.deepEqual(v.profile.device, { kind: "iphone", model: "iPhone 15 Pro Max" });
+  }
 });

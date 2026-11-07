@@ -7,12 +7,12 @@
  * see the elements it needs — and to generate `selectorOverrides` if some
  * concept comes back empty.
  */
-import type { Page } from "playwright-core";
+import type { Page } from "rebrowser-playwright";
 import type { SimulatorConfig } from "../config.js";
 import { Logger } from "../logging/logger.js";
 import { Rng, randomSeed } from "../util/random.js";
 import { Pacing } from "../behavior/timing.js";
-import { launchBrowser } from "../browser/cloak.js";
+import { launchBrowser } from "../browser/chrome.js";
 import { PageNavigator, openSessionPage } from "./pageNavigator.js";
 import { buildSelectors, type SelectorSet } from "./selectors.js";
 import type { PageType } from "../types.js";

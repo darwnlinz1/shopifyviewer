@@ -1,10 +1,10 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 /**
  * CLI for the Shopify storefront behaviour simulator.
  *
  *   storefront-sim run    [flags]   run one or more ~15 minute sessions
  *   storefront-sim probe  [flags]   check which selectors match this theme
- *   storefront-sim info             report CloakBrowser binary status
+ *   storefront-sim info             report browser binary status
  *   storefront-sim init             write a starter config file
  */
 import { writeFileSync, existsSync } from "node:fs";
@@ -12,13 +12,13 @@ import { ensureDependencies } from "./bootstrap.js";
 import { loadConfig, DEFAULT_CONFIG, type SimulatorConfig } from "./config.js";
 import { runAll } from "./session/runner.js";
 import { probeStorefront, formatProbeReport } from "./navigator/probe.js";
-import { cloakBinaryStatus } from "./browser/cloak.js";
+import { browserBinaryStatus } from "./browser/chrome.js";
 import { verifyBrowser, formatFingerprintReport } from "./browser/verify.js";
 import { Orchestrator } from "./server/orchestrator.js";
 import { startDashboard } from "./server/http.js";
 
 const USAGE = `
-Shopify Storefront Behaviour Simulator — CloakBrowser + Playwright
+AI Storefront Simulator — Chrome + Playwright + Claude element detection
 
 Usage
   storefront-sim <command> [options]
@@ -28,30 +28,33 @@ Commands
   run       Run simulated browsing sessions against a storefront
   probe     Load home/collection/product and report which selectors match
   verify    Report what the browser exposes to a page, and any inconsistencies
-  info      Show CloakBrowser binary status
+  info      Show browser binary status
   init      Write a starter storefront-sim.config.json
 
 Options
-  --storefront <url>     Storefront base URL            (default ${DEFAULT_CONFIG.storefront})
+  --storefront <url>     Storefront base URL            (default: none, set per profile)
   --sessions <n>         Number of sessions to run      (default 1)
   --concurrency <n>      Sessions running in parallel   (default 1)
   --duration <minutes>   Session length                 (default 15)
   --seed <n>             Deterministic seed (reproduces a session)
   --config <path>        Config file to load
-  --profile-dir <path>   Persistent profile directory   (default ./profiles)
+  --profile-dir <path>   Persistent profile directory   (default ./tempprofolio)
   --log-dir <path>       Log output directory           (default ./logs)
   --log-level <level>    debug | info | warn | error    (default info)
   --proxy <url>          Proxy URL (repeatable, one per session slot)
   --headed               Run with a visible browser window
   --headless             Force headless (default)
   --fresh-profiles       Do not reuse profiles between runs
-  --allow-fallback       Allow stock Chromium if CloakBrowser is unavailable
+  --allow-fallback       Legacy flag, accepted and ignored (Chrome is the engine)
   --pace <factor>        Speed multiplier for every delay
                          (1 = default, 2 = twice as brisk, 0.5 = half speed)
+  --atc-min <minutes>    Timed add-to-cart schedule; needs safety.allowCart
+                         (0 = disable timed ATC)
   --linger <minutes>     Hold the browser open after the budget is spent
                          (0 = close immediately, -1 = until closed)
   --port <n>             Dashboard port                 (default 7317)
   --host <addr>          Dashboard bind address         (default 127.0.0.1)
+  --token <secret>       Require this token on every dashboard API call
   --quiet                Suppress console logging
   -h, --help             Show this help
 
@@ -159,6 +162,17 @@ function overridesFrom(flags: Map<string, string[]>): Partial<SimulatorConfig> {
     behavior.speedFactor = pace;
   }
 
+  // Timed add-to-cart: minutes from session start; 0 disables it entirely.
+  // Only meaningful together with safety.allowCart.
+  const atc = num(flags, "atc-min");
+  if (atc !== undefined) {
+    if (atc < 0) throw new Error("--atc-min expects 0 (off) or a positive number of minutes");
+    const ai: Record<string, unknown> = {
+      advanceActionTimeMs: atc === 0 ? Number.MAX_SAFE_INTEGER : Math.round(atc * 60_000),
+    };
+    patch.ai = ai;
+  }
+
   const linger = num(flags, "linger");
   if (linger !== undefined) session.lingerMs = Math.round(linger * 60_000);
 
@@ -200,34 +214,48 @@ async function main(): Promise<number> {
   }
 
   if (command === "info") {
-    const status = await cloakBinaryStatus();
+    const status = await browserBinaryStatus();
     process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
-    if (!status.installed) {
+    if (status.engine === "none") {
       process.stdout.write(
-        `\nCloakBrowser binary not installed. Fetch it with:\n  npx cloakbrowser install\n`,
+        `\nKhong tim thay Google Chrome / Microsoft Edge. Cai Chrome hoac dat\n` +
+          `browser.executablePath trong storefront-sim.config.json.\n`,
       );
     }
-    return status.installed ? 0 : 1;
+    return status.engine === "none" ? 1 : 0;
   }
 
   const config = loadConfig(one(flags, "config"), overridesFrom(flags));
 
+  // Commands that browse need a shop to aim at. The dashboard does not: it
+  // only starts sessions for profiles that carry their own storefront.
+  if (["run", "probe"].includes(command) && !config.storefront) {
+    process.stderr.write(
+      `No storefront configured. Set one with --storefront <url>, in the\n` +
+        `config file, or on each profile via the dashboard.\n`,
+    );
+    return 1;
+  }
+
   if (command === "dashboard") {
     const port = num(flags, "port") ?? 7317;
     const host = one(flags, "host") ?? "127.0.0.1";
+    const token = one(flags, "token");
 
     const orchestrator = new Orchestrator(config);
-    const dashboard = await startDashboard(orchestrator, port, host);
+    const dashboard = await startDashboard(orchestrator, port, host, token);
 
     process.stdout.write(
       [
         "",
-        `Dashboard  ${dashboard.url}`,
-        `Storefront ${config.storefront}`,
+        `Dashboard  ${dashboard.url}${token ? "/?token=" + encodeURIComponent(token) : ""}`,
+        `Storefront ${config.storefront || "(per-profile)"}`,
         `Profiles   ${config.browser.profileDir}`,
         `Browsers   ${config.browser.headless ? "headless (live view still streams)" : "headed"}`,
         "",
-        "Every tile streams its browser live. Ctrl-C to stop.",
+        token
+          ? "API calls require the token. Every tile streams its browser live. Ctrl-C to stop."
+          : "Every tile streams its browser live. Ctrl-C to stop.",
         "",
       ].join("\n"),
     );
@@ -239,7 +267,7 @@ async function main(): Promise<number> {
       const shutdown = (): void => {
         if (closing) process.exit(130);
         closing = true;
-        process.stderr.write("\nClosing browsers…\n");
+        process.stderr.write("\nClosing browsers...\n");
         void (async () => {
           await orchestrator.shutdown().catch(() => undefined);
           await dashboard.close().catch(() => undefined);
@@ -276,7 +304,7 @@ async function main(): Promise<number> {
   const onSignal = (): void => {
     if (interrupted) process.exit(130);
     interrupted = true;
-    process.stderr.write("\nShutting down sessions… (Ctrl-C again to force)\n");
+    process.stderr.write("\nShutting down sessions... (Ctrl-C again to force)\n");
     controller.abort();
   };
   process.on("SIGINT", onSignal);
@@ -291,7 +319,7 @@ async function main(): Promise<number> {
     [
       "",
       `Run complete — ${summary.storefront}`,
-      `  sessions        ${t.succeeded}/${t.sessions} ok`,
+      `  sessions        ${t.succeeded}/${t.sessions} ok` + (t.blocked > 0 ? ` (${t.blocked} blocked by walls)` : ""),
       `  pages visited   ${t.pagesVisited}`,
       `  products viewed ${t.productsViewed}`,
       `  collections     ${t.collectionsViewed}`,
@@ -314,3 +342,4 @@ main()
     process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(1);
   });
+

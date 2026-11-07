@@ -7,7 +7,7 @@
  * live view produces frames.
  *
  * Runs on stock Chromium via the fallback path — this exercises the session
- * machinery, not CloakBrowser's patches, and does not need a 1 GB download in
+ * machinery, not external patches, and does not need a 1 GB download in
  * CI. Skips cleanly when no Chromium is available.
  */
 import { test, before, after } from "node:test";
@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../dist/config.js";
-import { startSession } from "../dist/session/manager.js";
+import { startSession } from "../dist/session/aiManager.js";
 import { Screencast } from "../dist/server/screencast.js";
 import { startMockStorefront } from "./mockStorefront.mjs";
 
@@ -24,6 +24,8 @@ import { startMockStorefront } from "./mockStorefront.mjs";
 function findChromium() {
   const candidates = [
     process.env.CHROMIUM_PATH,
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
     "/usr/bin/chromium",
     "/usr/bin/google-chrome",
@@ -64,6 +66,12 @@ before(async () => {
       navigationTimeoutMs: 15_000,
     },
     logging: { dir: join(workDir, "logs"), console: false, jsonl: false },
+    // Point the AI layer at an empty cookie directory: with no cookies the
+    // detector classifies locally (no network, deterministic), which is what
+    // these tests assert against.
+    ai: { cookiesDir: join(workDir, "cookies") },
+    // Short engagement so 12-second test sessions actually navigate.
+    behavior: { ...loadConfig().behavior, pageEngagementMs: { min: 2_000, max: 3_000 } },
   });
 });
 
@@ -214,4 +222,55 @@ test("closes immediately when linger is off", { skip }, async () => {
   assert.ok(["timer", "engine_exit"].includes(result.exitReason));
   // Scripted runs must still terminate on their own.
   assert.ok(handle.page.isClosed(), "page should be closed when linger is off");
+});
+
+test("revives in background when the browser is killed mid-visit", { skip }, async () => {
+  // Short engagement so the revived visit navigates again quickly.
+  const reviveConfig = {
+    ...config,
+    behavior: { ...config.behavior, pageEngagementMs: { min: 3_000, max: 5_000 } },
+    session: { ...config.session, durationMs: 90_000 },
+  };
+  const handle = await startSession({
+    slot: 4,
+    sessionId: "test-revive",
+    config: reviveConfig,
+    lingerMs: -1,
+  });
+
+  try {
+    // Let it reach a real page first.
+    const started = Date.now();
+    while (handle.snapshot().pagesVisited < 1 && Date.now() - started < 25_000) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(handle.snapshot().pagesVisited >= 1, "session should browse before the kill");
+
+    // The operator closes the desktop window out from under the visit.
+    const pagesBefore = handle.snapshot().pagesVisited;
+    await handle.page.context().close();
+
+    // A fresh background browser takes over the SAME visit and keeps going.
+    let revived = false;
+    const deadline = Date.now() + 40_000;
+    while (Date.now() < deadline) {
+      if (!handle.page.isClosed() && handle.snapshot().status === "running") { revived = true; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(revived, "session should relaunch in the background after the kill");
+    assert.ok(!handle.page.isClosed(), "a fresh page should be serving the visit");
+
+    // And browsing continues on the new instance.
+    let browsedAgain = false;
+    const deadline2 = Date.now() + 40_000;
+    while (Date.now() < deadline2) {
+      if (handle.snapshot().pagesVisited > pagesBefore) { browsedAgain = true; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(browsedAgain, "the revived visit should navigate again");
+
+    await handle.close();
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 });

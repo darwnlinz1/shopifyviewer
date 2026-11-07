@@ -17,6 +17,7 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import type { ProfileCookies, StoredCookie } from "./types.js";
+export type { StoredCookie } from "./types.js";
 
 /** Cookie formats the importer recognises. */
 export type CookieFormat = "storage-state" | "json-array" | "netscape";
@@ -57,13 +58,24 @@ function normaliseSameSite(raw: unknown): StoredCookie["sameSite"] {
 /**
  * Normalise an expiry to Unix *seconds*. Exporters variously emit seconds,
  * milliseconds, ISO strings, or nothing at all for a session cookie.
+ *
+ * Some OpenBullet-style exporters write absurd far-future stamps (1e13+
+ * seconds — the year 430,000). Chromium refuses those outright and would
+ * otherwise void the whole jar, so any future stamp past a sane ceiling is
+ * clamped rather than trusted.
  */
 function normaliseExpiry(raw: unknown): number {
+  // Anything past 2099 is exporter garbage (ticks/miscaled epochs), not a
+  // real cookie lifetime — clamp it so engines accept the jar.
+  const MAX_FUTURE_SEC = 4102444800;
+  const clampFuture = (seconds: number): number =>
+    seconds > MAX_FUTURE_SEC ? MAX_FUTURE_SEC : seconds;
+
   if (raw === undefined || raw === null || raw === "") return -1;
   if (typeof raw === "number") {
     if (!Number.isFinite(raw) || raw <= 0) return -1;
     // Values past ~year 33658 are milliseconds that were never converted.
-    return raw > 1e12 ? Math.round(raw / 1000) : Math.round(raw);
+    return clampFuture(raw > 1e12 ? Math.round(raw / 1000) : Math.round(raw));
   }
   if (typeof raw === "string") {
     const trimmed = raw.trim();
@@ -73,7 +85,7 @@ function normaliseExpiry(raw: unknown): number {
     // year 2000, and the cookie is then silently dropped as expired.
     if (trimmed !== "" && Number.isFinite(numeric)) return normaliseExpiry(numeric);
     const parsed = Date.parse(trimmed);
-    if (Number.isFinite(parsed)) return Math.round(parsed / 1000);
+    if (Number.isFinite(parsed)) return clampFuture(Math.round(parsed / 1000));
   }
   return -1;
 }
@@ -86,17 +98,31 @@ function toStoredCookie(
   const name = typeof raw.name === "string" ? raw.name : "";
   if (!name) return { skip: `entry ${index}: missing "name"` };
 
-  const domain = typeof raw.domain === "string" ? raw.domain : "";
+  // Missing domain is recoverable when the export carries a url/host field
+  // (Cookie-Editor style) — derive the scope from it instead of dropping the
+  // row. Only a row with neither is truly unscopeable.
+  let domain = typeof raw.domain === "string" ? raw.domain.trim() : "";
+  if (!domain) {
+    for (const fallback of [raw.url, raw.host]) {
+      if (typeof fallback !== "string" || !fallback) continue;
+      try {
+        domain = new URL(fallback.includes("://") ? fallback : `https://${fallback}`).hostname;
+        break;
+      } catch {
+        // not a URL; try the next fallback
+      }
+    }
+  }
   if (!domain) return { skip: `cookie "${name}": missing "domain"` };
 
-  // `value` is legitimately empty for some flags, so only its absence is fatal.
+  // An absent value stores as empty rather than fatal: exporters omit the
+  // value for flag cookies all the time, and Chromium happily keeps them.
   const value =
     typeof raw.value === "string"
       ? raw.value
       : raw.value === undefined || raw.value === null
-        ? undefined
+        ? ""
         : String(raw.value);
-  if (value === undefined) return { skip: `cookie "${name}": missing "value"` };
 
   // Chrome exports host-only cookies with a leading dot stripped and a
   // `hostOnly` flag; Playwright infers host-only from the absence of the dot,
@@ -132,21 +158,44 @@ function parseNetscape(text: string): ParsedCookieFile {
     const body = httpOnly ? trimmed.slice("#HttpOnly_".length) : trimmed;
     if (!body || body.startsWith("#")) continue;
 
-    // domain \t includeSubdomains \t path \t secure \t expiry \t name \t value
-    const fields = body.split("\t");
-    if (fields.length < 7) {
-      warnings.push(`line ${lineNumber + 1}: expected 7 tab-separated fields`);
+    let fields = body.split("\t");
+
+    // Some exporters separate the columns with runs of spaces instead of
+    // tabs. Fall back to whitespace splitting only when it plausibly yields a
+    // full row — first token must look like a domain.
+    if (fields.length === 1 && /\s/.test(body)) {
+      const spaced = body.split(/\s+/);
+      if (spaced.length >= 6 && /^[.#]?[\w-]+(\.[\w-]+)+$/.test(spaced[0] ?? "")) {
+        fields = spaced;
+      }
+    }
+
+    // Whatever is STILL a single field is prose from merged exports
+    // ("Email: x@y.z; Cards: [visa]…", "DATA: Name: … | Address: …") —
+    // vendor metadata, not cookie rows. Ignore QUIETLY so imports never
+    // report phantom skips.
+    if (fields.length === 1) continue;
+
+    // The five leading columns are fixed; everything after them is
+    // "name [value…]". Parsing left-to-right means a row whose value was
+    // empty — and whose trailing tab an editor trimmed away — imports with an
+    // empty value instead of being discarded wholesale. A value containing
+    // tabs is malformed but recoverable: rejoin it.
+    if (fields.length < 6) {
+      warnings.push(`line ${lineNumber + 1}: too few fields (${fields.length})`);
       continue;
     }
-    const [domain, includeSubdomains, path, secure, expiry, name, ...rest] = fields;
+    const [domain, includeSubdomains, path, secure, expiry] = fields;
+    const tail = fields.slice(5);
+    const name = tail[0] ?? "";
+    const value = tail.slice(1).join("\t");
     if (!domain || !name) {
       warnings.push(`line ${lineNumber + 1}: missing domain or name`);
       continue;
     }
-    cookies.push({
+    const row: StoredCookie = {
       name,
-      // A value containing tabs is malformed but recoverable — rejoin it.
-      value: rest.join("\t"),
+      value,
       domain:
         includeSubdomains?.toUpperCase() === "TRUE" && !domain.startsWith(".")
           ? `.${domain}`
@@ -156,7 +205,8 @@ function parseNetscape(text: string): ParsedCookieFile {
       httpOnly,
       secure: secure?.toUpperCase() === "TRUE",
       sameSite: "Lax",
-    });
+    };
+    cookies.push(row);
   }
 
   return { format: "netscape", cookies, warnings };
@@ -208,8 +258,13 @@ function parseJson(text: string): ParsedCookieFile {
 }
 
 /**
- * Parse cookie file contents. The format is detected from the content, not the
- * extension — exports are routinely saved under the wrong name.
+ * Take every row VERBATIM.
+ *
+ * No widening, no merging: a name present at several scopes (`shop.app` AND
+ * `.shop.app`) is several real cookies a browser would hold side by side, and
+ * collapsing them picks one value by guesswork while silently dropping the
+ * other. The jar below is exactly the file, line for line — only unparseable
+ * metadata lines produce warnings.
  */
 export function parseCookieText(text: string): ParsedCookieFile {
   const trimmed = text.trim();
@@ -250,6 +305,26 @@ export function cookieDomains(cookies: StoredCookie[]): string[] {
   return [...counts.entries()]
     .sort((a, b) => b[1] - a[1])
     .map(([domain]) => domain);
+}
+
+/**
+ * Stable, order-independent content fingerprint of a cookie jar.
+ *
+ * Injection is skipped whenever this matches what the browser already holds —
+ * sites rewrite session values continuously, and stamping an older snapshot
+ * back over the fresher state logs the visitor out. Value participates so any
+ * server-side rotation produces a new signature; expiry participates because
+ * the injector normalises stale stamps to session cookies and the captured
+ * jar must agree with what was actually applied.
+ */
+export function jarSignature(cookies: StoredCookie[]): string {
+  return cookies
+    .map(
+      (c) =>
+        `${c.name}|${c.domain}|${c.path}|${c.expires}|${c.httpOnly ? 1 : 0}|${c.value}`,
+    )
+    .sort()
+    .join("\n");
 }
 
 /** Build the stored record the profile keeps for an imported cookie file. */
