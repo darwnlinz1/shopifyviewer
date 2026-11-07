@@ -75,7 +75,8 @@ export class WafChallengeDetector {
    */
   public static async inspectPage(page: Page, logger?: Logger): Promise<WafChallengeState> {
     const url = page.url();
-    const pageTitle = (await evaluateIsolated(page, function pageTitleInPage(): string { return document.title || ""; })) ?? "";
+    const isolatedTitle = await evaluateIsolated(page, function pageTitleInPage(): string { return document.title || ""; });
+    const pageTitle = (isolatedTitle ?? (await (typeof page.title === "function" ? page.title() : Promise.resolve("")).catch(() => ""))) || "";
 
     // Inject hooks for SPAs
     await this.injectTurnstileHooks(page);
