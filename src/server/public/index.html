@@ -26,7 +26,6 @@
       <div style="display:flex;align-items:center;gap:6px">
         <span class="brand__name">Storefront Simulator</span>
         <span class="badge" id="engine-badge" style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(74,222,128,0.3)">🚀 Ungoogled-Chromium</span>
-        <span class="badge" id="bitbrowser-badge" style="font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px" hidden>BitBrowser</span>
       </div>
       <span class="brand__sub" id="storefront">—</span>
     </div>
@@ -187,23 +186,6 @@
            profile override.</p>
       </div>
 
-      <div class="grid2">
-        <label class="field">
-          <span>Browser engine <em>kernel</em></span>
-          <select id="f-provider" class="engine-select">
-            <option value="">Theo config (mặc định)</option>
-            <option value="builtin">Built-in Chromium</option>
-            <option value="bitbrowser">BitBrowser (C++ kernel)</option>
-          </select>
-        </label>
-        <label class="field" data-bit-only id="f-bitbrowser-field">
-          <span>BitBrowser Profile ID <em>trống = tự tạo</em></span>
-          <input type="text" id="f-bitbrowser-id" autocomplete="off" spellcheck="false"
-                 placeholder="empty = auto-create on first launch">
-        </label>
-      </div>
-      <p class="note" id="f-bitbrowser-note" hidden>BitBrowser mở profile qua Local API và tự giả lập vân tay bằng nhân C++ — SiteViewer không tiêm script stealth trong chế độ này. Đổi engine áp dụng ở lần mở trình duyệt tiếp theo.</p>
-
       <div class="field">
         <span>Proxy</span>
         <input type="text" id="f-proxy" autocomplete="off" spellcheck="false"
@@ -288,21 +270,6 @@
       </label>
       <div class="grid2">
         <label class="field">
-          <span>Browser engine <em>kernel</em></span>
-          <select id="c-provider" class="engine-select">
-            <option value="">Theo config (mặc định)</option>
-            <option value="builtin">Built-in Chromium</option>
-            <option value="bitbrowser">BitBrowser (C++ kernel)</option>
-          </select>
-        </label>
-        <label class="field" data-bit-only id="c-bitbrowser-field">
-          <span>BitBrowser Profile ID <em>trống = tự tạo</em></span>
-          <input type="text" id="c-bitbrowser-id" autocomplete="off" spellcheck="false"
-                 placeholder="empty = auto-create on first launch">
-        </label>
-      </div>
-      <div class="grid2">
-        <label class="field">
           <span>Session length <em>minutes</em></span>
           <input type="number" id="c-duration" min="1" step="1" placeholder="global default">
         </label>
@@ -385,14 +352,6 @@
           <input type="number" id="bc-atc" min="0" step="1" placeholder="6 (global default)">
         </label>
       </div>
-      <label class="field">
-        <span>Browser engine <em>cho toàn bộ profile · BitBrowser tự tạo 1 profile cho mỗi dòng</em></span>
-        <select id="bc-provider" class="engine-select">
-          <option value="">Theo config (mặc định)</option>
-          <option value="builtin">Built-in Chromium</option>
-          <option value="bitbrowser">BitBrowser (C++ kernel)</option>
-        </select>
-      </label>
       <div class="field">
         <span>Thiết bị <em>giả lập UA + màn hình cho toàn bộ profile</em></span>
         <div class="device-picker" id="bc-device-kinds">

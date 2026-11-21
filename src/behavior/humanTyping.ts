@@ -110,22 +110,6 @@ function computeFlightLatency(rng: Rng, prevChar: string, nextChar: string): num
 }
 
 /**
- * Determine whether two consecutive characters can exhibit N-graph key rollover
- * (Dhakal et al. CHI 2018: 25-45% of human keystrokes overlap on alternating hands or inward rolls).
- */
-function canRolloverDigraph(prevChar: string, nextChar: string): boolean {
-  if (!prevChar || !nextChar || prevChar.toLowerCase() === nextChar.toLowerCase()) return false;
-  const p1 = KEY_MAP[prevChar.toLowerCase()];
-  const p2 = KEY_MAP[nextChar.toLowerCase()];
-  if (!p1 || !p2) return false;
-  // Tier 1: Alternating hands (left <-> right)
-  if (p1.hand !== p2.hand) return true;
-  // Tier 2: Same-hand inward roll (outer finger -> inner finger, e.g. pinky/ring -> middle/index)
-  if (p1.hand === p2.hand && p1.finger < p2.finger && p1.row === p2.row) return true;
-  return false;
-}
-
-/**
  * Dispatches a single keystroke with distinct keydown and keyup dwell timing.
  * Dwell time strictly conforms to Log-Normal(μ=80ms, σ=18ms, [35ms, 160ms]).
  */
@@ -139,13 +123,11 @@ async function pressKeyWithDwell(page: Page, key: string, rng: Rng): Promise<num
 
 /**
  * Types human-like text with authentic dwell times, QWERTY digraph flight times,
- * N-graph key rollover (overlapping keydown/keyup on alternating hands),
  * cognitive perception lag, and post-error slowing.
  */
 export async function typeHumanLike(page: Page, text: string, rng: Rng): Promise<void> {
   let prevChar = " ";
   let prevDwell = 75;
-  let pendingKeyUp: Promise<void> | null = null;
   let i = 0;
   let postErrorSlowing = 1.0;
 
@@ -157,10 +139,6 @@ export async function typeHumanLike(page: Page, text: string, rng: Rng): Promise
     const willTypo = rng.next() < 0.03 && QWERTY_ADJACENT[lower];
 
     if (willTypo) {
-      if (pendingKeyUp) {
-        await pendingKeyUp;
-        pendingKeyUp = null;
-      }
       const adjacent = QWERTY_ADJACENT[lower] ?? [];
       const wrongChar = adjacent[Math.floor(rng.next() * adjacent.length)] ?? "e";
 
@@ -195,52 +173,16 @@ export async function typeHumanLike(page: Page, text: string, rng: Rng): Promise
       prevDwell = 85;
     }
 
-    // Type the correct character (with N-graph rollover when biomechanically eligible)
+    // Type the correct character
     const baseFlight = computeFlightLatency(rng, prevChar, char);
     const targetFlight = Math.round(baseFlight * postErrorSlowing);
-    const rawRpDelay = targetFlight - prevDwell;
+    const releaseToPressDelay = Math.max(10, targetFlight - prevDwell);
     postErrorSlowing = Math.max(1.0, postErrorSlowing - 0.14);
 
-    const nextChar = i + 1 < text.length ? (text[i + 1] ?? "") : "";
-    const nextEligibleRollover = canRolloverDigraph(char, nextChar) && postErrorSlowing <= 1.05 && rng.chance(0.55);
-    const currentDwell = Math.max(35, Math.min(160, sampleLogNormal(rng, 80, 0.22)));
-
-    if (pendingKeyUp) {
-      // Previous key is still held down (rollover active): press current key now, then await previous keyup
-      await page.keyboard.down(char);
-      await pendingKeyUp;
-      pendingKeyUp = null;
-      await new Promise((r) => setTimeout(r, currentDwell));
-      await page.keyboard.up(char);
-      prevDwell = currentDwell;
-    } else if (nextEligibleRollover) {
-      const releaseToPressDelay = Math.max(8, rawRpDelay);
-      await new Promise((r) => setTimeout(r, releaseToPressDelay));
-      const overlapMs = rng.int(12, Math.min(36, currentDwell - 15));
-      const preOverlapMs = Math.max(12, currentDwell - overlapMs);
-      await page.keyboard.down(char);
-      await new Promise((r) => setTimeout(r, preOverlapMs));
-      // Schedule keyup after overlapMs while next iteration presses the next key!
-      pendingKeyUp = new Promise<void>((resolve) => {
-        setTimeout(() => {
-          void page.keyboard.up(char).then(() => resolve()).catch(() => resolve());
-        }, overlapMs);
-      });
-      prevDwell = currentDwell;
-    } else {
-      const releaseToPressDelay = Math.max(10, rawRpDelay);
-      await new Promise((r) => setTimeout(r, releaseToPressDelay));
-      await page.keyboard.down(char);
-      await new Promise((r) => setTimeout(r, currentDwell));
-      await page.keyboard.up(char);
-      prevDwell = currentDwell;
-    }
+    await new Promise((r) => setTimeout(r, releaseToPressDelay));
+    prevDwell = await pressKeyWithDwell(page, char, rng);
 
     prevChar = char;
     i++;
-  }
-
-  if (pendingKeyUp) {
-    await pendingKeyUp;
   }
 }

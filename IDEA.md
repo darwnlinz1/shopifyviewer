@@ -1,15 +1,7 @@
-# Storefront Simulator — SiteViewer V3.0 (BitBrowser Edition)
+# Storefront Simulator — SiteViewer V1.0.0
 
-> **Trạng thái V3.0 (16/10/2026)**: hai trụ cột trong [`BITBROWSER_HANDOFF_PROMPT.md`](./BITBROWSER_HANDOFF_PROMPT.md)
-> đã được hiện thực và kiểm chứng:
-> 1. **Engine BitBrowser** (`src/browser/bitbrowser.ts`) — Local API `:54345` + `connectOverCDP`, chọn theo từng profile
->    song song với Chromium tích hợp; không tiêm bất kỳ script stealth/noise JS nào khi chạy trên BitBrowser.
-> 2. **Nhận diện 3 tầng + chuỗi view người thật trước checkout** — Tier 0 recipe theo tên miền, Tier 1 multi-signal
->    (oracle Shopify + form + ARIA + hình học buy-box) trong isolated world, Tier 2 AI chỉ khi cần; khám phá → so sánh
->    (Back) → xem sâu PDP (gallery, mô tả, size/màu) → ATC đúng mốc → kiểm tra giỏ.
-
-Công cụ QA & mô phỏng hành vi người mua hàng thật trên storefront Shopify, ghi lại JS error,
-thời gian tải trang, request hỏng và tương tác giỏ hàng (Add-To-Cart) — kèm dashboard quản lý nhiều profile
+Công cụ QA chạy phiên duyệt web mô phỏng trên storefront Shopify của chính mình, ghi lại JS error,
+thời gian tải trang, request hỏng và sản phẩm render thiếu — kèm dashboard quản lý nhiều profile
 browser, mỗi profile stream trực tiếp.
 
 ## Dự án này có ý nghĩa gì
@@ -20,40 +12,47 @@ xem gallery, rê chuột qua biến thể, rồi rời đi. Trong lúc đó nó 
 Về bản chất đây là **công cụ giám sát chất lượng storefront bằng lưu lượng giả lập người thật**,
 chạy trên browser thật (Chrome/Edge) nên thấy được những gì một khách thật thấy.
 
-Một engine hành vi (`src/behavior/aiEngine.ts`) lái phiên; nó biết bấm vào đâu nhờ thác nhận diện 3 tầng:
+Hai lớp hành vi dùng chung một tầng browser:
 
-- **Tier 0** (`src/ai/domainRecipeCache.ts`) — selector đã học theo `hostname + pageType`, lưu ở `data/domain-recipes.json`.
-- **Tier 1** (`src/navigator/multiSignalDetector.ts`) — quét buy-box trong isolated world: oracle sản phẩm Shopify
-  (variant + tồn kho), form/custom element, ARIA, hình học.
-- **Tier 2** (`src/ai/elementDetector.ts`) — gửi *source digest* lên Claude khi Tier 1 không chắc (< 0,80) hoặc một cú
-  bấm ATC không làm giỏ tăng; kết quả đúng được ghi ngược về Tier 0. `src/ai/localFallback.ts` là rule offline khi AI vắng.
+- **Local engine** (`src/navigator/productDiscovery.ts`, khớp phần tử theo rule) — không cần mạng,
+  deterministic, dùng cho test và làm fallback.
+- **AI engine** (`src/behavior/aiEngine.ts`) — gửi *source digest* của trang (JSON-LD, mọi link kèm
+  ngữ cảnh card và giá, control tương tác) lên Claude để phân loại link sản phẩm / nút ATC dựa trên
+  bằng chứng markup, không lọc sẵn theo URL pattern — theme không dùng route `/products/` vẫn chạy được.
 
 > Mặc định chỉ đọc. Add-to-cart tồn tại nhưng chết trừ khi `safety.allowCart = true`;
 > checkout và trang account luôn bị chặn.
 
-## Số liệu đã kiểm chứng V3.0 (16/10/2026)
+## Số liệu thực tế (đo ngày 26/08/2026)
 
 | Chỉ số | Giá trị |
 | --- | --- |
-| Code nguồn | 60 file trong `src/` |
-| Test suite (`npm test`) | **109 / 109 pass** (13 file; gồm mock BitBrowser Local API mở Chrome thật qua CDP, nhận diện 3 tầng, chuỗi view trên mock storefront có giỏ thật, fleet 10 & 20 trình duyệt — 20 trình duyệt đóng trong ~2 s) |
-| Benchmark 5 site Shopify thật (`scripts/test-5-live-sites.mjs`) | **5 / 5 Verified Add-To-Cart** ở cả 8 lần chạy V3.0, không cookie shop.app / AI; phiên 3,2 phút, ATC ở phút 2,0. Ở 5/8 lần (gồm 3 lần cuối trên code cuối) lần bấm ATC đầu tiên đều được xác minh trên cả 5 site; các lần còn lại, lần bấm đầu hụt được cứu ở sản phẩm kế tiếp |
-| BitBrowser thật | `scripts/bitbrowser-smoke.mjs` PASS: tạo profile tạm → mở → `connectOverCDP` → `contexts()[0]` (mở trong ~3,5 s, mở lại ~2,3 s) → không có dấu vết script SiteViewer trong trang → đóng → xoá |
-| Typecheck & Build | `npx tsc --noEmit` = 0, `npm run build` = 0 |
+| Code nguồn | **35 file TypeScript, ~10.642 dòng** trong `src/` |
+| Web UI dashboard | ~1.386 dòng (`index.html` + `app.js` + `styles.css`) |
+| Test suite | **71 test — 59 pass, 12 skip (tự skip khi máy không có Chromium), 0 fail** |
+| Typecheck | `tsc --noEmit` sạch, 0 lỗi |
+| Build | `dist/` đầy đủ, có `dist/cli.js` |
+| CLI | 6 lệnh hoạt động: `dashboard`, `run`, `probe`, `verify`, `info`, `init` |
 
-## Tình trạng theo module
+## Tình trạng hoàn thành theo module
 
-| Module | Trạng thái | Ghi chú |
+| Module | Hoàn thành | Ghi chú |
 | --- | --- | --- |
-| Entry (`cli.ts`, `bootstrap.ts`, `config.ts`) | Xong | `provider`, `bitbrowser`, `choreography`, `recipeCachePath` trong config |
-| Browser (`chrome.ts`, `bitbrowser.ts`, `viewport.ts`, `verify.ts`, `identity.ts`) | Xong | Hai engine; BitBrowser: hàng đợi ≥ 350 ms, proxy chỉ đẩy khi đổi, tự tạo lại profile bị xoá phía BitBrowser |
-| Nhận diện (`domainRecipeCache.ts`, `multiSignalDetector.ts`, `detectionWaterfall.ts`, `isolate.ts`) | Xong | Isolated world qua CDP thô (`Page.createIsolatedWorld`), không `Runtime.enable` |
-| Hành vi (`aiEngine.ts`, `choreography.ts`, `pdpChoreography.ts`, `humanActions.ts`, `humanCursor.ts`) | Xong | Khám phá → so sánh → xem sâu → ATC → kiểm tra giỏ; hit-test trước mỗi click |
-| Session (`aiManager.ts`, `actionExecutor.ts`, `atcVerifier.ts`, `digestExtractor.ts`) | Xong | Tách từ `aiManager.ts` ~2150 dòng; `viewTimeline` / `viewStats` / `detectionTiers` trong snapshot |
-| Server/Dashboard (http, orchestrator, screencast + UI) | Xong | Ô Engine + BitBrowser Profile ID; `/api/bitbrowser/status`, `/api/bitbrowser/profiles` |
-| Profiles (store, cookies, proxy, types) | Xong | `browserProvider`, `bitBrowserId`, profile tự tạo bị xoá cùng profile SiteViewer |
+| Entry (`cli.ts`, `bootstrap.ts`, `config.ts`) | ✅ 100% | 6 lệnh đủ, signal cleanup, deep-merge config |
+| Browser (`chrome.ts`, `verify.ts`, `identity.ts`) | ✅ ~97% | Thiếu: verify.ts hardcode version `"chrome"`, chưa set `tier` |
+| Session (`aiManager`, `runner`, `timer`, report) | ✅ 100% | Recovery ladder, revive browser, ATC 4-lớp xác minh |
+| AI layer (claudeClient, detector, cookiePool, fallback) | ✅ 100% | SSE streaming, TTL cache, quarantine, cooldown |
+| Server/Dashboard (http, orchestrator, screencast + UI) | ✅ ~98% | ~25 REST endpoint, SSE, MJPEG live view, token auth; còn 1 vòng heartbeat rỗng trong multiplexed stream |
+| Navigator (isolate, pageNavigator, probe, selectors, wheel) | ✅ ~90% | Đủ chức năng; còn song song 2 implementation cũ/mới |
+| Profiles (store, cookies, proxy, types) | ✅ 100% | Import 3 định dạng cookie, test proxy SOCKS5/CONNECT tự viết |
+| Behavior (aiEngine, timing, engine) | ✅ 100% | 4 personality, pacing log-normal có drift + fatigue |
 
-## Việc còn lại
+### Tổng hợp: **~93–95% hoàn thành** (chốt: **94%**)
+
+Core pipeline chạy end-to-end, build + typecheck + test sạch. Phần thiếu còn lại là tinh chỉnh,
+không phải chức năng chính.
+
+## Việc còn lại (~6%)
 
 1. **`browser.geoip` chưa hiện thực** — flag khai báo trong config (mặc định false), dependency
    `mmdb-lib` đã cài nhưng chưa import ở đâu. Đây là feature duy nhất "hứa mà chưa có".
@@ -64,22 +63,16 @@ Một engine hành vi (`src/behavior/aiEngine.ts`) lái phiên; nó biết bấm
 4. **`dist/browser/cloak.js` mồ côi** — artifact build từ source đã xoá, chỉ chứa `export {}`.
 5. **Cosmetic**: vòng heartbeat rỗng trong `streamMultiplexedScreens()` (`http.ts`);
    `runner.runSession(options: any)` chưa typ hoá; vài cast `(config as any).ai`.
-6. **Thời gian quét Tier 1 trên trang thật**: ~2–4 ms trên mock, nhưng 15–80 ms trên theme thật nặng
-   (Keychron ~66 ms) — vẫn nhỏ so với một lượt hành vi, nhưng chưa đạt mục tiêu < 4 ms của đặc tả.
-7. **Benchmark live trên BitBrowser** (`node scripts/test-5-live-sites.mjs --bitbrowser`) cần app BitBrowser đang
-   chạy; luồng BitBrowser đã được kiểm bằng smoke test thật và mock Local API trong `npm test`.
 
 ## Kiến trúc
 
 ```
-Built-in Chromium ─┐
-                   ├─ launchBrowser(provider) → Session (aiManager) → Behavior engine (aiEngine + choreography)
-BitBrowser :54345 ─┘     (BitBrowser: connectOverCDP,        │ decision            ↑ page features
-                          contexts()[0], no JS stealth)      ↓                     │
-                                                   actionExecutor / atcVerifier → Detection waterfall
-                                                                                   Tier 0 recipes (data/domain-recipes.json)
-                                                                                   Tier 1 multi-signal (isolated world)
-                                                                                   Tier 2 Claude (cookie pool) → local fallback
+Chrome → Session Manager (aiManager) → AI Behavior Engine → Pacing → Timer
+                    │                        ↑
+                    │ source digest          │ decision
+                    ↓                        │
+             Element Detector ── Cookie Pool ── Claude Web API
+                    └── Local fallback (no AI)
                     → Logger (JSONL) → Dashboard / CLI runner
 ```
 
@@ -91,5 +84,4 @@ node dist/cli.js dashboard --token <secret>   # mở http://127.0.0.1:7317
 # hoặc dùng Start.bat — tự check Node, install, build, mở dashboard
 ```
 
-Test: `npm test` (mock storefront + mock BitBrowser, không đụng mạng);
-benchmark thật: `node scripts/test-5-live-sites.mjs` (cờ `--quick`, `--bitbrowser`, `--warm`).
+Test: `npm test` (mock storefront self-contained, không đụng mạng).

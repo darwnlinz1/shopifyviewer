@@ -11,7 +11,6 @@
 import type { Page, Frame } from "rebrowser-playwright";
 import type { Logger } from "../logging/logger.js";
 import { sleep } from "../util/random.js";
-import { evaluateIsolated } from "../navigator/isolate.js";
 
 export type WafEngineType =
   | "cloudflare_turnstile"
@@ -52,7 +51,7 @@ export class WafChallengeDetector {
    */
   public static async probeTurnstileToken(page: Page): Promise<string | null> {
     try {
-      return await evaluateIsolated(page, () => {
+      return await page.evaluate(() => {
         const inputs = Array.from(
           document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(
             'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], [name="cf-turnstile-response"], [name="g-recaptcha-response"]',
@@ -75,8 +74,7 @@ export class WafChallengeDetector {
    */
   public static async inspectPage(page: Page, logger?: Logger): Promise<WafChallengeState> {
     const url = page.url();
-    const isolatedTitle = await evaluateIsolated(page, function pageTitleInPage(): string { return document.title || ""; });
-    const pageTitle = (isolatedTitle ?? (await (typeof page.title === "function" ? page.title() : Promise.resolve("")).catch(() => ""))) || "";
+    const pageTitle = await page.title().catch(() => "");
 
     // Inject hooks for SPAs
     await this.injectTurnstileHooks(page);
@@ -97,14 +95,16 @@ export class WafChallengeDetector {
       };
     }
 
-    // Direct Turnstile Widget Probe in DOM (isolated utility world)
-    const hasTurnstileWidget = !!(await evaluateIsolated(page, () => {
-      return !!(
-        document.querySelector(".cf-turnstile") ||
-        document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
-        document.querySelector("#cf-challenge-running")
-      );
-    }));
+    // Direct Turnstile Widget Probe in DOM
+    const hasTurnstileWidget = await page
+      .evaluate(() => {
+        return !!(
+          document.querySelector(".cf-turnstile") ||
+          document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+          document.querySelector("#cf-challenge-running")
+        );
+      })
+      .catch(() => false);
 
     if (hasTurnstileWidget) {
       const activeToken = await this.probeTurnstileToken(page);
@@ -141,13 +141,15 @@ export class WafChallengeDetector {
       };
     }
 
-    const dataDomeDetected = !!(await evaluateIsolated(page, () => {
-      const hasCaptchaDiv = !!document.querySelector("#datadome-captcha");
-      const hasDataDomeIframe = !!document.querySelector('iframe[src*="captcha-delivery.com"]');
-      const hasDataDomeScript = !!document.querySelector('script[src*="datadome.js"], script[src*="tags.js"]');
-      const isBlocked = document.title.toLowerCase().includes("datadome") || (document.body && document.body.innerText && document.body.innerText.includes("DataDome"));
-      return hasCaptchaDiv || hasDataDomeIframe || (hasDataDomeScript && isBlocked);
-    }));
+    const dataDomeDetected = await page
+      .evaluate(() => {
+        const hasCaptchaDiv = !!document.querySelector("#datadome-captcha");
+        const hasDataDomeIframe = !!document.querySelector('iframe[src*="captcha-delivery.com"]');
+        const hasDataDomeScript = !!document.querySelector('script[src*="datadome.js"], script[src*="tags.js"]');
+        const isBlocked = document.title.toLowerCase().includes("datadome") || (document.body && document.body.innerText && document.body.innerText.includes("DataDome"));
+        return hasCaptchaDiv || hasDataDomeIframe || (hasDataDomeScript && isBlocked);
+      })
+      .catch(() => false);
 
     if (dataDomeDetected) {
       const dataDomeFrame = page.frames().find((f) => f.url().includes("captcha-delivery.com"));
@@ -252,7 +254,7 @@ export class WafChallengeDetector {
             if (await checkbox.isVisible({ timeout: 3000 }).catch(() => false)) {
               logger.info("turnstile_checkbox_found", "Interactive Turnstile checkbox found. Executing click.");
 
-              const box = await checkbox.boundingBox({ timeout: 2000 }).catch(() => null);
+              const box = await checkbox.boundingBox();
               if (box) {
                 const targetX = box.x + box.width / 2 + (Math.random() * 4 - 2);
                 const targetY = box.y + box.height / 2 + (Math.random() * 4 - 2);

@@ -9,7 +9,7 @@ import { mkdirSync, existsSync, rmSync, readFileSync, writeFileSync, readdirSync
 import { execFileSync } from "node:child_process";
 import { resolve, join, dirname } from "node:path";
 import type { BrowserContext } from "rebrowser-playwright";
-import type { BrowserConfig, BrowserProvider, SimulatorConfig } from "../config.js";
+import type { BrowserConfig, SimulatorConfig } from "../config.js";
 import type { Logger } from "../logging/logger.js";
 import type { Profile, StoredCookie } from "../profiles/types.js";
 import { parseProxy, redactProxy, resolveProxy } from "../profiles/proxy.js";
@@ -19,7 +19,7 @@ import { buildNoiseScript } from "./noiseInject.js";
 import { setupNetworkFilter } from "../navigator/networkFilter.js";
 import { applyRuntimeCpuOptimizations } from "../performance/RuntimeCpuOptimizer.js";
 
-export type BrowserEngine = "chrome" | "bitbrowser" | "none";
+export type BrowserEngine = "chrome" | "none";
 
 export interface LaunchedBrowser {
   context: BrowserContext;
@@ -27,14 +27,6 @@ export interface LaunchedBrowser {
   profilePath: string;
   cookiesInjected: number;
   close(): Promise<void>;
-}
-
-/** Callbacks a launcher uses to persist what it learned about the profile. */
-export interface LaunchHooks {
-  /** The BitBrowser profile backing this one was created or re-synced. */
-  bitBrowserLinked?(link: { id: string; managed: boolean; proxySig: string }): void;
-  /** A pending cookie import was hard-written into the browser. */
-  cookiesHardWritten?(): void;
 }
 
 export interface LaunchRequest {
@@ -45,12 +37,6 @@ export interface LaunchRequest {
   rng: Rng;
   profile?: Profile;
   userDataDir?: string;
-  hooks?: LaunchHooks;
-}
-
-/** The kernel a profile runs on: its own pick, else the config default. */
-export function providerFor(config: SimulatorConfig, profile?: Pick<Profile, "browserProvider">): BrowserProvider {
-  return profile?.browserProvider ?? config.browser.provider ?? "builtin";
 }
 
 export function profilePathFor(browser: BrowserConfig, slot: number, sessionId: string): string {
@@ -232,13 +218,8 @@ function disableTabRestore(profilePath: string): void {
   } catch { /* unreadable prefs — Chrome defaults apply */ }
 }
 
-/** BitBrowser's own start tab. Closing it makes the kernel tear the window down after the next navigation. */
-export function isBitBrowserConsole(url: string): boolean {
-  return /console\.bitbrowser\.net/i.test(url);
-}
-
-/** Close Chrome internals, Google account pages and shop.app account tabs. The BitBrowser console tab is left open; the session uses another tab. */
-export async function closeSystemTabs(context: BrowserContext): Promise<void> {
+/** Close system/Google-account/shop.app account tabs left in the context; keep one blank page. */
+async function closeSystemTabs(context: BrowserContext): Promise<void> {
   for (const page of context.pages()) {
     const u = page.url();
     if (/^chrome(-edge)?:\/\//i.test(u) || /^https?:\/\/(myaccount|accounts)\.google\./i.test(u) || /shop\.app\/account/i.test(u)) {
@@ -313,22 +294,8 @@ function privacyInitScripts(privacy?: import("../config.js").PrivacyConfig): str
   return scripts;
 }
 
-/**
- * Verify the kernel a session needs is reachable before it starts: a local
- * Chrome/Edge binary for builtin, the Local API for BitBrowser.
- */
-export async function preflight(
-  config: SimulatorConfig,
-  _logger: Logger,
-  provider: BrowserProvider = providerFor(config),
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  if (provider === "bitbrowser") {
-    const { checkBitBrowserHealth, bitBrowserSettings } = await import("./bitbrowser.js");
-    const health = await checkBitBrowserHealth(bitBrowserSettings(config));
-    return health.ok
-      ? { ok: true }
-      : { ok: false, reason: `BitBrowser Local API khong phan hoi tai ${health.apiUrl}: ${health.error ?? "unknown error"}` };
-  }
+/** Verify a usable Chrome/Edge binary exists before any session starts. */
+export async function preflight(config: SimulatorConfig, _logger: Logger): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (config.browser.executablePath && existsSync(config.browser.executablePath)) return { ok: true };
   if (findSystemChrome()) return { ok: true };
   return { ok: false, reason: "Khong tim thay Google Chrome hay Microsoft Edge. Cai Chrome, hoac dat browser.executablePath trong config." };
@@ -569,30 +536,6 @@ function stealthInitScripts(ctx: { seed: number; uaMajor: string; viewport: { wi
         const proto = Navigator.prototype;
         defProto(proto, 'platform', ${JSON.stringify(navPlatform)});
         defProto(proto, 'maxTouchPoints', ${maxTouch});
-        defProto(proto, 'webdriver', false);
-        if (!${isMobile} && (!navigator.plugins || navigator.plugins.length === 0)) {
-          const fakePlugins = Object.create(PluginArray.prototype);
-          const pdfNames = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer', 'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'];
-          pdfNames.forEach((name, idx) => {
-            const p = Object.create(Plugin.prototype);
-            Object.defineProperties(p, {
-              name: { value: name, enumerable: true },
-              filename: { value: 'internal-pdf-viewer', enumerable: true },
-              description: { value: 'Portable Document Format', enumerable: true },
-              length: { value: 2, enumerable: true },
-            });
-            Object.defineProperty(fakePlugins, idx, { value: p, enumerable: true });
-          });
-          Object.defineProperty(fakePlugins, 'length', { value: pdfNames.length, enumerable: false });
-          defProto(proto, 'plugins', fakePlugins);
-        }
-      } catch(e) {}
-
-      try {
-        if (!${isMobile} && window.outerHeight === window.innerHeight) {
-          Object.defineProperty(window, 'outerWidth', { get: registerNative(() => window.innerWidth + 16, 'get outerWidth', 0), configurable: true });
-          Object.defineProperty(window, 'outerHeight', { get: registerNative(() => window.innerHeight + 88, 'get outerHeight', 0), configurable: true });
-        }
       } catch(e) {}
 
       if (typeof Screen !== 'undefined' && Screen.prototype) {
@@ -616,18 +559,17 @@ function stealthInitScripts(ctx: { seed: number; uaMajor: string; viewport: { wi
       }
 
       ${chromium ? `try {
-        const isMob = ${isMobile};
         const brands = [{ brand: 'Chromium', version: '${major}' }, { brand: 'Google Chrome', version: '${major}' }, { brand: 'Not?A_Brand', version: '24' }];
-        const high = { architecture: isMob ? 'arm' : 'x86', bitness: '64', brands, fullVersionList: brands.map(b => ({ brand: b.brand, version: b.version + '.0.0.0' })), mobile: isMob, model: ${JSON.stringify(device?.model ?? "")}, platform: '${uaPlatform}', platformVersion: isMob ? '14.0.0' : '15.0.0', uaFullVersion: '${major}.0.0.0', wow64: false };
+        const high = { architecture: 'arm', bitness: '64', brands, fullVersionList: brands.map(b => ({ brand: b.brand, version: b.version + '.0.0.0' })), mobile: true, model: '', platform: '${uaPlatform}', platformVersion: '14.0.0', uaFullVersion: '${major}.0.0.0', wow64: false };
         const uad = {
-          brands, mobile: isMob, platform: '${uaPlatform}',
+          brands, mobile: true, platform: '${uaPlatform}',
           getHighEntropyValues: registerNative((hints) => {
             const r = {};
             (hints || []).forEach(h => { if (h in high) r[h] = high[h]; });
-            r.brands = brands; r.mobile = isMob; r.platform = '${uaPlatform}';
+            r.brands = brands; r.mobile = true; r.platform = '${uaPlatform}';
             return Promise.resolve(r);
           }, 'getHighEntropyValues', 1),
-          toJSON: registerNative(() => ({ brands, mobile: isMob, platform: '${uaPlatform}' }), 'toJSON', 0)
+          toJSON: registerNative(() => ({ brands, mobile: true, platform: '${uaPlatform}' }), 'toJSON', 0)
         };
         Object.defineProperty(Navigator.prototype, 'userAgentData', {
           get: registerNative(function() {
@@ -666,10 +608,6 @@ function stealthInitScripts(ctx: { seed: number; uaMajor: string; viewport: { wi
 
 
 export async function launchBrowser(req: LaunchRequest): Promise<LaunchedBrowser> {
-  if (providerFor(req.config, req.profile) === "bitbrowser") {
-    const { launchBitBrowser } = await import("./bitbrowser.js");
-    return launchBitBrowser(req);
-  }
   const { config, logger, rng, slot, sessionId, profile } = req;
   const browserCfg = config.browser;
   const profilePath = req.userDataDir ?? profilePathFor(browserCfg, slot, sessionId);
@@ -882,7 +820,6 @@ export async function writeJarToProfileDir(opts: {
   if (!execPath) throw new Error("Khong tim thay Google Chrome / Microsoft Edge.");
   const { chromium } = await import("rebrowser-playwright");
   mkdirSync(opts.userDataDir, { recursive: true });
-  cleanStaleLocks(opts.userDataDir);
   const context = await chromium.launchPersistentContext(opts.userDataDir, {
     headless: true,
     executablePath: execPath,
@@ -890,10 +827,6 @@ export async function writeJarToProfileDir(opts: {
     args: stabilityArgs(),
   });
   try {
-    const firstPage = context.pages()[0];
-    if (firstPage) {
-      await firstPage.waitForLoadState("domcontentloaded", { timeout: 2000 }).catch(() => undefined);
-    }
     return await hardWriteCookies(context, opts.profile?.cookies?.cookies, opts.logger);
   } finally {
     await context.close().catch(() => undefined);

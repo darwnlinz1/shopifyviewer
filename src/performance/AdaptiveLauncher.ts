@@ -5,7 +5,6 @@
  * Prevents launch thundering herds and 100% CPU lock when spawning 50+ Chromium instances.
  */
 import os from "node:os";
-import { monitorEventLoopDelay, type IntervalHistogram } from "node:perf_hooks";
 
 export interface AdaptiveLauncherOptions {
   baseIntervalMs?: number;
@@ -13,7 +12,6 @@ export interface AdaptiveLauncherOptions {
   maxCpuThreshold?: number;
   minFreeRamMb?: number;
   maxConcurrent?: number;
-  maxEventLoopDelayMs?: number;
 }
 
 export class AdaptiveLauncher {
@@ -23,8 +21,6 @@ export class AdaptiveLauncher {
   private readonly targetCpuPercent: number;
   private readonly maxCpuThreshold: number;
   private readonly minFreeRamMb: number;
-  private readonly maxEventLoopDelayMs: number;
-  private readonly loopMonitor: IntervalHistogram;
   private lastCpuSample = this.sampleCpu();
   private cpuEma = 25;
   private lastLaunchTime = 0;
@@ -37,14 +33,6 @@ export class AdaptiveLauncher {
     this.targetCpuPercent = options.targetCpuPercent ?? 75;
     this.maxCpuThreshold = options.maxCpuThreshold ?? 85;
     this.minFreeRamMb = options.minFreeRamMb ?? 1024;
-    this.maxEventLoopDelayMs = options.maxEventLoopDelayMs ?? 120;
-    this.loopMonitor = monitorEventLoopDelay({ resolution: 20 });
-    this.loopMonitor.enable();
-  }
-
-  public getEventLoopDelayP95Ms(): number {
-    const ns = this.loopMonitor.percentile(95);
-    return Number.isFinite(ns) ? Math.max(0, Math.round(ns / 1e6 - 20)) : 0;
   }
 
   private sampleCpu(): { idle: number; total: number } {
@@ -93,10 +81,9 @@ export class AdaptiveLauncher {
     while (true) {
       const cpu = this.refreshCpuLoad();
       const freeMemMb = os.freemem() / (1024 * 1024);
-      const loopLagMs = this.getEventLoopDelayP95Ms();
 
-      // ── Circuit Breaker: Wait if host CPU > threshold, RAM depleted, or Event Loop saturated ──
-      if (cpu >= this.maxCpuThreshold || freeMemMb < this.minFreeRamMb || loopLagMs > this.maxEventLoopDelayMs) {
+      // ── Circuit Breaker: Wait if host CPU > threshold or RAM depleted ──
+      if (cpu >= this.maxCpuThreshold || freeMemMb < this.minFreeRamMb) {
         await new Promise<void>((r) => setTimeout(r, 600));
         continue;
       }

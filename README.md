@@ -1,80 +1,11 @@
-# AI Storefront Simulator & SiteViewer V3.0 (BitBrowser Edition)
+# AI Storefront Simulator & SiteViewer V1.0.0
 
-> **Trạng thái V3.0**: cả hai trụ cột trong [`BITBROWSER_HANDOFF_PROMPT.md`](./BITBROWSER_HANDOFF_PROMPT.md) đã được hiện thực và kiểm chứng —
-> (1) engine **BitBrowser** (nhân C++, Local API `http://127.0.0.1:54345`) song song với Chromium tích hợp, chọn theo từng profile;
-> (2) **nhận diện 3 tầng** (Tier 0 recipe → Tier 1 multi-signal → Tier 2 AI) và **chuỗi view người thật co giãn trước checkout**.
-> Xem số liệu kiểm chứng ở mục [Kiểm Thử Hệ Thống](#-kiểm-thử-hệ-thống).
+Synthetic visitor sessions for Shopify storefronts, driven by a real, privacy-hardened browser and an AI behavior layer. A session opens the shop, walks collections, clicks into products, scrolls naturally like a real human shopper, and records everything the storefront does in return: navigation timings, JS errors, failed requests, and automated Add-To-Cart (ATC) conversions.
 
-Synthetic visitor sessions for Shopify storefronts, driven by a real, privacy-hardened browser (hoặc kết nối trực tiếp vào nhân C++ của **BitBrowser**) và lớp hành vi sinh học người thật.
+Two behavior engines share one browser layer:
 
-One behavior engine (`src/behavior/aiEngine.ts`) drives the visit; it finds what to click through a detection waterfall:
-
-- **Tier 0 — domain recipes** (`src/ai/domainRecipeCache.ts`) — selectors learned once per `hostname + pageType`, persisted to `data/domain-recipes.json`, applied in under a millisecond.
-- **Tier 1 — multi-signal detector** (`src/navigator/multiSignalDetector.ts`) — one scan in an isolated CDP world (the page's own JS never sees it): the Shopify product oracle (variant IDs + stock), cart forms and custom elements, ARIA roles, and buy-box geometry.
-- **Tier 2 — AI** (`src/ai/elementDetector.ts`) — the page's *source digest* goes to Claude only when Tier 1 is unsure (confidence < 0.80) or a click did not add to the cart; what works is written back to Tier 0.
-- **Local fallback** (`src/ai/localFallback.ts`) — offline rules when the AI is rate-limited or has no cookies.
-
----
-
-## 🧬 Engine BitBrowser (Nhân C++)
-
-Mỗi profile chọn engine riêng: **Built-in Chromium** (mặc định) hoặc **BitBrowser**. Chọn trong Dashboard
-(ô *Engine* ở Settings / Create / Bulk Create) hoặc qua API (`browserProvider: "bitbrowser"`).
-Ô *BitBrowser Profile ID* để trống = SiteViewer tự tạo profile BitBrowser (và xoá nó khi xoá profile);
-dán ID có sẵn = dùng profile của bạn, giữ nguyên proxy/fingerprint bạn đã cấu hình bên BitBrowser.
-
-```jsonc
-// config — browser
-"provider": "builtin",              // mặc định toàn cục: "builtin" | "bitbrowser"
-"bitbrowser": {
-  "apiUrl": "http://127.0.0.1:54345",
-  "coreVersion": "136",             // nhân Chrome của profile tự tạo (BitBrowser hiện ship tới 148)
-  "autoCreateProfile": true,
-  "groupId": "",                    // tuỳ chọn: nhóm BitBrowser cho profile tự tạo
-  "apiKey": ""                      // tuỳ chọn: header x-api-key (BitBrowser ≥ 7.1.5 khi bật auth)
-}
-```
-
-Luồng (`src/browser/bitbrowser.ts`): `POST /browser/update` (tạo profile + proxy + fingerprint C++) →
-`POST /browser/open` → `chromium.connectOverCDP(ws)` → `browser.contexts()[0]` (không bao giờ `newContext()`)
-→ khi đóng: ngắt Playwright + `POST /browser/close`. Mọi lời gọi Local API đi qua một hàng đợi cách nhau
-≥ 350 ms. Proxy chỉ được đẩy lại (`/browser/update/partial`) khi thay đổi, nên fingerprint giữ nguyên.
-
-> **Quy tắc sống còn:** khi chạy trên BitBrowser, SiteViewer **không** tiêm `stealthInitScripts()`,
-> `privacyInitScripts()` hay `buildNoiseScript()` — nhân C++ của BitBrowser lo toàn bộ fingerprint; JS tiêm
-> thêm chỉ làm bẩn nó. Vẫn giữ: tối ưu CPU runtime, bộ lọc mạng, đóng tab hệ thống, đồng bộ cookie.
-
-Kiểm tra với BitBrowser thật đang chạy: `node scripts/bitbrowser-smoke.mjs` (tạo profile tạm, mở, gắn CDP, đóng, xoá).
-
----
-
-## 🎯 Nhận Diện 3 Tầng & Chuỗi View Trước Checkout
-
-**Tier 1 đọc trang như một hệ thống, không đoán theo text nút:**
-
-| Lớp tín hiệu | Đọc gì |
-| :--- | :--- |
-| Shopify Data Oracle | `data-product-json` / JSON nhúng, `/products/<handle>.js`, JSON-LD offers, `ShopifyAnalytics.meta` → variant ID thật + Size/Màu + còn hàng |
-| Form & custom elements | `form[action*="/cart/add"]`, `input[name=id]`, `<product-form>`, `<variant-selects>`… |
-| ARIA | `role=button`, `aria-label`, nhóm radio/listbox của biến thể |
-| Hình học buy-box | nút nằm dưới tiêu đề/giá (0 < dy < 700 px), rộng 160–580 px, cao 38–72 px, đang hiển thị; loại Shop Pay, quick-add, sticky bar, nút ẩn, footer |
-
-Vùng quét biến thể là tổ tiên nhỏ nhất của form giỏ hàng có chứa tiêu đề sản phẩm — theme nào tách picker
-ra một block anh em với block nút mua vẫn đọc đúng.
-
-**Chuỗi view co giãn theo `durationMinutes` / `atcMinutes`** (`src/behavior/choreography.ts`,
-`src/behavior/pdpChoreography.ts`):
-
-1. **Khám phá (0–20%)** — vào danh mục bằng click thật vào link (giữ Referer; `goto` chỉ là dự phòng), rê chuột qua card sản phẩm.
-2. **So sánh** (khi ATC ≥ 2 phút) — xem sản phẩm A, `page.goBack()` về danh mục, chọn sản phẩm B.
-3. **Xem sâu PDP** — lướt 2–5 ảnh gallery (0,8–2,2 s/ảnh; thumbnail, nút slider, hoặc cuộn qua cột ảnh xếp chồng), mở đọc tab Mô tả/Vận chuyển, thỉnh thoảng bôi đen một dòng, thử Size/Màu 15–40 s trước ATC (chỉ chọn tổ hợp oracle báo còn hàng, và chỉ tổ hợp kịp bấm xong).
-4. **Add-To-Cart đúng mốc** — xác minh bằng mạng, `/cart.js`, drawer, badge hoặc trang giỏ.
-5. **Kiểm tra giỏ (5–12 s)** — mở drawer hoặc `/cart`, đọc dòng hàng và tạm tính, giữ nguyên giỏ cho checkout.
-
-Trước mỗi click, điểm bấm được kiểm tra bằng hit-test: nếu bị popup/drawer che (hoặc một modal khoá cuộn trang),
-thử Escape, rồi bấm nút đóng của chính lớp phủ đó như người thật; vẫn che thì không bấm mù. Trên trang nặng, sự kiện
-wheel được gộp theo thời gian thật nên một cú cuộn vẫn dài đúng một cú cuộn. Toàn bộ dấu vết view (`viewTimeline`
-kèm thời gian từng bước, `viewStats`, `detectionTiers`) có trong snapshot phiên.
+- **AI engine** (`src/behavior/aiEngine.ts`) — sends the page's *source digest* (JSON-LD markers, product cards, price metadata, interactive DOM controls) to Claude AI for evidence-based semantic classification of product links and Add-To-Cart buttons. Works across all custom Shopify themes without depending on canonical `/products/` URL paths.
+- **Local engine** (`src/ai/localFallback.ts` & `src/navigator/productDiscovery.ts`) — offline, zero-network rule-based element matching; acts as an instant sub-millisecond fallback when AI rate limits or network issues occur.
 
 ---
 
@@ -155,25 +86,14 @@ Truy cập Dashboard tại: **`http://localhost:7317`** (hoặc port được c�
 
 ## 🧪 Kiểm Thử Hệ Thống
 
+Chạy toàn bộ 54 bài Unit Test tự động:
 ```bash
-npx tsc --noEmit                      # typecheck
-npm run build
-npm test                              # 13 file test, mock storefront + mock BitBrowser, không cần mạng
-node scripts/test-5-live-sites.mjs    # 5 site Shopify thật, 3,2 phút/phiên, ATC ở phút 2,0
+npm test
 ```
 
-`npm test` dựng mock storefront có giỏ thật (`/cart/add`, `/cart.js`, drawer, badge), 12 sản phẩm Size×Màu
-(có biến thể hết hàng, sản phẩm hết sạch), mồi nhử (Shop Pay, sticky bar, quick-add, nút ẩn), cùng mock
-BitBrowser Local API mở Chrome thật qua CDP — nên cả hai engine được kiểm thử mà không cần mạng.
-
-`scripts/test-5-live-sites.mjs` chạy 5 phiên đồng thời trên Taylor Stitch, Keychron, Death Wish Coffee, Pura Vida,
-BioLite — không cookie shop.app, không cookie AI — và chỉ thoát 0 khi cả 5 xác minh được Add-To-Cart.
-Cờ: `--quick` (1,5 phút, ATC ở 0,4), `--bitbrowser` (chạy trên profile BitBrowser tạm, xoá sau),
-`--warm` (dùng lại `./data/domain-recipes.json`). Log JSONL của lần chạy gần nhất nằm ở `./logs/live-5-sites/`.
-
-Kiểm tra độ ẩn danh trên các trang bot-detector:
+Kiểm tra độ ẩn danh trên trang Bot Detector Sannysoft:
 ```bash
-node test/experiments/20-bot-detect-benchmark.mjs
+node scratch/test-bot-detect.mjs
 ```
 
 ---
@@ -184,7 +104,5 @@ node test/experiments/20-bot-detect-benchmark.mjs
 | :--- | :--- |
 | `npm start` | Chạy Dashboard máy chủ điều phối profile trực quan. |
 | `npm run setup:browser` | Tự động tải Ungoogled-Chromium Portable mới nhất. |
-| `npm test` | Chạy toàn bộ bộ test (unit + tích hợp trên Chromium thật). |
-| `npx tsc --noEmit` | Kiểm tra tính đúng đắn của kiểu TypeScript. |
-| `node scripts/test-5-live-sites.mjs` | Benchmark 5 site Shopify thật (xem cờ ở trên). |
-| `node scripts/bitbrowser-smoke.mjs` | Kiểm tra kết nối BitBrowser thật (profile tạm, tự xoá). |
+| `npm test` | Chạy toàn bộ 54 bài test kiểm thử tích hợp. |
+| `npm run typecheck` | Kiểm tra tính đúng đắn của kiểu TypeScript. |

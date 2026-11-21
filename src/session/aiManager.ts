@@ -2,63 +2,162 @@
  * AI-Driven Session Manager - manages one browsing session.
  *
  * Core loop:
- *   1. Extract a source digest from the page (isolated world)
- *   2. On a new page, scan it with the detection waterfall (Tier 0 recipe /
- *      Tier 1 multi-signal); the AI tier is only prefetched where they fall short
- *   3. The behaviour engine decides the next step of the pre-checkout choreography
- *   4. The executor performs it with human input; results feed back to the engine
- *
- * Modules: digestExtractor.ts (page digest), actionExecutor.ts (decision →
- * input), atcVerifier.ts (add-to-cart + verification), this file (lifecycle,
- * revive, drive loop).
+ *   1. Extract a source digest from the page (isolated world when possible)
+ *   2. AI decides next action (click, scroll, add-to-cart, ...)
+ *   3. Backend executes with random human-like delays
+ *   4. On new page → repeat from step 1
  *
  * Bot walls are detected from the page title and handled with a bounded
- * back-off (see the drive loop).
+ * back-off (see the drive loop). There is no popup-dismissal layer: overlays
+ * are navigated around, not clicked away.
  *
- * Advance action: at ai.advanceActionTimeMs the engine clicks add-to-cart —
- * gated by safety.allowCart — reviews the cart, then resumes browsing.
+ * Advance action: at ai.advanceActionTimeMs (default 10 minutes) the engine
+ * clicks add-to-cart once — gated by safety.allowCart — then resumes browsing.
  */
 import type { BrowserContext, Page } from "rebrowser-playwright";
 import type { SimulatorConfig } from "../config.js";
 import { Logger } from "../logging/logger.js";
 import { Rng, randomSeed, sleep } from "../util/random.js";
-import { launchBrowser, type BrowserEngine, type LaunchHooks } from "../browser/chrome.js";
-import { measureViewport } from "../browser/viewport.js";
-import { evaluateIsolated } from "../navigator/isolate.js";
+import { launchBrowser, type BrowserEngine } from "../browser/chrome.js";
 import { openSessionPage } from "../navigator/pageNavigator.js";
 import { Pacing } from "../behavior/timing.js";
 import { SessionTimer } from "./timer.js";
 import { CookiePool } from "../ai/cookiePool.js";
 import { ElementDetector } from "../ai/elementDetector.js";
-import { sharedRecipeCache } from "../ai/domainRecipeCache.js";
-import { DetectionWaterfall, featuresOf, type BuyBoxResolution } from "../ai/detectionWaterfall.js";
-import { AiBehaviorEngine, type Personality, type ShopperState, type VisitStateSnapshot } from "../behavior/aiEngine.js";
+import { AiBehaviorEngine, type Personality, type VisitStateSnapshot } from "../behavior/aiEngine.js";
+import { preprocessHtml } from "../ai/promptTemplates.js";
 import type { Profile } from "../profiles/types.js";
+import { evaluateIsolated } from "../navigator/isolate.js";
+import { wheelBy, seatCursor } from "../navigator/wheel.js";
 import type { AiDecision, NavigationMetrics, SessionBlocker, SessionResult } from "../types.js";
 import { saveSessionReport } from "./sessionReport.js";
 import { DEFAULT_AI_CONFIG } from "../config.js";
+import { HumanCursor } from "../behavior/humanCursor.js";
 import { WafChallengeDetector } from "../security/wafDetector.js";
-import { readDigest, digestPrice, digestProductTitle } from "./digestExtractor.js";
-import { executeDecision, smartNav, type ExecOutcome } from "./actionExecutor.js";
 
-export { extractSourceDigest } from "./digestExtractor.js";
+/**
+ * Build the SOURCE DIGEST the AI reads. Runs inside an isolated world via
+ * CDP when possible (invisible to page scripts), falling back to
+ * page.evaluate. Self-contained on purpose: no closures, so it can be
+ * serialized into either world unchanged.
+ *
+ * Layout:
+ *   JSON-LD:{...}            authoritative product markers
+ *   OG:TYPE=product          secondary confirmation
+ *   LINKS:                   every unique same-origin path + text + card ctx + price
+ *   CONTROLS:                buttons/submits — where an add-to-cart lives
+ */
+export function extractSourceDigest(): string {
+  const out: string[] = [];
+  const push = (line: string): void => { if (out.length < 280) out.push(line); };
+
+  // The title carries bot-wall fingerprints ("Just a moment...", etc.) that
+  // survive even when nothing else renders.
+  push("TITLE=" + (document.title || "").slice(0, 120));
+  // Rendered-text size: a hydrated-but-blank SPA (failed XHRs, throttled
+  // APIs) keeps hidden template anchors while showing a white screen.
+  const bodyTextLen = ((document.body?.innerText || "").replace(/\s+/g, " ").trim()).length;
+  push("BODYTEXT=" + bodyTextLen);
+
+  const ld: string[] = [];
+  document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+    const t = (s.textContent || "").trim();
+    if (t && t.length <= 1500 && /"@type"\s*:\s*"?product/i.test(t)) ld.push(t);
+  });
+  if (ld.length) push("JSON-LD:\n" + ld.join("\n---\n"));
+  const og = document.querySelector('meta[property="og:type"]');
+  const ogType = og ? og.getAttribute("content") : null;
+  if (ogType) push("OG:TYPE=" + ogType);
+
+  // Variant controls: option selects and radio groups. Placed early — a PDP's
+  // size/colour pickers are exactly what the ATC plan needs and must not be
+  // crowded out of the line budget by navigation links.
+  push("VARIANTS:");
+  const seenVariant = new Set<string>();
+  document.querySelectorAll("select").forEach((s) => {
+    const el = s as HTMLSelectElement;
+    const key = "select" + (el.id || el.name || "");
+    if (!el.options.length || seenVariant.has(key)) return;
+    seenVariant.add(key);
+    const label = (el.closest("label")?.textContent || el.getAttribute("aria-label") || "options").trim().slice(0, 30);
+    const opts = Array.from(el.options).map((o) => o.text.trim()).filter(Boolean).slice(0, 12).join("|");
+    if (opts) push(`select${el.id ? "#" + el.id : ""}${el.name ? "[name=" + el.name + "]" : ""} | ${label} | opts:${opts}`);
+  });
+  const radioGroups = new Map<string, string[]>();
+  document.querySelectorAll('input[type=radio]').forEach((r) => {
+    const el = r as HTMLInputElement;
+    if (!el.name) return;
+    const lbl = ((el.closest("label")?.textContent || "") || el.value || "").trim().slice(0, 24);
+    if (!radioGroups.has(el.name)) radioGroups.set(el.name, []);
+    const arr = radioGroups.get(el.name) as string[];
+    if (arr.length < 12 && lbl) arr.push(lbl);
+  });
+  for (const [nm, opts] of radioGroups) {
+    if (opts.length >= 2) {
+      push(`radio[name=${nm}] | group | opts:${opts.join("|")}`);
+      if (out.length > 250) break;
+    }
+  }
+
+  push("LINKS:");
+  const seen = new Set<string>();
+  const productLines: string[] = [];
+    const otherLines: string[] = [];
+    document.querySelectorAll("a[href]").forEach((a) => {
+      const el = a as HTMLAnchorElement;
+      const href = el.href || "";
+      if (!href || href.startsWith("javascript:") || href.endsWith("#")) return;
+      let u: URL;
+      try { u = new URL(href, location.origin); } catch { return; }
+      if (seen.has(u.pathname)) return;
+      seen.add(u.pathname);
+      // Flatten whitespace: multi-line link text would otherwise tear one
+      // entry into two digest lines.
+      const text = ((el as HTMLElement).innerText || "").trim().replace(/\s+/g, " ").slice(0, 80);
+      const card = el.closest('[class*="card"], [class*="product"], article, li');
+      const cls = card ? String(card.className).slice(0, 90) : "";
+      const priceEl = card?.querySelector("[class*='price'], [data-price]");
+      const price = priceEl ? ((priceEl as HTMLElement).innerText || "").trim().replace(/\s+/g, " ").slice(0, 30) : "";
+      const line = u.pathname + (u.search || "") + " | " + text + (cls ? " | ctx:" + cls : "") + (price ? " | price:" + price : "");
+      // Product links go first: header/footer nav must not crowd them out of
+      // the line budget (a 280-line cap fills with ~100 nav links easily).
+      if (/\/products?\//.test(u.pathname)) productLines.push(line);
+      else otherLines.push(line);
+    });
+    [...productLines, ...otherLines].forEach(push);
+
+  // Buttons/submits — where an add-to-cart lives. ATC-shaped labels go
+  // first: upsell/gift widgets can fill the whole line budget otherwise.
+  push("CONTROLS:");
+  const atcControls: string[] = [];
+  const otherControls: string[] = [];
+  document.querySelectorAll('button, input[type=submit], [role="button"]').forEach((b) => {
+    const el = b as HTMLButtonElement;
+    const rawLabel = (el.innerText || el.value || el.getAttribute("aria-label") || "") as string;
+    // Flatten newlines: a two-line label ("Ajouter au panier\nAjouté") must
+    // stay one digest line or the parsers below tear it apart.
+    const label = rawLabel.replace(/\s+/g, " ").trim().slice(0, 60);
+    if (!label) return;
+    const form = el.closest("form");
+    const action = form ? (form.getAttribute("action") || "") : "";
+    const bits = [
+      el.name ? "name=" + el.name : "",
+      action.includes("cart") ? "form:" + action.slice(0, 60) : "",
+    ].filter(Boolean);
+    const line = el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + " | " + label + (bits.length ? " | " + bits.join(" ") : "");
+    if (/add\s|buy|cart|bag|mua|giỏ/i.test(label)) atcControls.push(line);
+    else otherControls.push(line);
+  });
+  [...atcControls, ...otherControls].forEach(push);
+
+  return out.join("\n");
+}
 
 // ── Session status ──
 
 export type SessionStatus =
   | "starting" | "running" | "paused" | "blocked"
   | "lingering" | "stopping" | "finished" | "error";
-
-/** One step of the visible pre-checkout trail. */
-export interface ViewEvent {
-  /** Session clock when the step finished. */
-  atMs: number;
-  /** How long the step itself ran. */
-  tookMs: number;
-  phase: string;
-  action: string;
-  detail?: string;
-}
 
 export interface SessionSnapshot {
   sessionId: string;
@@ -90,8 +189,6 @@ export interface SessionSnapshot {
   /** Add-to-cart CONFIRMED by the shop (network/drawer/cart/count), not merely
    * clicked. atcPerformed can be true while this is false = "clicked, unconfirmed". */
   atcVerified: boolean;
-  /** Detection tier whose selector produced the verified add (0 recipe, 1 multi-signal, 2 AI). */
-  atcTier?: number;
   /** Effective timed-ATC schedule in minutes; null = timed ATC off. */
   atcMinutes?: number | null;
   /** Whether the account tab (shop.app/account) shows a logged-in visitor. */
@@ -105,15 +202,6 @@ export interface SessionSnapshot {
   activeProductTitle?: string;
   activeProductPrice?: string;
   wafStatus?: "clean" | "turnstile_bypassing" | "solved" | "blocked";
-  /** Pre-checkout choreography phase (discovery, compare, deep_pdp, …). */
-  choreographyPhase?: string;
-  shopperState?: ShopperState;
-  /** The visit's view behaviours in order (latest last, capped). */
-  viewTimeline?: ViewEvent[];
-  /** Counters per view behaviour for the whole visit. */
-  viewStats?: Record<string, number>;
-  /** How often each detection tier answered. */
-  detectionTiers?: { tier0: number; tier1: number; tier2: number; local: number };
   blocker?: SessionBlocker;
   error?: string;
 }
@@ -157,8 +245,6 @@ export interface SessionOptions {
   /** Expected account email (from the imported cookie's filename) so the
    * account-tab login check confirms the RIGHT account, not just any email. */
   accountEmailHint?: string;
-  /** Persist what the launcher learns (BitBrowser link, written cookie jar). */
-  launchHooks?: LaunchHooks;
   onUpdate?: (snapshot: SessionSnapshot) => void;
   onPage?: (page: Page, context: BrowserContext) => void | Promise<void>;
 }
@@ -187,7 +273,7 @@ class Control {
   private paused = false;
   private parkRequested = false;
   private closeRequested = false;
-  private wakeSet = new Set<() => void>();
+  private wake: (() => void) | null = null;
   pause(): void { this.paused = true; }
   resume(): void { this.paused = false; this.notify(); }
   park(): void { this.parkRequested = true; this.paused = false; this.notify(); }
@@ -195,17 +281,10 @@ class Control {
   get isPaused() { return this.paused; }
   get shouldPark() { return this.parkRequested; }
   get shouldClose() { return this.closeRequested; }
-  private notify(): void {
-    for (const w of this.wakeSet) w();
-    this.wakeSet.clear();
-  }
+  private notify(): void { const w = this.wake; this.wake = null; w?.(); }
   async gate(): Promise<void> {
     while (this.paused && !this.closeRequested && !this.parkRequested) {
-      await new Promise<void>(r => {
-        const fn = () => { clearTimeout(t); this.wakeSet.delete(fn); r(); };
-        const t = setTimeout(fn, 500);
-        this.wakeSet.add(fn);
-      });
+      await new Promise<void>(r => { this.wake = r; setTimeout(r, 500); });
     }
   }
   async waitForClose(timeoutMs: number): Promise<void> {
@@ -213,59 +292,10 @@ class Control {
     const d = timeoutMs >= 0 ? Date.now() + timeoutMs : Infinity;
     while (!this.closeRequested && Date.now() < d) {
       const s = Math.min(500, Math.max(0, d - Date.now()));
-      await new Promise<void>(r => {
-        const fn = () => { clearTimeout(t); this.wakeSet.delete(fn); r(); };
-        const t = setTimeout(fn, Number.isFinite(s) ? s : 500);
-        this.wakeSet.add(fn);
-      });
+      await new Promise<void>(r => { this.wake = r; setTimeout(r, Number.isFinite(s) ? s : 500); });
     }
   }
-  waitForStopSignal(): { promise: Promise<"break">; cancel: () => void } {
-    if (this.closeRequested || this.parkRequested) {
-      return { promise: Promise.resolve("break"), cancel: () => {} };
-    }
-    let checkFn: (() => void) | null = null;
-    const promise = new Promise<"break">(r => {
-      checkFn = () => {
-        if (this.closeRequested || this.parkRequested) {
-          if (checkFn) this.wakeSet.delete(checkFn);
-          r("break");
-        }
-      };
-      this.wakeSet.add(checkFn);
-    });
-    return {
-      promise,
-      cancel: () => {
-        if (checkFn) this.wakeSet.delete(checkFn);
-      },
-    };
-  }
 }
-
-/** Resolve with the promise's value, or null once `ms` passes (timer always cleared). */
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<null>((r) => { timer = setTimeout(() => r(null), ms); }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-/** Dashboard line for the step the visitor is on. */
-const LIVE_TEXT: Partial<Record<AiDecision["action"], string>> = {
-  hover_card: "👀 Rê chuột ngắm thẻ sản phẩm",
-  view_media: "🖼️ Lướt xem ảnh sản phẩm",
-  read_section: "📖 Đọc chi tiết / vận chuyển",
-  select_text: "🖍️ Bôi đen một dòng mô tả",
-  explore_variants: "🎨 Bấm thử Size / Màu",
-  inspect_cart: "🛍️ Kiểm tra giỏ hàng trước checkout",
-  go_back: "↩️ Quay lại danh mục để so sánh",
-};
 
 // ═══════════════════════════════════════════════════════════════════════
 // START SESSION
@@ -296,7 +326,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     : config.session;
 
   const timer = new SessionTimer(sessionCfg, rng, elapsedOffsetMs);
-
+  
   // Recreate logger with profile name + live countdown timer
   const profileName = profile?.name ?? `Profile-${slot}`;
   const fmtClock = (ms: number): string => {
@@ -309,16 +339,6 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     `${fmtClock(timer.elapsedMs())}/${fmtClock(timer.plannedDurationMs)}`
   );
   const control = new Control();
-  /** Await `p` unless close/park arrives first (then undefined); the loser runs on harmlessly. */
-  const untilStop = async <T>(p: Promise<T>): Promise<T | undefined> => {
-    p.catch(() => undefined);
-    const stop = control.waitForStopSignal();
-    try {
-      return await Promise.race([p, stop.promise.then(() => undefined)]);
-    } finally {
-      stop.cancel();
-    }
-  };
 
   logger.info("session_start", "seed=" + seed + " budget=" + Math.round(timer.plannedDurationMs / 1000) + "s", {
     data: {
@@ -343,7 +363,6 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     slot, sessionId, config, logger, rng,
     ...(profile ? { profile } : {}),
     ...(options.userDataDir ? { userDataDir: options.userDataDir } : {}),
-    ...(options.launchHooks ? { hooks: options.launchHooks } : {}),
   });
   // Everything from here to the end of setup runs against a live Chrome
   // process. If any step throws, the process is orphaned — the orchestrator's
@@ -361,8 +380,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     // driving loop never touches this tab; it exists purely as a live account
     // view alongside the storefront the session actually browses.
     const openAccountTab = async (): Promise<void> => {
-      const hasImportedCookies = (profile?.cookies?.cookies?.length ?? 0) > 0 || browser.cookiesInjected > 0;
-      if (options.accountTabUrl === null || (!options.accountTabUrl && !hasImportedCookies)) return;
+      if (options.accountTabUrl === null) return; // explicitly disabled
       const url = options.accountTabUrl ?? "https://shop.app/account";
       try {
         const acct = await browser.context.newPage();
@@ -430,13 +448,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
           slot, sessionId, config: bgConfig, logger, rng,
           ...(profile ? { profile } : {}),
           ...(options.userDataDir ? { userDataDir: options.userDataDir } : {}),
-          ...(options.launchHooks ? { hooks: options.launchHooks } : {}),
         });
-        if (control.shouldClose) {
-          // Closed while relaunching: the session already shut the old browser down.
-          await fresh.close().catch(() => undefined);
-          return false;
-        }
         browser = fresh;
         page = await openSessionPage(browser.context);
         page.setDefaultTimeout(10_000);
@@ -447,10 +459,8 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
         publish();
         return true;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn("browser_revive_failed", msg);
-        const rateLimited = /request frequency|administrator mode/i.test(msg);
-        await sleep((rateLimited ? 8_000 : 2_000) * attempt);
+        logger.warn("browser_revive_failed", err instanceof Error ? err.message : String(err));
+        await sleep(2000 * attempt);
       }
     }
     return false;
@@ -476,18 +486,9 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
   const detector = new ElementDetector(cookiePool, logger, {
     maxRetries: aiConfig.maxRetries,
     maxHtmlChars: aiConfig.maxHtmlChars,
-    detectionCooldownMs: aiConfig.detectionCooldownMs,
     model: aiConfig.model,
     ...(aiConfig.claudeBaseUrl ? { baseUrl: aiConfig.claudeBaseUrl } : {}),
   });
-  // Tier 0 recipes are shared by every session in the process (and on disk);
-  // Tier 2 (the detector above) is only consulted where Tiers 0/1 fall short.
-  const waterfall = new DetectionWaterfall(
-    detector,
-    sharedRecipeCache(aiConfig.recipeCachePath ?? DEFAULT_AI_CONFIG.recipeCachePath),
-    logger,
-    { threshold: aiConfig.tier1ConfidenceThreshold ?? 0.8, maxHtmlChars: aiConfig.maxHtmlChars },
-  );
   // Random personality per session (behavioral fingerprinting)
   const personalities: Personality[] = ["browser", "browser_fast", "shopper", "researcher"];
   const engine = new AiBehaviorEngine({ ...config, ai: aiConfig } as any, rng, logger, rng.pick(personalities));
@@ -520,67 +521,12 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
   // Add-to-cart CONFIRMED (not merely clicked). atcPerformed says the engine
   // decided to click; atcVerified says the shop acknowledged the item.
   let atcVerified = false;
-  let atcTier: number | undefined;
   const recentNavs: NavigationMetrics[] = [];
   const RECENT_CAP = 30;
   // Real counters — the snapshot used to report aiCallsCount here, which
   // counted model calls, not things the visitor actually did.
   let actionsCount = 0;
   const visitedCollections = new Set<string>();
-
-  // The pre-checkout trail as it actually happened, for the dashboard and reports.
-  const viewTimeline: ViewEvent[] = [];
-  const VIEW_CAP = 60;
-  const viewStats: Record<string, number> = {};
-  const bump = (key: string, by = 1): void => { viewStats[key] = (viewStats[key] ?? 0) + by; };
-  const recordView = (decision: AiDecision, outcome: ExecOutcome, tookMs: number): void => {
-    const phase = decision.phase ?? engine.currentPhase;
-    const push = (action: string, detail?: string): void => {
-      viewTimeline.push({ atMs: timer.elapsedMs(), tookMs, phase, action, ...(detail ? { detail } : {}) });
-      if (viewTimeline.length > VIEW_CAP) viewTimeline.shift();
-    };
-    const performed = outcome.performed ?? 0;
-    switch (decision.action) {
-      case "goto_home":
-      case "goto_collection":
-      case "goto_product": {
-        if (performed > 0) { bump("hover_card", performed); push("hover_card", outcome.detail); }
-        if (!outcome.navigated) return;
-        const kind = outcome.clickThrough ? "click_through" : "goto_direct";
-        bump(kind);
-        let path = "";
-        try { path = new URL(page.url()).pathname; } catch { /* keep empty */ }
-        push(kind, `${decision.action.replace("goto_", "")} ${path}`);
-        return;
-      }
-      case "go_back":
-        if (outcome.navigated) { bump("go_back"); push("go_back", decision.reason); }
-        return;
-      case "hover_card":
-      case "view_media":
-      case "select_text":
-      case "explore_variants":
-      case "inspect_cart":
-        if (performed > 0) {
-          bump(decision.action, decision.action === "view_media" ? performed : 1);
-          push(decision.action, outcome.detail);
-        }
-        return;
-      case "read_section":
-        if (performed > 0) {
-          bump("read_section");
-          if (performed > 1) bump("select_text");
-          push("read_section", outcome.detail);
-        }
-        return;
-      case "add_to_cart":
-        bump(outcome.atcVerified ? "add_to_cart_verified" : "add_to_cart_unverified");
-        push("add_to_cart", outcome.detail);
-        return;
-      default:
-        bump(decision.action);
-    }
-  };
 
   // JS error tracking. The count alone is useless for debugging — each
   // distinct uncaught exception gets logged once, up to a cap so a page that
@@ -639,7 +585,6 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     personality: (engine as any).personality ?? "unknown",
     atcPerformed: engine.state.advanceActionPerformed,
     atcVerified,
-    ...(atcTier !== undefined ? { atcTier } : {}),
     /** Effective timed-ATC mark for this session, in minutes (null = off). */
     atcMinutes: aiConfig.advanceActionTimeMs >= Number.MAX_SAFE_INTEGER ? null : Math.round(aiConfig.advanceActionTimeMs / 60_000),
     accountLoggedIn,
@@ -651,11 +596,6 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     activeProductTitle,
     activeProductPrice,
     wafStatus,
-    choreographyPhase: engine.currentPhase,
-    shopperState: engine.state.currentState,
-    viewTimeline: [...viewTimeline],
-    viewStats: { ...viewStats },
-    detectionTiers: { ...waterfall.stats },
     ...(blocker ? { blocker } : {}),
     ...(errorMessage ? { error: errorMessage } : {}),
   });
@@ -683,10 +623,9 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     }
     const entryUrl = options.resumeUrl || storefrontUrl;
     try {
-      const ok = await untilStop(smartNav(page, entryUrl, 30_000));
-      if (ok === undefined) return;
+      const ok = await smartNav(page, entryUrl, 30_000);
       if (!ok) logger.warn("initial_nav_failed", "page did not confirm load: " + entryUrl);
-      await untilStop(sleep(pacing.pageSettle()));
+      await sleep(pacing.pageSettle());
       if (options.resumeUrl) {
         logger.info("session_resumed", `reopened on ${options.resumeUrl}`, {
           data: { resumeUrl: options.resumeUrl, elapsedOffsetMs: elapsedOffsetMs },
@@ -696,10 +635,10 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       logger.warn("initial_nav_failed", err instanceof Error ? err.message : String(err));
     }
 
-    let lastUrl = "";
-    let lastDigest = "";
+    let lastUrl = page.url();
     let loopCount = 0;
     let emptyHtmlCount = 0;
+    const MAX_EMPTY_HTML = 5;
     // Recovery ladder state: consecutive empty-digest recoveries, and the URL
     // the last recovery ran on (a healthy page elsewhere resets the count).
     let emptyRecoveries = 0;
@@ -716,55 +655,48 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
 
       // Update title
       if (urlChanged || loopCount % 10 === 0) {
-        lastTitle = (await evaluateIsolated(page, function pageTitleInPage(): string { return document.title || ""; })) ?? "";
+        lastTitle = await page.title().catch(() => "");
         lastUrl = currentUrl;
       }
 
-      // Step 1: Build the source digest the AI reads (reuse cached digest when URL is unchanged).
-      let htmlSource = !urlChanged && lastDigest.length >= 20 ? lastDigest : "";
-      if (!htmlSource) {
-        try {
-          await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
-          htmlSource = await readDigest(page);
-          if (htmlSource && htmlSource.length >= 20) {
-            lastDigest = htmlSource;
-          }
-        } catch {
-          htmlSource = "";
-        }
+      // Step 1: Build the source digest the AI reads.
+      let htmlSource = "";
+      try {
+        await page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+        htmlSource =
+          (await evaluateIsolated(page, extractSourceDigest)) ??
+          (await page.evaluate(extractSourceDigest).catch(() => ""));
+      } catch {
+        htmlSource = "";
       }
 
-      // ── WAF & Bot Challenge Detection Ladder (only inspect on URL change or suspicious title) ──
-      if (urlChanged || /moment|challenge|attention|denied|captcha|429/i.test(lastTitle)) {
-        const wafState = await WafChallengeDetector.inspectPage(page, logger);
-        if (wafState.engine !== "none") {
-          logger.warn("waf_challenge_detected", `WAF challenge encountered: ${wafState.engine}`, { data: { url: currentUrl } });
-          const solveRes = await WafChallengeDetector.resolveChallenge(page, wafState, logger);
-          if (solveRes.resolved) {
-            logger.info("waf_challenge_cleared", `WAF challenge ${wafState.engine} cleared successfully via ${solveRes.actionTaken}`);
-            consecutiveChallenges = 0;
-            lastUrl = "";
-            lastDigest = "";
-            return "continue";
-          }
-
-          consecutiveChallenges++;
-          if (pagesVisited > 0 && consecutiveChallenges <= 2) {
-            logger.warn("challenge_backoff", `Bot wall on ${currentUrl} — going back (${consecutiveChallenges}/2)`, { data: { url: currentUrl } });
-            await page.goBack({ timeout: 15_000 }).catch(() => undefined);
-            lastUrl = "";
-            lastDigest = "";
-            return "continue";
-          }
-          const title = /^TITLE=(.*)$/m.exec(htmlSource)?.[1] ?? wafState.pageTitle ?? "(untitled)";
-          blocker = { kind: "challenge", message: `Bot challenge (${wafState.engine}): ${title}`, url: currentUrl };
-          lastReason = blocker.message;
-          logger.error("session_blocked", blocker.message, { data: { url: currentUrl } });
-          exitReason = "engine_exit";
-          return "break";
+      // ── WAF & Bot Challenge Detection Ladder ──
+      const wafState = await WafChallengeDetector.inspectPage(page, logger);
+      if (wafState.engine !== "none") {
+        logger.warn("waf_challenge_detected", `WAF challenge encountered: ${wafState.engine}`, { data: { url: currentUrl } });
+        const solveRes = await WafChallengeDetector.resolveChallenge(page, wafState, logger);
+        if (solveRes.resolved) {
+          logger.info("waf_challenge_cleared", `WAF challenge ${wafState.engine} cleared successfully via ${solveRes.actionTaken}`);
+          consecutiveChallenges = 0;
+          lastUrl = "";
+          return "continue";
         }
-        consecutiveChallenges = 0;
+
+        consecutiveChallenges++;
+        if (pagesVisited > 0 && consecutiveChallenges <= 2) {
+          logger.warn("challenge_backoff", `Bot wall on ${currentUrl} — going back (${consecutiveChallenges}/2)`, { data: { url: currentUrl } });
+          await page.goBack({ timeout: 15_000 }).catch(() => undefined);
+          lastUrl = "";
+          return "continue";
+        }
+        const title = /^TITLE=(.*)$/m.exec(htmlSource)?.[1] ?? wafState.pageTitle ?? "(untitled)";
+        blocker = { kind: "challenge", message: `Bot challenge (${wafState.engine}): ${title}`, url: currentUrl };
+        lastReason = blocker.message;
+        logger.error("session_blocked", blocker.message, { data: { url: currentUrl } });
+        exitReason = "engine_exit";
+        return "break";
       }
+      consecutiveChallenges = 0;
 
       // Check for truly blank pages (less than 10 chars AND no links or controls)
       const bodyTextLen = Number(/^BODYTEXT=(\d+)$/m.exec(htmlSource)?.[1] ?? 9999);
@@ -813,20 +745,17 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       // run of failures counts against it.
       if (currentUrl !== recoveredFromUrl) emptyRecoveries = 0;
 
-      // ── Step 2: Tier 0/1 scan of the new page; the AI tier only where it falls short ──
-      if (urlChanged) {
-        if (page.viewportSize() === null) await measureViewport(page).catch(() => undefined);
-        const scanned: BuyBoxResolution | null = await withTimeout(waterfall.scan(page, currentUrl), 8_000).catch(() => null);
-        if (scanned) engine.notePageFeatures(currentUrl, featuresOf(scanned));
-        waterfall.prefetch(currentUrl, htmlSource, {
-          intent: currentUrl.includes("/products/") ? "interact" : "discover",
-        });
-      }
+      // ── Step 2: Fire the AI analysis in the BACKGROUND. ──
+      // Its latency now overlaps with this page's engagement time; when the
+      // engine needs results after the floor, they are already waiting.
+      detector.prefetch(currentUrl, htmlSource, {
+        intent: currentUrl.includes("/products/") ? "interact" : "discover",
+      });
 
-      // ── Step 3: Decide ──
+      // ── Step 3: Get AI decision ──
       let decision: AiDecision;
       try {
-        decision = await engine.decide(waterfall, currentUrl, htmlSource, timer);
+        decision = await engine.decide(detector, currentUrl, htmlSource, timer);
       } catch (err) {
         logger.error("engine_error", err instanceof Error ? err.message : String(err), { url: currentUrl });
         exitReason = "error";
@@ -851,16 +780,14 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       lastAction = decision.action;
 
       if (currentUrl.includes("/products/")) {
-        const title = digestProductTitle(htmlSource);
-        if (title) activeProductTitle = title;
-        const price = digestPrice(htmlSource);
-        if (price) activeProductPrice = price;
+        const prodMatch = /^OG:TITLE=(.*)$/m.exec(htmlSource) || /^TITLE=(.*)$/m.exec(htmlSource);
+        if (prodMatch && prodMatch[1]) activeProductTitle = prodMatch[1].replace(/—.*$/i, "").trim().slice(0, 45);
+        const priceMatch = /price:([^\n|]+)/i.exec(htmlSource);
+        if (priceMatch && priceMatch[1]) activeProductPrice = priceMatch[1].trim();
       }
 
       if (decision.action === "add_to_cart") {
         liveActionText = `🛒 Chọn Size & Click Add-To-Cart...`;
-      } else if (LIVE_TEXT[decision.action]) {
-        liveActionText = LIVE_TEXT[decision.action]!;
       } else if (currentUrl.includes("/products/")) {
         liveActionText = `🔍 Xem SP: ${activeProductTitle || "Chi tiết SP"} ${activeProductPrice ? "(" + activeProductPrice + ")" : ""}`;
       } else if (currentUrl.includes("/collections/")) {
@@ -874,35 +801,14 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
 
       publish();
 
-      // ── Step 4: Execute with human-like input ──
-      const atcProductUrl = decision.url ?? currentUrl;
-      const actionStartedAt = Date.now();
-      const outcome = await executeDecision(decision, {
-        page,
-        logger,
-        rng,
-        pacing,
-        ...(config.behavior.choreography ? { choreography: config.behavior.choreography } : {}),
-        waterfall,
-        triedVariants: engine.triedVariantsFor(currentUrl),
-      });
+      // ── Step 4: Execute with human-like delays ──
+      const outcome = await executeDecision(decision, page, logger, rng, pacing);
       actionsCount++;
-      logger.debug(
-        "action_result",
-        `${decision.action} [${decision.phase ?? engine.currentPhase}] in ${Date.now() - actionStartedAt}ms` +
-          (outcome.performed !== undefined ? ` performed=${outcome.performed}` : "") +
-          (outcome.detail ? ` — ${outcome.detail}` : "") +
-          ` | ${decision.reason}`,
-        { url: currentUrl },
-      );
-      engine.noteActionResult(decision, outcome);
-      recordView(decision, outcome, Date.now() - actionStartedAt);
       if (decision.action === "add_to_cart") {
-        engine.notifyAtcResult(outcome.atcVerified === true, { url: atcProductUrl });
+        engine.notifyAtcResult(outcome.atcVerified === true, { url: page.url() });
       }
       if (outcome.atcVerified) {
         atcVerified = true;
-        if (outcome.atcTier !== undefined) atcTier = outcome.atcTier;
         liveActionText = `💎 Add-To-Cart #${engine.state.addToCartCount} thành công!`;
         publish();
       }
@@ -940,8 +846,8 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
 
       publish();
 
-      // Human-like pause between actions (honours configured actionPause & speedFactor)
-      await sleep(Math.max(600, pacing.actionPause()));
+      // Human-like pause between actions: 2-6s base + random
+      await sleep(rng.int(2000, 6000));
       return "ok";
     };
 
@@ -982,23 +888,23 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       // visitor was on, and keep the same visit running.
       if (contextClosed) {
         const resumeUrl = page.url();
-        // A close requested mid-revive must not wait out a relaunch and a 30 s navigation.
-        const ok = await untilStop(reviveBrowser());
-        if (ok === undefined) continue;
+        const ok = await reviveBrowser();
         if (!ok) {
           exitReason = "error";
           errorMessage = "Browser was closed and could not be revived";
           break;
         }
         logger.info("browser_revived", "continuing visit in background", { data: { resumeUrl } });
-        await untilStop(
-          page.goto(resumeUrl && resumeUrl !== "about:blank" ? resumeUrl : storefrontUrl, {
+        try {
+          await page.goto(resumeUrl && resumeUrl !== "about:blank" ? resumeUrl : storefrontUrl, {
             waitUntil: "domcontentloaded",
             timeout: 30_000,
-          }).catch((err) => logger.warn("revive_nav_failed", err instanceof Error ? err.message : String(err))),
-        );
+          });
+        } catch (err) {
+          logger.warn("revive_nav_failed", err instanceof Error ? err.message : String(err));
+        }
         lastUrl = ""; // force re-detection
-        await untilStop(sleep(pacing.pageSettle()));
+        await sleep(pacing.pageSettle());
         continue;
       }
 
@@ -1011,15 +917,10 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
       // can crash the whole process.
       const turnPromise = doTurn();
       turnPromise.catch(() => undefined);
-      let turnTimer: ReturnType<typeof setTimeout> | undefined;
-      const stopPromise = control.waitForStopSignal();
       try {
         verdict = await Promise.race([
           turnPromise,
-          stopPromise.promise,
-          new Promise<"timeout">((r) => {
-            turnTimer = setTimeout(() => r("timeout"), TURN_TIMEOUT_MS);
-          }),
+          sleep(TURN_TIMEOUT_MS).then(() => "timeout" as const),
         ]);
       } catch (err) {
         // A context that died mid-turn surfaces here as a thrown protocol
@@ -1029,9 +930,6 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
           continue;
         }
         throw err;
-      } finally {
-        if (turnTimer) clearTimeout(turnTimer);
-        stopPromise.cancel();
       }
 
       if (verdict === "timeout") {
@@ -1043,15 +941,11 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
           break;
         }
         lastUrl = "";
-        await untilStop(page.reload({ timeout: 20_000 }).catch(() => undefined));
+        try { await Promise.race([page.reload({ timeout: 20_000 }), sleep(25_000)]); } catch {}
         continue;
       }
       turnTimeouts = 0;
-      if (verdict === "break") {
-        if (control.shouldClose) exitReason = "aborted";
-        else if (control.shouldPark) exitReason = "engine_exit";
-        break;
-      }
+      if (verdict === "break") break;
     }
   };
 
@@ -1098,7 +992,6 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     // Close out the cookie audit trail for this run.
     try { cookiePool.auditSummary("session_end"); } catch {}
     try { cookiePool.flushHealth(); } catch {}
-    try { waterfall.recipes.flush(); } catch {}
     // Save detailed session report — only fields the run actually measured.
     try {
       saveSessionReport({
@@ -1124,8 +1017,7 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
         " | " + result.pagesVisited + " pages" +
         " | " + result.productsViewed + " products" +
         " | " + result.actionsPerformed + " ai_calls" +
-        " | cookies: " + stats.active + " active, " + stats.quarantined + " quarantined" +
-        " | tiers: " + JSON.stringify(waterfall.stats),
+        " | cookies: " + stats.active + " active, " + stats.quarantined + " quarantined",
     );
     await logger.close();
     publish(errorMessage ? "error" : "finished");
@@ -1163,6 +1055,812 @@ export async function startSession(options: SessionOptions): Promise<SessionHand
     },
     done,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// DECISION EXECUTION
+// ═══════════════════════════════════════════════════════════════════════
+
+
+// ── Human-like mouse simulation ──
+// A cubic Bézier path with per-step wobble and an occasional overshoot, rather
+// than a straight linear interpolation — real cursors curve, jitter, and
+// slightly overshoot a target before settling. Step count and wobble come from
+// the rng so no two moves are byte-identical.
+async function humanMouse(page: Page, rng: Rng): Promise<void> {
+  try {
+    const vp = page.viewportSize() ?? { width: 1440, height: 900 };
+    const targetX = Math.round(vp.width * rng.float(0.15, 0.85));
+    const targetY = Math.round(vp.height * rng.float(0.15, 0.80));
+    const cursor = new HumanCursor(page, rng);
+    await cursor.moveTo({ x: targetX, y: targetY });
+  } catch {}
+}
+
+// Hover near an element before clicking using biological Minimum-Jerk trajectory
+async function hoverBeforeClick(page: Page, selector: string | undefined, rng: Rng): Promise<void> {
+  if (!selector) { await humanMouse(page, rng); return; }
+  try {
+    const loc = page.locator(selector).first();
+    if (await loc.isVisible({ timeout: 2000 }).catch(() => false)) {
+      const box = await loc.boundingBox().catch(() => null);
+      if (box) {
+        const cursor = new HumanCursor(page, rng);
+        const targetX = box.x + box.width * rng.float(0.3, 0.7);
+        const targetY = box.y + box.height * rng.float(0.3, 0.7);
+        await cursor.moveTo({ x: targetX, y: targetY }, box);
+        await sleep(rng.int(120, 300));
+        return;
+      }
+    }
+  } catch {}
+  await humanMouse(page, rng);
+}
+
+interface ExecOutcome {
+  navigated: boolean;
+  failed: boolean;
+  metrics: NavigationMetrics | null;
+  /** True only when an add-to-cart was CONFIRMED (network/drawer/cart/count),
+   * not merely clicked. Distinguishes "đã thêm giỏ" from "đã click chưa xác nhận". */
+  atcVerified?: boolean;
+}
+
+/**
+ * Dismiss newsletter/geo/consent/REGION overlays that hide or cover buy
+ * controls. Escape first, then the usual close affordances, then region/
+ * country redirect dialogs (gymshark-class "ARE YOU IN THE RIGHT PLACE?" —
+ * the buy box never renders until a region is picked — and MyShopify's
+ * auto-redirect banner). Bounded — this is a courtesy pass, not a guarantee.
+ */
+async function dismissPopups(page: Page): Promise<void> {
+  await page.keyboard.press("Escape").catch(() => undefined);
+
+  // Age verification acceptance (18+, 21+)
+  await page.evaluate(() => {
+    const ageButtons = Array.from(document.querySelectorAll<HTMLElement>(
+      'button, a, [role="button"], input[type="button"], input[type="submit"]'
+    ));
+    for (const btn of ageButtons) {
+      const text = (btn.innerText || btn.textContent || "").toLowerCase().trim();
+      if (/^(i am 21\+|i am 18\+|enter|yes, i am|yes|i agree|agree & enter|over 21|over 18|confirm age)$/i.test(text)) {
+        if (btn.offsetParent !== null) { btn.click(); return; }
+      }
+    }
+  }).catch(() => undefined);
+
+  // Cookie consent
+  await page.evaluate(() => {
+    const consentSels = [
+      '#onetrust-accept-btn-handler',
+      '#accept-cookies',
+      '.cc-btn.cc-allow',
+      '[data-testid*="cookie-accept" i]',
+      'button[id*="cookie-accept" i]',
+      'button[class*="cookie-accept" i]',
+      'button:has-text("Accept All")',
+      'button:has-text("Allow all")',
+    ];
+    for (const sel of consentSels) {
+      const el = document.querySelector<HTMLElement>(sel);
+      if (el && el.offsetParent !== null) { el.click(); break; }
+    }
+  }).catch(() => undefined);
+
+  const closeSels = [
+    '[aria-label*="lose" i]',
+    '[aria-label*="close" i]',
+    'button[class*="close" i]',
+    '[class*="popup"] button',
+    '[class*="modal"] button[class*="close" i]',
+    '[class*="banner"] [class*="accept"]',
+    'div.klaviyo-close-form',
+  ];
+  for (const sel of closeSels) {
+    try {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
+        await loc.click({ timeout: 900 }).catch(() => undefined);
+        await sleep(250);
+      }
+    } catch { /* next */ }
+  }
+  // Region / country pickers: a visible "United States / ROW / Continue"
+  // choice blocks the whole storefront. Click the first viable country link.
+  try {
+    const regionSels = [
+      'a[href*="ROW" i]',
+      'a[href*="country" i], a[href*="region" i], button[href*="country" i]',
+      '[class*="country" i] a, [class*="region" i] a, [class*="country" i] button, [class*="region" i] button',
+      'a[href*="us" i], a[href*="en-us" i], a[href*="en_us" i]',
+    ];
+    for (const sel of regionSels) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
+        await loc.click({ timeout: 900 }).catch(() => undefined);
+        await sleep(500);
+      }
+    }
+  } catch { /* no region dialog */ }
+}
+
+/** Click a selector if a visible match exists with biological trajectory. */
+async function clickBySelector(page: Page, selector: string, rng?: Rng): Promise<boolean> {
+  const loc = page.locator(selector);
+  const count = Math.min(await loc.count().catch(() => 0), 5);
+  for (let i = 0; i < count; i++) {
+    const candidate = loc.nth(i);
+    const visible = await candidate.isVisible({ timeout: 1500 }).catch(() => false);
+    if (!visible) continue;
+    await candidate.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    await sleep(150);
+
+    // Biological mouse trajectory click first if rng is provided
+    if (rng) {
+      const cursor = new HumanCursor(page, rng);
+      const ok = await cursor.clickElement(selector);
+      if (ok) return true;
+    }
+
+    const clicked = await candidate.click({ timeout: 3000 }).then(() => true).catch(() => false);
+    if (!clicked) {
+      // Graceful force-click fallback without fake DOM evaluate
+      const forceClicked = await candidate.click({ force: true, timeout: 2000 }).then(() => true).catch(() => false);
+      if (forceClicked) return true;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Navigate, tolerating engines that never emit CDP lifecycle events.
+ *
+ * Some engines never answer `domcontentloaded` on schedule,
+ * so every goto "times out" even though the document is fully there. On a
+ * timeout, confirm reality directly — a non-empty title on a real URL means
+ * the page arrived; only then report failure honestly.
+ */
+async function smartNav(
+  page: Page,
+  url: string,
+  timeoutMs: number,
+  waitUntil: "domcontentloaded" = "domcontentloaded",
+): Promise<boolean> {
+  try {
+    await page.goto(url, { waitUntil, timeout: timeoutMs });
+    return true;
+  } catch {
+    await sleep(2500);
+    const title = await page.title().catch(() => "");
+    const current = page.url();
+    if (title && !current.startsWith("about:") && !/just a moment|checking your browser/i.test(title)) {
+      return true;
+    }
+    return false;
+  }
+}
+
+async function executeDecision(
+  decision: AiDecision,
+  page: Page,
+  logger: Logger,
+  rng: Rng,
+  pacing: Pacing,
+): Promise<ExecOutcome> {
+  const noNav: ExecOutcome = { navigated: false, failed: false, metrics: null };
+
+  try {
+    switch (decision.action) {
+      // ── Navigation ──
+      case "goto_home":
+      case "goto_collection":
+      case "goto_product": {
+        const url = decision.url || decision.targetElement?.url;
+        if (!url) return noNav;
+        const started = Date.now();
+        try {
+          const ok = await smartNav(page, url, 45_000);
+          return {
+            navigated: true,
+            failed: !ok,
+            metrics: {
+              url,
+              status: null,
+              elapsedMs: Date.now() - started,
+              ttfbMs: null,
+              domContentLoadedMs: null,
+              loadEventMs: null,
+              firstContentfulPaintMs: null,
+              jsErrors: 0,
+              consoleErrors: 0,
+              failedRequests: 0,
+            },
+          };
+        } catch {
+          return {
+            navigated: true,
+            failed: true,
+            metrics: {
+              url,
+              status: null,
+              elapsedMs: Date.now() - started,
+              ttfbMs: null,
+              domContentLoadedMs: null,
+              loadEventMs: null,
+              firstContentfulPaintMs: null,
+              jsErrors: 0,
+              consoleErrors: 0,
+              failedRequests: 0,
+            },
+          };
+        }
+      }
+
+      // ── Go back ──
+      case "go_back": {
+        await page.goBack({ timeout: 15_000 }).catch(() => null);
+        return noNav;
+      }
+
+      // ── Click element (links, buttons, popups, etc.) ──
+      // ── Click element (links, buttons, popups, etc.) ──
+      // Prioritize real DOM element clicks; direct URL navigation is fallback only
+      case "click_element": {
+        const targetEl = decision.targetElement;
+        if (!targetEl) return noNav;
+        const targetUrl = targetEl.url;
+        const sel = targetEl.selector || "";
+        await hoverBeforeClick(page, sel || undefined, rng);
+
+        // STRATEGY 1: Try CSS selector from AI
+        if (sel && !sel.startsWith("text=")) {
+          try {
+            const loc = page.locator(sel).first();
+            const vis = await loc.isVisible({ timeout: 2000 }).catch(() => false);
+            if (vis) {
+              await loc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+              await sleep(rng.int(150, 400));
+              const navStart = Date.now();
+              const prevUrl = page.url();
+              await loc.click({ timeout: 5000 }).catch(() => {});
+              await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+              logger.debug("click_selector_ok", "clicked: " + sel);
+              if (page.url() !== prevUrl) {
+                return {
+                  navigated: true, failed: false,
+                  metrics: { url: page.url(), status: null, elapsedMs: Date.now() - navStart, ttfbMs: null, domContentLoadedMs: null, loadEventMs: null, firstContentfulPaintMs: null, jsErrors: 0, consoleErrors: 0, failedRequests: 0 },
+                };
+              }
+              return noNav;
+            }
+          } catch {}
+        }
+
+        // STRATEGY 2: Try text-based matching
+        if (targetEl.text) {
+          try {
+            const textLoc = page.getByText(targetEl.text, { exact: false }).first();
+            const visT = await textLoc.isVisible({ timeout: 2000 }).catch(() => false);
+            if (visT) {
+              await textLoc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+              await sleep(rng.int(150, 400));
+              const navStart = Date.now();
+              const prevUrl = page.url();
+              await textLoc.click({ timeout: 5000 }).catch(() => {});
+              await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+              logger.debug("click_text_ok", "clicked by text: " + targetEl.text.slice(0, 50));
+              if (page.url() !== prevUrl) {
+                return {
+                  navigated: true, failed: false,
+                  metrics: { url: page.url(), status: null, elapsedMs: Date.now() - navStart, ttfbMs: null, domContentLoadedMs: null, loadEventMs: null, firstContentfulPaintMs: null, jsErrors: 0, consoleErrors: 0, failedRequests: 0 },
+                };
+              }
+              return noNav;
+            }
+          } catch {}
+        }
+
+        // STRATEGY 3: Try href DOM element locator
+        if (targetUrl) {
+          try {
+            const urlPath = new URL(targetUrl, page.url()).pathname;
+            const hrefLoc = page.locator("a[href*=\"" + urlPath + "\"]").first();
+            const visH = await hrefLoc.isVisible({ timeout: 2000 }).catch(() => false);
+            if (visH) {
+              await hrefLoc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+              await sleep(rng.int(150, 400));
+              const navStart = Date.now();
+              const prevUrl = page.url();
+              await hrefLoc.click({ timeout: 5000 }).catch(() => {});
+              await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+              logger.debug("click_href_ok", "clicked href anchor: " + urlPath);
+              if (page.url() !== prevUrl) {
+                return {
+                  navigated: true, failed: false,
+                  metrics: { url: page.url(), status: null, elapsedMs: Date.now() - navStart, ttfbMs: null, domContentLoadedMs: null, loadEventMs: null, firstContentfulPaintMs: null, jsErrors: 0, consoleErrors: 0, failedRequests: 0 },
+                };
+              }
+              return noNav;
+            }
+          } catch {}
+        }
+
+        // STRATEGY 4 (Fallback only): Direct URL navigation when DOM clicking fails
+        if (targetUrl) {
+          try {
+            const fullUrl = targetUrl.startsWith("/") 
+              ? new URL(targetUrl, page.url()).href 
+              : targetUrl;
+            if (fullUrl.startsWith("http")) {
+              const navStart = Date.now();
+              logger.info("click_url_nav_fallback", "DOM click unavailable, falling back to direct nav: " + fullUrl.slice(0, 80));
+              await page.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+              return {
+                navigated: true, failed: false,
+                metrics: { url: fullUrl, status: null, elapsedMs: Date.now() - navStart, ttfbMs: null, domContentLoadedMs: null, loadEventMs: null, firstContentfulPaintMs: null, jsErrors: 0, consoleErrors: 0, failedRequests: 0 },
+              };
+            }
+          } catch {
+            logger.debug("url_nav_failed", "Fallback URL nav failed for: " + (targetUrl || "").slice(0, 60));
+          }
+        }
+
+        logger.debug("click_all_failed", "all strategies exhausted");
+        return noNav;
+      }
+
+      // ── Hover ──
+      case "hover_element": {
+        if (!decision.targetElement?.selector) return noNav;
+        const h = page.locator(decision.targetElement.selector).first();
+        if (await h.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await h.hover({ timeout: 5000 }).catch(() => {});
+        }
+        return noNav;
+      }
+
+      // ── Scroll (natural eased wheel bursts) ──
+      case "scroll": {
+        // Sometimes move the mouse before scrolling, like a person reaching
+        // for the wheel; wheel deltas land where the cursor sits.
+        if (rng.chance(0.3)) await humanMouse(page, rng);
+        await seatCursor(page, rng);
+
+        // Đọc toạ độ và trạng thái phase cuộn trên trang hiện tại
+        const pageMetrics = await page.evaluate(() => {
+          const w = window as any;
+          if (!w.__scrollPhase) w.__scrollPhase = "down";
+          const scrollY = window.scrollY || document.documentElement.scrollTop || 0;
+          const vh = window.innerHeight;
+          const scrollHeight = Math.max(
+            document.body?.scrollHeight ?? 0,
+            document.documentElement?.scrollHeight ?? 0,
+            vh
+          );
+          // Nếu chạm hoặc gần sát đáy (còn cách < 150px) => chuyển sang phase up
+          if (w.__scrollPhase === "down" && scrollY + vh >= scrollHeight - 150) {
+            w.__scrollPhase = "up";
+          }
+          // Nếu đã cuộn ngược lại gần đỉnh (còn cách < 100px) => lại chuyển sang down
+          else if (w.__scrollPhase === "up" && scrollY <= 100) {
+            w.__scrollPhase = "down";
+          }
+          return { vh, scrollY, scrollHeight, phase: w.__scrollPhase as "down" | "up" };
+        }).catch(() => ({ vh: 800, scrollY: 0, scrollHeight: 2000, phase: "down" as const }));
+
+        const { vh, phase } = pageMetrics;
+        const steps = rng.int(2, 4);
+
+        // Hướng cuộn cơ bản: theo phase (down: 1, up: -1)
+        // Kèm sai số / nhịp lên xuống ngẫu nhiên (18% cơ hội đảo hướng tạm thời)
+        const mainDir = phase === "down" ? 1 : -1;
+        const capMs = decision.maxMs;
+        const startedAt = Date.now();
+
+        for (let i = 0; i < steps; i++) {
+          // Nhịp phụ có thể ngẫu nhiên lùi lại chút ít như người đang dừng xem lại
+          let stepDir = mainDir;
+          if (rng.chance(0.18)) {
+            stepDir = -mainDir;
+          }
+
+          // Độ dài mỗi nhịp cuộn tự nhiên: 30% - 70% chiều cao màn hình
+          const distance = Math.round(vh * rng.float(0.3, 0.7) * stepDir);
+          const moved = await wheelBy(page, rng, distance);
+          if (moved === null) break; // page went away mid-gesture
+
+          // Người dùng dừng lại đọc: lần nghỉ đầu thỉnh thoảng kéo dài
+          let pause = i === 0 && rng.chance(0.35) ? rng.int(800, 2000) : pacing.scrollPause();
+          if (capMs !== undefined) {
+            // A scheduled add-to-cart is close: trim the pause so the next
+            // decision lands at the mark instead of past it.
+            pause = Math.max(300, Math.min(pause, capMs - (Date.now() - startedAt)));
+            if (Date.now() - startedAt >= capMs) break;
+          }
+          await sleep(pause);
+        }
+        return noNav;
+      }
+
+      // ── Dwell (reading / looking) ──
+      case "dwell": {
+        const dwell = rng.int(1500, 4000);
+        await sleep(decision.maxMs !== undefined ? Math.min(dwell, decision.maxMs) : dwell);
+        return noNav;
+      }
+
+      // ── Add to cart (scheduled advance action) ──
+      // The AI prepared a plan for THIS product page while the visitor was
+      // still scrolling (see the prefetch on page arrival). Executing it is
+      // pure clicking: random-pick one option per variant group, then press
+      // the add-to-cart control. A failure here is silent by design — the
+      // visit continues scrolling exactly as if no cart was ever touched.
+      case "add_to_cart": {
+        // The plan was prepared for a specific product page; the visitor may
+        // have wandered since. Go back to that page before pressing anything.
+        if (decision.url) {
+          try {
+            const target = new URL(decision.url);
+            if (target.pathname !== new URL(page.url()).pathname) {
+              logger.info("atc_return", "returning to planned product page", { data: { url: decision.url } });
+              await page.goto(decision.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+              await sleep(rng.int(1800, 2800));
+            }
+          } catch { /* malformed target — click where we are */ }
+        }
+
+        const plan = decision.plan;
+        const atcSelector = plan?.addToCart?.selector ?? decision.targetElement?.selector;
+        // No early return when the plan is empty: the generic fallback chain
+        // below (form[action*=/cart/add], data-add-to-cart, text match) still
+        // finds the button on themes whose plan came back bare (liquiddeath-
+        // class React buy boxes). Bailing here was a silent atc_noop.
+
+        const readCartCount = (): Promise<number> =>
+          page.evaluate(() =>
+            fetch("/cart.js", { headers: { accept: "application/json" } })
+              .then((r) => r.json())
+              .then((c) => Number(c?.item_count ?? -1))
+              .catch(() => -1),
+          ) as Promise<number>;
+
+        // Golden evidence, four layers: (1) POST /cart/add(.js) — the Shopify
+        // standard; (2) any POST whose URL mentions "cart" — custom stacks;
+        // (3) POST-body sniff — headless/GraphQL stacks hide cart mutations
+        // behind opaque URLs, so we read small POST bodies looking for cart
+        let addHit = false;
+        const bodyChecks: Array<Promise<void>> = [];
+        const onResponse = (resp: { url(): string; status(): number; request(): { method(): string; headers(): Record<string, string> }; text(): Promise<string> }): void => {
+          try {
+            const u = resp.url();
+            if (resp.status() >= 400) return;
+            const method = resp.request().method().toUpperCase();
+            if (/\/cart\/add(\.js)?|cart[_-]?add|add[_-]?to[_-]?cart|add[_-]?item|\/api\/.*\/cart/i.test(u) && (method === "POST" || method === "PUT")) {
+              addHit = true;
+              return;
+            }
+            if (method !== "POST" && method !== "PUT") return;
+            if (!/cart|graphql|api|checkout|storefront|lines|items/i.test(u)) return;
+            const lenStr = resp.request().headers()["content-length"] ?? "0";
+            if (Number(lenStr) > 40_000) return;
+            bodyChecks.push(
+              resp.text().then((t) => {
+                if (/cart(id|line|_count)|"item_count"|CartLine|AddedToCart|merchandiseId|cartLinesAdd|cartCreate|checkoutCreate|"quantity"\s*:\s*[1-9]|"totalQuantity"\s*:\s*[1-9]|"subtotalPrice"/i.test(t)) {
+                  addHit = true;
+                }
+              }).catch(() => undefined),
+            );
+          } catch { /* response may be gone */ }
+        };
+
+        page.on("response", onResponse);
+        let before = -1;
+        let clicks = 0;
+        let drawerOpened = false;
+        let after = -1;
+        let badgeCount = 0;
+        let groups: Array<{ group: string; options: string[] }> = [];
+
+        try {
+          before = await readCartCount().catch(() => -1);
+
+          // Overlays first — a newsletter modal above the buy box eats clicks.
+          await dismissPopups(page);
+
+          if (before === -1) {
+            logger.warn("atc_cart_unreadable", "/cart.js unreadable — verification will rely on network signals", { data: { url: page.url() } });
+          }
+
+          // 1. Variant groups from AI plan (if available)
+          groups = plan?.variants?.length ? [...plan.variants].slice(0, 2) : [];
+          for (const g of groups) {
+            if (!g.options.length) continue;
+            const idx = Math.floor(rng.float(0, g.options.length)) % g.options.length;
+            const pick = g.options[idx];
+            if (!pick) continue;
+            const ok = await clickBySelector(page, pick, rng);
+            logger.debug(ok ? "atc_variant_picked" : "atc_variant_missed", g.group + ": " + pick);
+            if (ok) clicks++;
+            await sleep(rng.int(350, 850));
+          }
+
+          // 2. Smart Variant / Size Auto-Selector (Apparel, Shoes, Colors, Options)
+          const smartVariantPicked = await page.evaluate(() => {
+            const isItemInStock = (el: HTMLElement): boolean => {
+              if (el.hasAttribute("disabled")) return false;
+              if (el.getAttribute("aria-disabled") === "true") return false;
+              if (el.getAttribute("data-available") === "false") return false;
+              if (el.getAttribute("data-in-stock") === "false") return false;
+              const cl = (el.className || "").toLowerCase();
+              if (/sold[-_]?out|disabled|unavailable|out[-_]?of[-_]?stock/i.test(cl)) return false;
+              const txt = (el.innerText || el.textContent || "").toLowerCase();
+              if (/sold\s*out|out\s*of\s*stock|hết\s*hàng|unavailable/i.test(txt)) return false;
+              return true;
+            };
+
+            let count = 0;
+            const radios = Array.from(document.querySelectorAll('input[type="radio"]:not([disabled])')) as HTMLInputElement[];
+            const radioGroups = new Map<string, HTMLInputElement[]>();
+            radios.forEach((r) => {
+              if (r.name && !/selling_plan|payment|shipping|rating|frequency|quantity/i.test(r.name)) {
+                radioGroups.set(r.name, [...(radioGroups.get(r.name) || []), r]);
+              }
+            });
+            radioGroups.forEach((group) => {
+              const inStock = group.filter(r => isItemInStock(r));
+              const already = inStock.find((r) => r.checked);
+              if (!already && inStock.length > 0) {
+                const target = inStock[0];
+                target.click();
+                target.dispatchEvent(new Event("change", { bubbles: true }));
+                count++;
+              }
+            });
+
+            const swatchContainers = Array.from(document.querySelectorAll('fieldset, [class*="swatch" i], [class*="variant" i], [class*="size" i], [data-option-name], [class*="option-select" i]'));
+            for (const container of swatchContainers) {
+              const items = Array.from(container.querySelectorAll('button, label, [data-option-value], [role="radio"]')).filter((el) => {
+                const htmlEl = el as HTMLElement;
+                if (!isItemInStock(htmlEl)) return false;
+                if (!htmlEl.offsetParent && getComputedStyle(htmlEl).display === "none") return false;
+                const txt = (htmlEl.textContent || "").trim();
+                return txt.length > 0 && txt.length <= 15 && !/add|cart|bag|buy|checkout|close|\$/i.test(txt);
+              });
+              if (items.length > 1) {
+                const isAnySelected = items.some((item) => item.getAttribute("aria-checked") === "true" || item.classList.contains("selected") || item.classList.contains("active"));
+                if (!isAnySelected) {
+                  const pick = items[Math.min(1, items.length - 1)] as HTMLElement;
+                  pick.click();
+                  count++;
+                }
+              }
+            }
+
+            document.querySelectorAll("select[name*='options'], select[name='id'], select[id*='option']").forEach((sel) => {
+              const s = sel as HTMLSelectElement;
+              if (s.options.length > 1) {
+                const validOptions = Array.from(s.options).filter((o, idx) => idx > 0 && !o.disabled && !/sold\s*out|hết\s*hàng/i.test(o.text));
+                if (validOptions.length > 0 && (s.selectedIndex <= 0 || s.options[s.selectedIndex].disabled)) {
+                  s.value = validOptions[0].value;
+                  s.dispatchEvent(new Event("change", { bubbles: true }));
+                  count++;
+                }
+              }
+            });
+
+            return count;
+          }).catch(() => 0);
+
+          if (smartVariantPicked > 0) {
+            logger.debug("atc_smart_variants", `Pre-selected ${smartVariantPicked} variant option(s)`);
+            clicks += smartVariantPicked;
+            await sleep(rng.int(500, 1100));
+          }
+
+          // 3. Main Add-To-Cart Control Click (AI selector -> AI form fallback -> Rich generic handles -> form.requestSubmit)
+          if (atcSelector) {
+            await page.waitForSelector(atcSelector, { timeout: 8_000 }).catch(() => undefined);
+          }
+          let clickedMain = atcSelector ? await clickBySelector(page, atcSelector, rng) : false;
+          if (clickedMain) clicks++;
+          else logger.debug("add_to_cart_invisible", "Add-to-cart control not visible", { data: { url: page.url(), selector: atcSelector ?? "" } });
+
+          if (!clickedMain && plan?.formSelector) {
+            await page.waitForSelector(plan.formSelector, { timeout: 4000 }).catch(() => undefined);
+            if (await clickBySelector(page, plan.formSelector, rng)) { clickedMain = true; clicks++; logger.debug("atc_form_click", "AI form fallback: " + plan.formSelector); }
+          }
+
+          if (!clickedMain) {
+            const generic = [
+              'form[action*="/cart/add"] [type="submit"]',
+              'form[action*="/cart/add"] [name="add"]',
+              'form[action*="/cart/add"] button',
+              'product-form form [type="submit"]',
+              'product-form form button[name="add"]',
+              'product-form button[type="submit"]',
+              'form#AddToCartForm [type="submit"]',
+              '[data-action="add-to-cart"]',
+              '[data-add-to-cart]',
+              '[data-testid*="add-to-cart" i]',
+              '[data-test*="add-to-cart" i]',
+              'button[class*="add-to-cart" i]',
+              'button[class*="AddToCart" i]',
+              'button[id*="add-to-cart" i]',
+              '[id*="AddToCart" i]',
+              ".product-form__submit",
+              ".shopify-payment-button__button--unbranded",
+              '[class*="sticky-atc" i] button',
+              '[class*="sticky-cart" i] button',
+              '[data-sticky-add-to-cart] button',
+              '[name="add"]',
+              'button[name="add"]',
+              'input[name="add"]',
+              'button[aria-label*="Add to cart" i]',
+              'button[aria-label*="Add to bag" i]',
+            ];
+            for (let pass = 0; pass < 2 && !clickedMain; pass++) {
+              if (pass === 1) await sleep(2500);
+              await dismissPopups(page);
+              for (const sel of generic) {
+                const loc = page.locator(sel).first();
+                if (!(await loc.isVisible({ timeout: 1000 }).catch(() => false))) continue;
+                if (await loc.isDisabled({ timeout: 600 }).catch(() => true)) continue;
+                await loc.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+                await clickBySelector(page, sel, rng);
+                clickedMain = true;
+                clicks++;
+                logger.debug("atc_generic_click", "fallback clicked: " + sel);
+                break;
+              }
+              if (!clickedMain) {
+                const byText = page.getByRole("button", { name: /add to cart|add to bag|buy now|thêm vào giỏ|ajouter au panier|in den warenkorb/i }).first();
+                if (await byText.isVisible({ timeout: 1000 }).catch(() => false)) {
+                  await byText.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+                  await byText.click({ timeout: 4000 }).catch(() => {});
+                  clickedMain = true;
+                  clicks++;
+                  logger.debug("atc_text_click", "fallback clicked by text");
+                }
+              }
+            }
+
+            // Layer 4 Fallback: Native form.requestSubmit()
+            if (!clickedMain) {
+              const formSubmitted = await page.evaluate(() => {
+                const form = document.querySelector<HTMLFormElement>('form[action*="/cart/add"], product-form form, form#AddToCartForm');
+                if (form) {
+                  const submitBtn = form.querySelector<HTMLElement>('button[type="submit"], [name="add"], button');
+                  if (typeof form.requestSubmit === "function") {
+                    form.requestSubmit(submitBtn as HTMLButtonElement);
+                    return true;
+                  } else if (submitBtn) {
+                    submitBtn.click();
+                    return true;
+                  }
+                }
+                return false;
+              }).catch(() => false);
+
+              if (formSubmitted) {
+                clickedMain = true;
+                clicks++;
+                logger.debug("atc_form_request_submit", "Fallback triggered via form.requestSubmit()");
+              }
+            }
+          }
+
+          // 4. Quick-Add / Modal Size Selection Handshake
+          await sleep(rng.int(1000, 1800));
+          const modalHandled = await page.evaluate(() => {
+            const modals = Array.from(document.querySelectorAll('[role="dialog"], [class*="drawer" i], [class*="modal" i], [class*="quick-add" i], [id*="quick-add" i], [class*="popover" i]')).filter((el) => {
+              const h = el as HTMLElement;
+              return h.offsetParent !== null && getComputedStyle(h).display !== "none";
+            });
+            if (modals.length === 0) return false;
+            let handled = false;
+            for (const m of modals) {
+              const options = Array.from(m.querySelectorAll('button:not([disabled]), label:not([class*="disabled"]), [role="radio"]')).filter((el) => {
+                const t = (el.textContent || "").trim();
+                return t.length >= 1 && t.length <= 10 && !/add|close|cancel|cart|bag|view/i.test(t);
+              });
+              if (options.length > 0) {
+                (options[0] as HTMLElement).click();
+                handled = true;
+              }
+              const confirmBtn = m.querySelector('button[type="submit"], [name="add"], button:has-text("Add"), button:has-text("Bag"), button:has-text("Cart")') as HTMLElement;
+              if (confirmBtn) {
+                confirmBtn.click();
+                handled = true;
+              }
+            }
+            return handled;
+          }).catch(() => false);
+
+          if (modalHandled) {
+            logger.debug("atc_modal_handled", "Handled quick-add/size drawer selection");
+            clicks++;
+            await sleep(rng.int(1800, 2600));
+          }
+
+          // Drain in-flight network bodies
+          await sleep(rng.int(2200, 3400));
+          if (bodyChecks.length) await Promise.race([Promise.all(bodyChecks), sleep(1500)]);
+
+          drawerOpened = clicks > 0 ? await page.evaluate(() => {
+            const d = document.querySelector('cart-drawer, #CartDrawer, .cart-drawer, cart-notification, #CartNotification, .cart-notification, [class*="cart-drawer" i], [class*="CartDrawer"], [class*="mini-cart" i], [class*="MiniCart"], [id*="cart-drawer" i], [class*="cart-flyout" i], [class*="drawer--cart" i], [aria-label*="cart" i][role="dialog"]');
+            if (!d) return false;
+            const st = getComputedStyle(d);
+            return (d as HTMLElement).offsetParent !== null || st.display !== "none" || st.transform !== "none";
+          }).catch(() => false) : false;
+          after = clicks > 0 ? await readCartCount().catch(() => -1) : before;
+
+          badgeCount = clicks > 0 ? await page.evaluate(() => {
+            const sels = ['[class*="cart-count" i]','[class*="cart_count" i]','[class*="CartCount"]','[data-cart-count]','[class*="cart" i] [class*="count" i]','[class*="bag" i] [class*="count" i]','[aria-label*="cart" i] [class*="count" i]','header [class*="badge" i]'];
+            let best = 0;
+            for (const sel of sels) {
+              for (const el of Array.from(document.querySelectorAll(sel))) {
+                const t = (el.textContent || "").trim();
+                const n = parseInt(t.replace(/[^\d]/g, ""), 10);
+                if (Number.isFinite(n) && n > best && n < 100) best = n;
+              }
+            }
+            return best;
+          }).catch(() => 0) : 0;
+        } finally {
+          page.off("response", onResponse);
+        }
+
+        if (!clicks) {
+          logger.debug("atc_noop", "nothing clickable — visit continues", { url: page.url() });
+          return noNav;
+        }
+
+        const landedOnCart = /\/cart(\?|$)/.test(page.url());
+        const verified = addHit || landedOnCart || after > before || drawerOpened || badgeCount > 0;
+        if (verified) {
+          const how = addHit ? "network" : drawerOpened ? "cart drawer" : landedOnCart ? "cart page" : badgeCount > 0 ? "cart badge" : "cart";
+          logger.info("atc_success", `add-to-cart verified via ${how}: ${before} -> ${after} items`, {
+            url: page.url(),
+            data: { selector: atcSelector ?? "", variants: groups.map((g) => g.group).join("+") },
+          });
+        } else {
+          // Silent failure: log and keep browsing — never derail the visit.
+          logger.warn("atc_unverified", `clicked but unconfirmed (net=${addHit}, cart ${before} -> ${after}) — continuing browse`, {
+            url: page.url(),
+            data: { selector: atcSelector ?? "" },
+          });
+          return noNav;
+        }
+
+        // Cart abandonment: sometimes look at what we just added, then leave.
+        await sleep(rng.int(1500, 3000));
+        if (rng.chance(0.35)) {
+          try {
+            const origin = new URL(page.url()).origin;
+            await page.goto(origin + "/cart", { waitUntil: "domcontentloaded", timeout: 15000 });
+            logger.info("cart_view", "Viewed cart page (abandonment)");
+            await sleep(rng.int(3000, 8000));
+            await page.goBack({ timeout: 15_000 }).catch(() => null);
+          } catch {}
+        }
+        return { navigated: false, failed: false, metrics: null, atcVerified: true };
+      }
+
+      // ── Exit ──
+      case "exit":
+        return noNav;
+    }
+  } catch (err) {
+    logger.error(
+      "action_failed",
+      decision.action + ": " + (err instanceof Error ? err.message : String(err)),
+    );
+    return { navigated: false, failed: true, metrics: null };
+  }
+
+  return noNav;
 }
 
 export { sleep };

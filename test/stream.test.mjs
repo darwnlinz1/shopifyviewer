@@ -54,8 +54,6 @@ before(async () => {
     },
     session: { durationMs: 60_000, durationJitterMs: 0, navigationTimeoutMs: 15_000 },
     logging: { dir: join(workDir, "logs"), console: false, jsonl: false },
-    ai: { cookiesDir: join(workDir, "cookies") },
-    behavior: { ...loadConfig().behavior, pageEngagementMs: { min: 2_000, max: 3_000 } },
   });
 
   orchestrator = new Orchestrator(config);
@@ -68,7 +66,7 @@ after(async () => {
   await orchestrator?.shutdown();
   await dashboard?.close();
   await shop?.close();
-  rmSync(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+  rmSync(workDir, { recursive: true, force: true });
 });
 
 async function api(path, options = {}) {

@@ -12,17 +12,10 @@ import { existsSync, readdirSync, rmSync, readFileSync, writeFileSync } from "no
 import { join, resolve } from "node:path";
 import { rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import type { BrowserProvider, SimulatorConfig } from "../config.js";
+import type { SimulatorConfig } from "../config.js";
 import { DEFAULT_CONFIG } from "../config.js";
 import { Logger } from "../logging/logger.js";
-import { preflight, hardWriteCookies, writeJarToProfileDir, captureContextCookies, findSystemChrome, detectBrowserEngineBranding, providerFor } from "../browser/chrome.js";
-import {
-  bitBrowserClientFor,
-  bitBrowserSettings,
-  checkBitBrowserHealth,
-  deleteBitBrowserProfile,
-  type BitBrowserProfileSummary,
-} from "../browser/bitbrowser.js";
+import { preflight, hardWriteCookies, writeJarToProfileDir, captureContextCookies, findSystemChrome, detectBrowserEngineBranding } from "../browser/chrome.js";
 import { startSession, type SessionHandle, type SessionSnapshot } from "../session/aiManager.js";
 import { ProfileStore, type CreateProfileInput, type UpdateProfileInput } from "../profiles/store.js";
 import { CookiePool } from "../ai/cookiePool.js";
@@ -34,7 +27,6 @@ import { Screencast } from "./screencast.js";
 import { describeIdentity } from "../browser/identity.js";
 
 import { AdaptiveLauncher } from "../performance/AdaptiveLauncher.js";
-import { TabHibernationEngine } from "../performance/TabHibernation.js";
 
 /** A profile plus whatever it is doing right now. */
 export interface ProfileView {
@@ -63,17 +55,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
    * a double-click or /start + /continue race from launching two Chrome
    * processes against the same user-data directory. */
   private readonly launching = new Set<string>();
-  private readonly inFlightLaunches = new Map<string, Promise<SessionHandle>>();
-  private readonly cancelledLaunches = new Set<string>();
   private readonly logger: Logger;
 
   // ── Coalesced Push Engine (600ms Tick / 1.6Hz Throttle) ──
   private isDirty = true;
   private pushTimer: NodeJS.Timeout | null = null;
   private readonly launcher = new AdaptiveLauncher({ maxConcurrent: 5, baseIntervalMs: 300, targetCpuPercent: 75 });
-  private readonly hibernator: TabHibernationEngine;
-  /** Kernels already verified reachable in this process. */
-  private readonly preflightDone = new Set<BrowserProvider>();
+  private preflightDone = false;
   /** One cookie pool for the whole dashboard process — rate limits learned by
    * any profile's session immediately protect every other profile. */
   private sharedPool?: CookiePool;
@@ -84,7 +72,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     this.store = new ProfileStore(config.browser.profileDir);
     this.cleanupStaleProfiles();
     this.logger = new Logger("dashboard", { ...config.logging, jsonl: false }, "dash");
-    this.hibernator = new TabHibernationEngine(this.logger);
     this.startCoalescedPushLoop();
     setImmediate(() => {
       try { this.ensureSharedPool(); } catch { /* surfaced on first use */ }
@@ -115,42 +102,22 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     defaultDurationMinutes: number;
     headless: boolean;
     engine: { name: string; isUngoogled: boolean; isEdge: boolean };
-    provider: BrowserProvider;
-    bitbrowser: { apiUrl: string; coreVersion: string };
   } {
     const execPath = this.config.browser.executablePath || findSystemChrome();
-    const bit = bitBrowserSettings(this.config);
     return {
       storefront: this.config.storefront,
       defaultDurationMinutes: Math.round(this.config.session.durationMs / 60_000),
       headless: this.config.browser.headless,
       engine: detectBrowserEngineBranding(execPath),
-      provider: providerFor(this.config),
-      bitbrowser: { apiUrl: bit.apiUrl, coreVersion: bit.coreVersion },
     };
-  }
-
-  /** Live reachability of the BitBrowser Local API. */
-  async bitBrowserStatus(): Promise<{ ok: boolean; apiUrl: string; latencyMs?: number; error?: string; profilesLinked: number }> {
-    const health = await checkBitBrowserHealth(bitBrowserSettings(this.config));
-    const profilesLinked = this.store.list().filter((p) => !!p.bitBrowserId).length;
-    return { ...health, profilesLinked };
-  }
-
-  /** Profiles that exist in the BitBrowser app, for linking one to a SiteViewer profile. */
-  async listBitBrowserProfiles(page = 0, pageSize = 50): Promise<{ list: BitBrowserProfileSummary[]; totalNum: number }> {
-    return bitBrowserClientFor(bitBrowserSettings(this.config)).list(page, pageSize);
   }
 
   /** Everything the dashboard needs, in stable profile order. */
   snapshot(): ProfileView[] {
     return this.store.list().map((profile) => {
       const live = this.sessions.get(profile.id);
-      const safeProfile: Profile = profile.cookies
-        ? { ...profile, cookies: { ...profile.cookies, cookies: [] } }
-        : profile;
       return {
-        profile: safeProfile,
+        profile,
         session: live ? live.handle.snapshot() : null,
         streaming: live ? live.screencast.lastFrame !== null : false,
         identity: describeIdentity(profile),
@@ -198,7 +165,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     durationMinutes?: number;
     atcMinutes?: number | null;
     device?: ProfileDevice | null;
-    browserProvider?: BrowserProvider | null;
   }): { created: number; profiles: Profile[]; errors: string[] } {
     const sites = [...new Set(input.sites.map((s) => s.trim()).filter(Boolean))];
     const proxies = [...new Set(input.proxies.map((p) => p.trim()).filter(Boolean))];
@@ -219,7 +185,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           ...(input.durationMinutes ? { durationMinutes: input.durationMinutes } : {}),
           ...(input.atcMinutes !== undefined ? { atcMinutes: input.atcMinutes } : {}),
           ...(input.device ? { device: input.device } : {}),
-          ...(input.browserProvider !== undefined ? { browserProvider: input.browserProvider } : {}),
         });
         profiles.push(profile);
       } catch (err) {
@@ -259,32 +224,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       ),
     );
 
-    // Only a BitBrowser profile SiteViewer created goes with it; one the
-    // operator linked by ID is theirs and is merely unlinked.
-    if (profile.bitBrowserId && profile.bitBrowserManaged) {
-      await this.deleteManagedBitBrowserProfile(profile.bitBrowserId);
-    }
-
-    this.logger.info("profile_deleted", profile.name, { data: { id, dir, bitBrowserId: profile.bitBrowserId ?? null } });
+    this.logger.info("profile_deleted", profile.name, { data: { id, dir } });
     this.schedulePush();
-  }
-
-  private async deleteManagedBitBrowserProfile(bitBrowserId: string): Promise<void> {
-    const settings = bitBrowserSettings(this.config);
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await deleteBitBrowserProfile(settings, bitBrowserId);
-        this.logger.info("bitbrowser_profile_deleted", bitBrowserId);
-        return;
-      } catch (err) {
-        // The window may still be shutting down right after closeSession.
-        if (attempt === 2) {
-          this.logger.warn("bitbrowser_delete_failed", `${bitBrowserId}: ${err instanceof Error ? err.message : String(err)}`);
-          return;
-        }
-        await new Promise<void>((r) => setTimeout(r, 1500));
-      }
-    }
   }
 
   /**
@@ -311,20 +252,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       // account would never appear when the operator opens that site in a tab.
       const n = await hardWriteCookies(live.handle.context, profile.cookies?.cookies, this.logger).catch(() => 0);
       this.logger.info("cookies_written_live", `${n} row(s) written into the running browser`);
-    } else if (this.launching.has(id)) {
-      const pending = this.inFlightLaunches.get(id);
-      if (pending) {
-        const h = await pending.catch(() => null);
-        if (h) {
-          const n = await hardWriteCookies(h.context, profile.cookies?.cookies, this.logger).catch(() => 0);
-          this.logger.info("cookies_written_live", `${n} row(s) written into the newly launched browser`);
-        }
-      }
-    } else if (providerFor(this.config, profile) === "bitbrowser") {
-      // The jar lives inside the BitBrowser app, not in a local user-data
-      // directory, so it is hard-written the next time that window opens.
-      this.store.setPendingCookieWrite(id, true);
-      this.logger.info("cookies_pending_bitbrowser", "jar will be hard-written when the BitBrowser profile next opens");
     } else {
       const n = await writeJarToProfileDir({
         config: this.config,
@@ -461,14 +388,11 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     if (this.launching.has(profileId)) {
       throw new Error("This profile is already starting");
     }
-    this.cancelledLaunches.delete(profileId);
     this.launching.add(profileId);
     try {
       return await this.startProfileInner(profileId, options);
     } finally {
       this.launching.delete(profileId);
-      this.inFlightLaunches.delete(profileId);
-      this.cancelledLaunches.delete(profileId);
     }
   }
 
@@ -482,14 +406,14 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     },
   ): Promise<SessionSnapshot> {
     const profile = this.store.require(profileId);
-    const provider = providerFor(this.config, profile);
 
-    // Check each kernel once per process, not once per profile — otherwise
-    // starting six profiles at once races six probes.
-    if (!this.preflightDone.has(provider)) {
-      const result = await preflight(this.config, this.logger, provider);
+    // Provision the binary and check the licence once per process, not once
+    // per profile — otherwise starting six profiles at once races six
+    // downloads.
+    if (!this.preflightDone) {
+      const result = await preflight(this.config, this.logger);
       if (!result.ok) throw new Error(result.reason);
-      this.preflightDone.add(provider);
+      this.preflightDone = true;
     }
 
     const sessionId = `${profile.ordinal}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
@@ -598,41 +522,21 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       ...(options.resumeUrl ? { resumeUrl: options.resumeUrl } : {}),
       ...(options.visitState ? { inherited: options.visitState } : {}),
       cookiePool: this.ensureSharedPool(),
-      launchHooks: {
-        bitBrowserLinked: (link) => {
-          this.store.recordBitBrowserLink(profileId, {
-            bitBrowserId: link.id,
-            managed: link.managed,
-            ...(link.proxySig ? { proxySig: link.proxySig } : {}),
-          });
-          this.schedulePush();
-        },
-        cookiesHardWritten: () => {
-          this.store.setPendingCookieWrite(profileId, false);
-        },
-      },
       onPage: async (page) => {
         const old = screenRef.current;
         const fresh = new Screencast(page);
-        await fresh.start(provider === "bitbrowser" ? { eager: false } : undefined).catch(() => undefined);
+        await fresh.start().catch(() => undefined);
         screenRef.current = fresh;
         if (old) await old.stop().catch(() => undefined);
       },
       onUpdate: () => this.markDirty(),
     });
     const captured = launching.then((h) => h);
-    this.inFlightLaunches.set(profileId, captured);
-    let launchTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
-    // BitBrowser queues opens and checks the proxy IP before handing back a
-    // websocket, so it gets a longer leash than a local Chrome spawn.
-    const launchTimeoutMs = provider === "bitbrowser" ? 150_000 : 60_000;
     try {
-      const timeout = new Promise<never>((_, reject) => {
-        launchTimeoutTimer = setTimeout(
-          () => reject(new Error(`Browser launch timed out after ${Math.round(launchTimeoutMs / 1000)}s`)),
-          launchTimeoutMs,
-        );
-      });
+      // 60s timeout: if browser doesn't launch in time, kill and move on
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Browser launch timed out after 60s")), 60_000)
+      );
       handle = await Promise.race([captured, timeout]);
     } catch (err) {
       void captured
@@ -640,20 +544,10 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
         .catch(() => undefined);
       throw err;
     } finally {
-      if (launchTimeoutTimer) clearTimeout(launchTimeoutTimer);
       this.launcher.release();
     }
 
-    if (this.cancelledLaunches.has(profileId) || !this.store.get(profileId)) {
-      await screenRef.current?.stop().catch(() => undefined);
-      await handle.close().catch(() => undefined);
-      throw new Error("Profile launch was cancelled");
-    }
-
-    if (!screenRef.current) {
-      await handle.close().catch(() => undefined);
-      throw new Error("Screencast failed to attach");
-    }
+    if (!screenRef.current) throw new Error("Screencast failed to attach");
     this.sessions.set(profileId, { handle, screencast: screencastProxy });
     this.schedulePush();
 
@@ -702,9 +596,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   }
 
   pauseProfile(profileId: string): void {
-    const live = this.requireSession(profileId);
-    live.handle.pause();
-    void this.hibernator.freezeTab(live.handle.page, `profile-${profileId}`).catch(() => undefined);
+    this.requireSession(profileId).handle.pause();
     this.schedulePush();
   }
 
@@ -722,7 +614,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     const status = live.handle.snapshot().status;
     if (status === "paused") {
-      await this.hibernator.resumeTab(live.handle.page, `profile-${profileId}`).catch(() => undefined);
       live.handle.resume();
     } else if (status === "lingering") {
       const profile = this.store.require(profileId);
@@ -758,10 +649,6 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     if (this.config.safety.allowCart !== true) {
       throw new Error("safety.allowCart is false — enable it in config before forcing add-to-cart");
     }
-    const profile = this.store.get(profileId);
-    if (profile?.atcMinutes === 0) {
-      throw new Error("Add-to-cart is disabled for this profile (atcMinutes = 0)");
-    }
     live.handle.forceAtc();
     this.logger.info("force_atc_requested", "Operator requested add-to-cart", { data: { profileId } });
     return true;
@@ -769,29 +656,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
   /** Close a profile's browser. */
   async closeSession(profileId: string): Promise<void> {
-    if (this.launching.has(profileId)) {
-      this.cancelledLaunches.add(profileId);
-      const pending = this.inFlightLaunches.get(profileId);
-      if (pending) {
-        const handle = await Promise.race([
-          pending.catch(() => null),
-          new Promise<null>((r) => setTimeout(() => r(null), 5_000)),
-        ]);
-        if (handle) {
-          await handle.close().catch(() => undefined);
-        }
-      }
-    }
     const live = this.sessions.get(profileId);
     if (!live) return;
     await live.screencast.stop().catch(() => undefined);
     // Save the browser's jar back to the profile BEFORE the context dies:
     // these are the freshest server-rotated values and the next launch must
     // restore them, not replay an older import over them.
-    const captured = await Promise.race([
-      captureContextCookies(live.handle.context).catch(() => []),
-      new Promise<never[]>((r) => setTimeout(() => r([]), 2000)),
-    ]);
+    const captured = await captureContextCookies(live.handle.context).catch(() => []);
     if (captured.length > 0) {
       this.store.adoptCookies(profileId, captured);
       this.logger.info(
@@ -836,15 +707,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
   /** Close everything. Called on dashboard shutdown. */
   async shutdown(): Promise<void> {
-    if (this.pushTimer) {
-      clearInterval(this.pushTimer);
-      this.pushTimer = null;
-    }
-    for (const id of this.launching) {
-      this.cancelledLaunches.add(id);
-    }
-    const allIds = new Set([...this.sessions.keys(), ...this.launching]);
-    await Promise.all([...allIds].map((id) => this.closeSession(id)));
+    await Promise.all([...this.sessions.keys()].map((id) => this.closeSession(id)));
   }
 }
 

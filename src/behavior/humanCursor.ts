@@ -15,7 +15,6 @@
  */
 import type { Page } from "rebrowser-playwright";
 import type { Rng } from "../util/random.js";
-import { viewportOf } from "../browser/viewport.js";
 
 export interface Point {
   x: number;
@@ -37,7 +36,6 @@ export interface TrajectoryPoint {
 }
 
 export class HumanCursor {
-  private static readonly pagePositions = new WeakMap<Page, Point>();
   private currentPos: Point = { x: 500, y: 300 };
 
   // Decoupled 3-Pole IIR Pink Noise States (X and Y)
@@ -59,19 +57,6 @@ export class HumanCursor {
     private readonly page: Page,
     private readonly rng: Rng,
   ) {
-    if (page && typeof page === "object") {
-      const remembered = HumanCursor.pagePositions.get(page);
-      if (remembered) {
-        this.currentPos = { ...remembered };
-      } else {
-        const vp = viewportOf(page);
-        this.currentPos = {
-          x: Math.round(vp.width * (0.38 + this.rng.next() * 0.24)),
-          y: Math.round(vp.height * (0.35 + this.rng.next() * 0.25)),
-        };
-        HumanCursor.pagePositions.set(page, { ...this.currentPos });
-      }
-    }
     this.resetNoiseGenerators();
   }
 
@@ -89,12 +74,9 @@ export class HumanCursor {
     this.tremorQ = 3.5 + this.rng.next() * 1.5;      // 3.5 - 5.0
   }
 
-  /** Set current cursor origin and persist per Page so subsequent instances never teleport */
+  /** Set current cursor origin */
   public setPosition(pos: Point): void {
     this.currentPos = { ...pos };
-    if (this.page && typeof this.page === "object") {
-      HumanCursor.pagePositions.set(this.page, { ...pos });
-    }
   }
 
   /** Get current cursor position */
@@ -262,45 +244,6 @@ export class HumanCursor {
     const sub2Start = useDualSubmovement ? durationSec * (0.60 + this.rng.next() * 0.05) : durationSec;
     const sub2Duration = durationSec - sub2Start;
 
-    // Precompute Equi-Affine Arc-Length CDF Φ(u) for Lacquaniti Two-Thirds Power Law (v ∝ (κ + κ₀)^(-1/3)):
-    // Spatial curve: X(u) = D1 * u, Y(u) = 16 * B * u² * (1 - u)² for u ∈ [0, 1].
-    const d1 = Math.max(1, Math.hypot(pPrimary.x - start.x, pPrimary.y - start.y));
-    const gridN = 64;
-    const cdf: number[] = new Array(gridN + 1).fill(0);
-    const kappa0 = 0.0015; // Regularization constant preventing infinite velocity on straight segments
-    let accum = 0;
-    for (let k = 1; k <= gridN; k++) {
-      const u = (k - 0.5) / gridN;
-      // g(u) = 16 B u²(1-u)² => g'(u) = 32 B u (1 - 3u + 2u²), g''(u) = 32 B (1 - 6u + 6u²)
-      const gPrime = 32.0 * maxBow * u * (1.0 - 3.0 * u + 2.0 * u * u);
-      const gSecond = 32.0 * maxBow * (1.0 - 6.0 * u + 6.0 * u * u);
-      const dsDu = Math.hypot(d1, gPrime);
-      const curvature = Math.abs(d1 * gSecond) / Math.pow(Math.max(1e-4, dsDu), 3);
-      // Equi-affine differential weight: (κ(u) + κ₀)^(1/3) * ds/du
-      const weight = Math.cbrt(curvature + kappa0) * dsDu;
-      accum += weight / gridN;
-      cdf[k] = accum;
-    }
-    const totalAffineLen = Math.max(1e-6, accum);
-    for (let k = 1; k <= gridN; k++) {
-      cdf[k] = (cdf[k] ?? 0) / totalAffineLen;
-    }
-    const invertAffineCdf = (q: number): number => {
-      if (q <= 0) return 0;
-      if (q >= 1) return 1;
-      let lo = 0;
-      let hi = gridN;
-      while (lo < hi - 1) {
-        const mid = (lo + hi) >> 1;
-        if ((cdf[mid] ?? 0) < q) lo = mid;
-        else hi = mid;
-      }
-      const cLo = cdf[lo] ?? 0;
-      const cHi = cdf[hi] ?? 1;
-      const frac = cHi > cLo ? (q - cLo) / (cHi - cLo) : 0;
-      return (lo + frac) / gridN;
-    };
-
     let prevX = start.x;
     let prevY = start.y;
 
@@ -308,16 +251,15 @@ export class HumanCursor {
       const rawTau = i / totalSteps;
       const t = rawTau * durationSec;
 
-      // 1. Primary Minimum-Jerk progress in equi-affine space, inverted via Φ⁻¹ for Lacquaniti 2/3 Power Law
+      // 1. Primary Minimum-Jerk displacement (Septic C³)
       const tau1 = Math.min(1.0, t / sub1Duration);
-      const q1 = this.septic(tau1).sigma;
-      const u1 = invertAffineCdf(q1);
+      const s1 = this.septic(tau1).sigma;
 
-      // 2. Smooth spatial curvature bow parameterized by chord progress u1: g(u) = 16·B·u²·(1-u)²
-      const bow = 16.0 * maxBow * Math.pow(u1, 2) * Math.pow(1.0 - u1, 2);
+      // 2. C²-continuous polynomial curvature bow: g(τ) = 64·B·τ³·(1-τ)³
+      const bow = 64.0 * maxBow * Math.pow(tau1, 3) * Math.pow(1.0 - tau1, 3);
 
-      let cx = start.x + (pPrimary.x - start.x) * u1 + perpX * bow;
-      let cy = start.y + (pPrimary.y - start.y) * u1 + perpY * bow;
+      let cx = start.x + (pPrimary.x - start.x) * s1 + perpX * bow;
+      let cy = start.y + (pPrimary.y - start.y) * s1 + perpY * bow;
 
       // 3. Secondary Corrective Submovement superposition
       if (useDualSubmovement && t >= sub2Start) {
@@ -331,8 +273,8 @@ export class HumanCursor {
       const { noiseX, noiseY } = this.stepPinkNoise();
       const { tremX, tremY } = this.stepTremor(dt, noiseX, noiseY);
 
-      // End-point visual-motor precision dampening (exact landing at i === totalSteps)
-      const endDampening = i === totalSteps ? 0 : 1.0 - Math.pow(rawTau, 2) * 0.78;
+      // End-point visual-motor precision dampening
+      const endDampening = 1.0 - Math.pow(rawTau, 2) * 0.70;
       const finalX = cx + (noiseX + tremX) * endDampening;
       const finalY = cy + (noiseY + tremY) * endDampening;
 
@@ -340,10 +282,9 @@ export class HumanCursor {
       const vy = i === 0 ? 0 : (finalY - prevY) / dt;
       const velocity = Math.hypot(vx, vy);
 
-      // Quantize to 0.5px physical DIP grid (matches DPR=1/DPR=2 OS pointer granularity instead of synthetic 0.1px)
       trajectory.push({
-        x: Math.round(finalX * 2) / 2,
-        y: Math.round(finalY * 2) / 2,
+        x: Math.round(finalX * 10) / 10,
+        y: Math.round(finalY * 10) / 10,
         timestamp: Math.round(t * 1000),
         velocity: Math.round(velocity),
       });
@@ -357,39 +298,27 @@ export class HumanCursor {
 
   /**
    * Move mouse from current position to target following a biological Minimum-Jerk curve.
-   * Uses a deadline-anchored clock so CDP round-trip latency does not inflate Fitts's Law duration.
    */
   public async moveTo(target: Point, bounds?: TargetBounds): Promise<void> {
     const trajectory = this.generateTrajectory(this.currentPos, target, bounds);
-    if (trajectory.length <= 1) {
-      this.setPosition(target);
-      return;
-    }
+    if (trajectory.length <= 1) return;
 
-    const startWall = performance.now();
-    const last = trajectory.length - 1;
-    for (let i = 1; i <= last; i++) {
-      // Behind schedule (slow CDP round-trips): skip to the newest due sample,
-      // as Chrome's input pipeline coalesces moves, instead of stretching the
-      // movement past its Fitts's-law duration. The landing point always goes out.
-      const late = performance.now() - startWall;
-      while (i < last && (trajectory[i + 1]?.timestamp ?? Infinity) <= late) i++;
+    for (let i = 1; i < trajectory.length; i++) {
       const pt = trajectory[i];
       if (!pt) continue;
+      const prevPt = trajectory[i - 1];
+      const prevTime = prevPt ? prevPt.timestamp : 0;
+      const stepDelay = Math.max(2, pt.timestamp - prevTime);
 
       await this.page.mouse.move(pt.x, pt.y).catch(() => undefined);
-      this.setPosition({ x: pt.x, y: pt.y });
+      this.currentPos = { x: pt.x, y: pt.y };
 
-      const remainingWait = Math.round(pt.timestamp - (performance.now() - startWall));
-      if (remainingWait > 1) {
-        await new Promise((r) => setTimeout(r, remainingWait));
-      }
+      await new Promise((r) => setTimeout(r, stepDelay));
     }
   }
 
   /**
-   * Move to an element with biological trajectory and perform human click with hesitation,
-   * uncorrelated Log-Normal dwell, and tendon-flexion micro-slip.
+   * Move to an element with biological trajectory and perform human click with hesitation and dwell.
    */
   public async clickElement(selector: string): Promise<boolean> {
     try {
@@ -397,18 +326,8 @@ export class HumanCursor {
       const visible = await loc.isVisible({ timeout: 2500 }).catch(() => false);
       if (!visible) return false;
 
-      const box = await loc.boundingBox({ timeout: 2000 });
+      const box = await loc.boundingBox();
       if (!box || box.width <= 0 || box.height <= 0) return false;
-      return await this.clickBox(box);
-    } catch {
-      return false;
-    }
-  }
-
-  /** Human click inside an already-measured viewport box. */
-  public async clickBox(box: TargetBounds): Promise<boolean> {
-    try {
-      if (box.width <= 0 || box.height <= 0) return false;
 
       // Box-Muller Gaussian off-center landing ([0.18, 0.82])
       const z0 = this.sampleStandardGaussian();
@@ -417,35 +336,21 @@ export class HumanCursor {
       const normX = Math.min(0.82, Math.max(0.18, 0.5 + z0 * 0.11));
       const normY = Math.min(0.82, Math.max(0.18, 0.5 + z1 * 0.11));
 
-      const targetX = Math.round((box.x + box.width * normX) * 2) / 2;
-      const targetY = Math.round((box.y + box.height * normY) * 2) / 2;
+      const targetX = box.x + box.width * normX;
+      const targetY = box.y + box.height * normY;
 
       await this.moveTo({ x: targetX, y: targetY }, box);
 
       // Pre-click hesitation (Visual confirmation latency: 50ms - 130ms)
-      const hesitation = Math.round(50 + this.rng.next() * 80);
+      const hesitation = 50 + this.rng.next() * 80;
       await new Promise((r) => setTimeout(r, hesitation));
 
       // Pointer down event
       await this.page.mouse.down();
 
-      // Independent Gaussian draw for Log-Normal button dwell time (μ = 75ms, σ = 0.22, [35ms, 160ms])
-      // Fixes ρ = 1.0 correlation bug where z0 from normX was reused for dwellDelay.
-      const zDwell = this.sampleStandardGaussian();
-      const dwellDelay = Math.max(35, Math.min(160, Math.round(75 * Math.exp(0.22 * zDwell))));
-
-      // Biomechanical button-press micro-slip (~26% of clicks shift 0.5-1.5px during index-finger flexion)
-      if (this.rng.next() < 0.26) {
-        const preSlipWait = Math.round(dwellDelay * (0.38 + this.rng.next() * 0.22));
-        await new Promise((r) => setTimeout(r, preSlipWait));
-        const slipX = targetX + (this.rng.next() < 0.5 ? 0.5 : -0.5);
-        const slipY = targetY + (this.rng.next() < 0.7 ? 1.0 : 0.5);
-        await this.page.mouse.move(slipX, slipY).catch(() => undefined);
-        this.setPosition({ x: slipX, y: slipY });
-        await new Promise((r) => setTimeout(r, Math.max(10, dwellDelay - preSlipWait)));
-      } else {
-        await new Promise((r) => setTimeout(r, dwellDelay));
-      }
+      // Mouse button dwell time (Log-Normal: μ = 75ms, σ = 18ms)
+      const dwellDelay = Math.max(35, Math.min(160, Math.round(75 + z0 * 18)));
+      await new Promise((r) => setTimeout(r, dwellDelay));
 
       // Pointer up event
       await this.page.mouse.up();

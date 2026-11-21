@@ -226,12 +226,6 @@ export interface AiDecision {
    * so the next decision lands at the mark, not one scroll past it.
    */
   maxMs?: number;
-  /** How many items a choreography step covers (thumbnails, sections, cards, variants). */
-  count?: number;
-  /** Pre-checkout choreography phase the decision belongs to (for the timeline). */
-  phase?: string;
-  /** inspect_cart only: stay on the cart afterwards, ready for checkout. */
-  park?: boolean;
   /** Human-readable reason */
   reason: string;
 }
@@ -277,13 +271,6 @@ export type AiActionKind =
   | "scroll"
   | "hover_element"
   | "dwell"
-  // pre-checkout choreography
-  | "hover_card"
-  | "view_media"
-  | "read_section"
-  | "select_text"
-  | "explore_variants"
-  | "inspect_cart"
   // advance actions (10-min mark etc.)
   | "add_to_cart"
   // lifecycle

@@ -29,8 +29,6 @@ let overlayFor = null;
 let statusFilter = "all";
 let textFilter = "";
 let liveStreamEnabled = false; // Default OFF for 0% CPU consumption across 50 streams
-/** Kernel profiles use when they do not pick one ("builtin" | "bitbrowser"), from /api/meta. */
-let defaultProvider = "builtin";
 
 // ── Socket cleanup on refresh / navigate ──
 // Release MJPEG streams immediately so browser sockets are freed instantly on reload
@@ -493,18 +491,10 @@ function updateTile(view) {
     : "Open on the desktop (same cookies and proxy)";
 
   // ---- badges (static per profile) -------------------------------------
-  const onBitBrowser = (profile.browserProvider || defaultProvider) === "bitbrowser";
-  const badgeKey = `${profile.ordinal}${onBitBrowser ? `bb${profile.bitBrowserId || ""}` : ""}${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}${profile.storefront ? "s" : ""}${profile.device && profile.device.kind !== "desktop" ? `dev_${profile.device.kind}_${profile.device.model}` : ""}`;
+  const badgeKey = `${profile.ordinal}${profile.proxy ? "p" : ""}${profile.cookies ? `c${profile.cookies.count}` : ""}${profile.headed ? "d" : ""}${profile.storefront ? "s" : ""}${profile.device && profile.device.kind !== "desktop" ? `dev_${profile.device.kind}_${profile.device.model}` : ""}`;
   if (refs.badges.dataset.key !== badgeKey) {
     refs.badges.dataset.key = badgeKey;
     refs.badges.replaceChildren();
-    if (onBitBrowser) {
-      const bit = badge("bit", "BitBrowser");
-      bit.title = profile.bitBrowserId
-        ? `BitBrowser profile ${profile.bitBrowserId}${profile.bitBrowserManaged ? " (created by SiteViewer)" : " (linked)"}`
-        : "BitBrowser — a profile is created on first launch";
-      refs.badges.append(bit);
-    }
     if (profile.proxy) refs.badges.append(badge("proxy", "proxy"));
     if (profile.cookies) refs.badges.append(badge("cookie", `${profile.cookies.count}c`));
     if (profile.headed) refs.badges.append(badge("desktop", "window"));
@@ -917,9 +907,6 @@ function openSettings(profileId) {
   document.getElementById("f-atc").value = view.profile.atcMinutes ?? "";
   syncAtcField(document.getElementById("f-atc"));
   settingsDevicePicker.setDevice(view.profile.device);
-  document.getElementById("f-provider").value = view.profile.browserProvider || "";
-  document.getElementById("f-bitbrowser-id").value = view.profile.bitBrowserId || "";
-  syncEngineFields("f");
   proxyStatus.textContent = "";
   proxyStatus.removeAttribute("data-tone");
   cookieStatus.removeAttribute("data-tone");
@@ -974,8 +961,6 @@ document.getElementById("save-proxy").addEventListener("click", async () => {
         durationMinutes: duration ? Number(duration) : null,
         atcMinutes: atcRaw === "" ? null : Math.max(0, Number(atcRaw)),
         device: dev && dev.kind !== "desktop" ? dev : null,
-        browserProvider: document.getElementById("f-provider").value || null,
-        bitBrowserId: document.getElementById("f-bitbrowser-id").value.trim() || null,
       }),
     });
     proxyStatus.textContent = "saved";
@@ -988,21 +973,6 @@ document.getElementById("save-proxy").addEventListener("click", async () => {
 });
 
 document.getElementById("f-atc").addEventListener("input", (e) => syncAtcField(e.target));
-
-/**
- * Show the BitBrowser profile-ID field only when that kernel is in play:
- * picked explicitly, or inherited from a config whose default is BitBrowser.
- */
-function syncEngineFields(prefix) {
-  const picked = document.getElementById(`${prefix}-provider`).value;
-  const effective = picked || defaultProvider;
-  const field = document.getElementById(`${prefix}-bitbrowser-field`);
-  if (field) field.hidden = effective !== "bitbrowser";
-  const note = document.getElementById(`${prefix}-bitbrowser-note`);
-  if (note) note.hidden = effective !== "bitbrowser";
-}
-document.getElementById("f-provider").addEventListener("change", () => syncEngineFields("f"));
-document.getElementById("c-provider").addEventListener("change", () => syncEngineFields("c"));
 
 document.getElementById("test-proxy").addEventListener("click", async () => {
   if (!settingsFor) return;
@@ -1083,9 +1053,6 @@ function openCreate() {
   syncAtcField(document.getElementById("c-atc"));
   createDevicePicker.setDevice(null);
   document.getElementById("c-headed").checked = false;
-  document.getElementById("c-provider").value = "";
-  document.getElementById("c-bitbrowser-id").value = "";
-  syncEngineFields("c");
   createStatus.textContent = "";
   createStatus.removeAttribute("data-tone");
   createModal.hidden = false;
@@ -1104,8 +1071,6 @@ async function submitCreate() {
   const atcRaw = document.getElementById("c-atc").value.trim();
   const headed = document.getElementById("c-headed").checked;
   const dev = createDevicePicker.getDevice();
-  const provider = document.getElementById("c-provider").value;
-  const bitBrowserId = document.getElementById("c-bitbrowser-id").value.trim();
 
   createStatus.textContent = "creating…";
   createStatus.removeAttribute("data-tone");
@@ -1120,8 +1085,6 @@ async function submitCreate() {
         ...(atcRaw !== "" ? { atcMinutes: Math.max(0, Number(atcRaw)) } : {}),
         ...(headed ? { headed: true } : {}),
         ...(dev && dev.kind !== "desktop" ? { device: dev } : {}),
-        ...(provider ? { browserProvider: provider } : {}),
-        ...(bitBrowserId && (provider || defaultProvider) === "bitbrowser" ? { bitBrowserId } : {}),
       }),
     });
     toast(`Created ${name || "profile"}`, "ok");
@@ -1157,7 +1120,6 @@ function openBulk() {
   document.getElementById("bc-atc").value = "";
   syncAtcField(document.getElementById("bc-atc"));
   bulkDevicePicker.setDevice(null);
-  document.getElementById("bc-provider").value = "";
   bulkStatus.textContent = "";
   bulkStatus.removeAttribute("data-tone");
   updateBulkPreview();
@@ -1189,7 +1151,6 @@ async function submitBulk() {
   const duration = document.getElementById("bc-duration").value;
   const atcRaw = document.getElementById("bc-atc").value.trim();
   const dev = bulkDevicePicker.getDevice();
-  const provider = document.getElementById("bc-provider").value;
   const count = proxies.length > 0 ? proxies.length : sites.length;
   if (count === 0) { bulkStatus.textContent = "Dán ít nhất 1 site hoặc 1 proxy"; bulkStatus.dataset.tone = "bad"; return; }
 
@@ -1203,7 +1164,6 @@ async function submitBulk() {
         ...(duration ? { durationMinutes: Number(duration) } : {}),
         ...(atcRaw !== "" ? { atcMinutes: Math.max(0, Number(atcRaw)) } : {}),
         ...(dev && dev.kind !== "desktop" ? { device: dev } : {}),
-        ...(provider ? { browserProvider: provider } : {}),
       }),
     });
     toast(`Created ${r.created} profile(s)` + (r.errors?.length ? `, ${r.errors.length} failed` : ""), r.errors?.length ? "warn" : "ok");
@@ -1424,33 +1384,8 @@ fetch(withToken("/api/meta"))
         ? "Đang chạy Ungoogled-Chromium Portable (độc lập, siêu nhẹ, tiết kiệm 50% RAM)"
         : `Trình duyệt: ${meta.engine.name}`;
     }
-    if (meta.provider) {
-      defaultProvider = meta.provider;
-      // Badges depend on the default kernel; force them to redraw.
-      for (const tile of tiles.values()) delete tile.refs.badges.dataset.key;
-      render(latestState);
-    }
   })
   .catch(() => undefined);
-
-/** Header pill: is the BitBrowser Local API answering right now? */
-async function refreshBitBrowserBadge() {
-  const el = document.getElementById("bitbrowser-badge");
-  if (!el) return;
-  try {
-    const status = await api("/api/bitbrowser/status");
-    el.hidden = false;
-    el.dataset.tone = status.ok ? "ok" : "bad";
-    el.textContent = status.ok ? `🧬 BitBrowser · ${status.latencyMs ?? "?"}ms` : "🧬 BitBrowser offline";
-    el.title = status.ok
-      ? `BitBrowser Local API ${status.apiUrl} · ${status.profilesLinked} profile(s) linked`
-      : `${status.apiUrl}: ${status.error ?? "not reachable"}`;
-  } catch {
-    el.hidden = true;
-  }
-}
-void refreshBitBrowserBadge();
-setInterval(() => void refreshBitBrowserBadge(), 30_000);
 
 fetch(withToken("/api/state"))
   .then((r) => r.json())

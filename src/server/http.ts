@@ -18,7 +18,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join, extname, normalize, resolve, sep } from "node:path";
+import { dirname, join, extname, normalize } from "node:path";
 import type { Orchestrator } from "./orchestrator.js";
 import { DEVICE_CATALOG } from "../browser/identity.js";
 
@@ -116,44 +116,13 @@ function readDevice(body: Record<string, unknown>): import("../profiles/types.js
   return undefined;
 }
 
-/**
- * Browser engine pick from a request body. Absent → undefined (untouched);
- * null / "" / "default" → null (follow the config default).
- */
-function readProvider(body: Record<string, unknown>): "builtin" | "bitbrowser" | null | undefined {
-  if (!("browserProvider" in body)) return undefined;
-  const value = body.browserProvider;
-  if (value === null || value === "" || value === "default") return null;
-  if (value === "builtin" || value === "bitbrowser") return value;
-  throw new HttpError(400, `Invalid browser provider: ${String(value)} (expected builtin or bitbrowser)`);
-}
-
-/** BitBrowser profile id from a request body; null/"" unlinks. */
-function readBitBrowserId(body: Record<string, unknown>): string | null | undefined {
-  if (!("bitBrowserId" in body)) return undefined;
-  const value = body.bitBrowserId;
-  if (value === null || value === "") return null;
-  if (typeof value === "string") return value;
-  throw new HttpError(400, `"bitBrowserId" must be a string or null`);
-}
-
-function engineFields(body: Record<string, unknown>): { browserProvider?: "builtin" | "bitbrowser" | null; bitBrowserId?: string | null } {
-  const provider = readProvider(body);
-  const bitBrowserId = readBitBrowserId(body);
-  return {
-    ...(provider !== undefined ? { browserProvider: provider } : {}),
-    ...(bitBrowserId !== undefined ? { bitBrowserId } : {}),
-  };
-}
-
 /** Serve a static asset from the bundled public directory. */
 async function serveStatic(res: ServerResponse, pathname: string, token?: string): Promise<void> {
   const relative = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
   // Resolve inside PUBLIC_DIR and verify the result stayed there, so a
   // traversal like /../../etc/passwd cannot escape.
-  const root = resolve(PUBLIC_DIR);
-  const target = resolve(root, normalize(relative));
-  if (target !== root && !target.startsWith(root + sep)) throw new HttpError(403, "Forbidden");
+  const target = join(PUBLIC_DIR, normalize(relative));
+  if (!target.startsWith(PUBLIC_DIR)) throw new HttpError(403, "Forbidden");
 
   let contents: Buffer;
   try {
@@ -269,7 +238,6 @@ function streamMultiplexedScreens(orchestrator: Orchestrator, req: IncomingMessa
   });
 
   const unsubs: Array<() => void> = [];
-  const lastSentByProfile = new Map<string, number>();
   let closed = false;
 
   const sendFrame = (profileId: string, frame: Buffer): void => {
@@ -279,7 +247,6 @@ function streamMultiplexedScreens(orchestrator: Orchestrator, req: IncomingMessa
     );
     res.write(frame);
     res.write("\r\n");
-    lastSentByProfile.set(profileId, Date.now());
   };
 
   // Subscribe to each active screencast
@@ -297,13 +264,10 @@ function streamMultiplexedScreens(orchestrator: Orchestrator, req: IncomingMessa
   // Heartbeat: re-send last frames to keep connection warm
   const heartbeat = setInterval(() => {
     if (closed || res.writableEnded) return;
-    const now = Date.now();
     for (const view of orchestrator.snapshot()) {
       const sc = orchestrator.screencastFor(view.profile.id);
       if (!sc?.lastFrame) continue;
-      if (now - (lastSentByProfile.get(view.profile.id) ?? 0) >= 2500) {
-        sendFrame(view.profile.id, sc.lastFrame);
-      }
+      // Only re-send if we haven't sent recently (screencast already handles rate)
     }
   }, 3000);
 
@@ -326,7 +290,7 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
   orchestrator.on("update", (state) => {
     const payload = `event: state\ndata: ${JSON.stringify(state)}\n\n`;
     for (const client of sseClients) {
-      if (!client.writableEnded && !client.writableNeedDrain) client.write(payload);
+      if (!client.writableEnded) client.write(payload);
     }
   });
 
@@ -378,22 +342,6 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
 
     if (path === "/api/devices" && method === "GET") {
       sendJson(res, 200, { catalog: thisCatalog() });
-      return;
-    }
-
-    if (path === "/api/bitbrowser/status" && method === "GET") {
-      sendJson(res, 200, await orchestrator.bitBrowserStatus());
-      return;
-    }
-
-    if (path === "/api/bitbrowser/profiles" && method === "GET") {
-      const page = Math.max(0, Number(url.searchParams.get("page") ?? 0) || 0);
-      const pageSize = Math.min(100, Math.max(1, Number(url.searchParams.get("pageSize") ?? 50) || 50));
-      try {
-        sendJson(res, 200, await orchestrator.listBitBrowserProfiles(page, pageSize));
-      } catch (err) {
-        throw new HttpError(502, err instanceof Error ? err.message : String(err));
-      }
       return;
     }
 
@@ -462,7 +410,6 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
           : {}),
         ...(typeof body.headed === "boolean" ? { headed: body.headed } : {}),
         ...(() => { const d = readDevice(body); return d === undefined ? {} : { device: d }; })(),
-        ...engineFields(body),
       });
       sendJson(res, 201, profile);
       return;
@@ -495,15 +442,7 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
           ? (body.atcMinutes as number | null)
           : undefined;
       const device = readDevice(body);
-      const browserProvider = readProvider(body);
-      const result = orchestrator.bulkCreateProfiles({
-        sites,
-        proxies,
-        durationMinutes,
-        atcMinutes,
-        device,
-        ...(browserProvider !== undefined ? { browserProvider } : {}),
-      });
+      const result = orchestrator.bulkCreateProfiles({ sites, proxies, durationMinutes, atcMinutes, device });
       sendJson(res, 201, result);
       return;
     }
@@ -549,7 +488,6 @@ export function createDashboardServer(orchestrator: Orchestrator, token?: string
               : {}),
             ...(typeof body.notes === "string" ? { notes: body.notes } : {}),
             ...(() => { const d = readDevice(body); return d === undefined ? {} : { device: d }; })(),
-            ...engineFields(body),
           }),
         );
         return;

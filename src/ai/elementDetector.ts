@@ -2,7 +2,7 @@
  * AI Element Detector with product link caching.
  */
 import type { CookiePool, CookieEntry } from "./cookiePool.js";
-import { ClaudeClient, ClaudeAuthError, ClaudeRateLimitError, ClaudePayloadError, type ClaudeResponse } from "./claudeClient.js";
+import { ClaudeClient, ClaudeAuthError, ClaudeRateLimitError, type ClaudeResponse } from "./claudeClient.js";
 import { buildDetectionPrompt, preprocessHtml } from "./promptTemplates.js";
 import { localDetect, sanitizeProductPath, hasProductSlug } from "./localFallback.js";
 import type { Logger } from "../logging/logger.js";
@@ -38,7 +38,7 @@ const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
  * /collections/<h>/products/<h>) always pass — a /collections/ prefix does
  * not make it a listing page. */
 const NON_PRODUCT =
-  /(\/blogs?\/)|(\/pages\/)|(\/policies\/)|(\/search)|(\/account)|(\/checkout)|(^\/cart$)|(\/apps\/)|(\/tools\/)|(gift[-_]?card|gift[-_]?certificate|e[-_]?gift)|(\.(png|jpe?g|gif|svg|webp|css|js|ico|pdf)$)/i;
+  /(\/blogs?\/)|(\/pages\/)|(\/policies\/)|(\/search)|(\/account)|(\/checkout)|(^\/cart$)|(\/apps\/)|(\/tools\/)|(\.(png|jpe?g|gif|svg|webp|css|js|ico|pdf)$)/i;
 
 function plausiblyNavigable(url: string): boolean {
   if (!url || url.length < 2 || url === "/") return false;
@@ -60,8 +60,6 @@ export class ElementDetector {
   private readonly logger: Logger;
   private readonly maxRetries: number;
   private readonly maxHtmlChars: number;
-  private readonly detectionCooldownMs: number;
-  private lastCallAt = 0;
   private readonly model?: string;
   private excludeSet = new Set<string>();
   /** Product cache keyed by domain+pathname, TTL-based */
@@ -69,12 +67,11 @@ export class ElementDetector {
   /** In-flight background analyses keyed like the cache — prefetch dedupe. */
   private pending = new Map<string, Promise<PageDetectionResult>>();
 
-  constructor(pool: CookiePool, logger: Logger, options: { maxRetries?: number; maxHtmlChars?: number; detectionCooldownMs?: number; model?: string; baseUrl?: string; client?: ClaudeClient } = {}) {
+  constructor(pool: CookiePool, logger: Logger, options: { maxRetries?: number; maxHtmlChars?: number; model?: string; baseUrl?: string; client?: ClaudeClient } = {}) {
     this.pool = pool;
     this.logger = logger;
     this.maxRetries = options.maxRetries ?? 3;
     this.maxHtmlChars = options.maxHtmlChars ?? 60000;
-    this.detectionCooldownMs = options.detectionCooldownMs ?? 0;
     this.model = options.model ?? DEFAULT_CLAUDE_MODEL;
     this.client = options.client ?? new ClaudeClient(options.baseUrl);
   }
@@ -95,7 +92,7 @@ export class ElementDetector {
     const key = this.cacheKey(url);
     if (this.pending.has(key)) return;
     const entry = this.cache.get(key);
-    if (!options.skipCache && entry && entry.products.length > 0 && Date.now() - entry.timestamp < CACHE_TTL_MS) return;
+    if (!options.skipCache && entry && Date.now() - entry.timestamp < CACHE_TTL_MS) return;
 
     const startedAt = Date.now();
     const task = this.runDetection(url, htmlSource, options)
@@ -121,7 +118,7 @@ export class ElementDetector {
     // Check cache first (only for discover/interact)
     if (!options.skipCache && intent !== "add_to_cart") {
       const entry = this.cache.get(key);
-      if (entry && entry.products.length > 0 && Date.now() - entry.timestamp < CACHE_TTL_MS) {
+      if (entry && Date.now() - entry.timestamp < CACHE_TTL_MS) {
         this.logger.debug("cache_hit", "Using cached products for " + key.slice(0, 60));
         return { url, products: entry.products, addToCart: entry.addToCart, ...(entry.plan ? { plan: entry.plan } : {}), accountSource: "cache", elapsedMs: 0, cached: true };
       }
@@ -151,17 +148,9 @@ export class ElementDetector {
     // One bounded payload for both the prompt and any local fallback.
     const digest = preprocessHtml(htmlSource, this.maxHtmlChars);
 
-    // No healthy cookies: skip the AI entirely and classify locally, caching the result so
-    // subsequent turns on the same URL resolve in 0ms without re-triggering prefetch.
+    // No healthy cookies: skip the AI entirely and classify locally.
     if (!this.pool.hasCookies()) {
       const local = localDetect(digest);
-      if (!options.skipCache && local.products.length > 0) {
-        this.cache.set(key, {
-          products: local.products,
-          addToCart: local.addToCart,
-          timestamp: Date.now(),
-        });
-      }
       this.logger.debug("local_detect", "no cookies - local classification products=" + local.products.length, { url });
       return { url, products: local.products, addToCart: local.addToCart, accountSource: "local", elapsedMs: 0, cached: false };
     }
@@ -174,20 +163,9 @@ export class ElementDetector {
       const cookie = this.pool.getNext(this.excludeSet);
       if (!cookie) break;
 
-      if (this.detectionCooldownMs > 0) {
-        const sinceLast = Date.now() - this.lastCallAt;
-        if (sinceLast < this.detectionCooldownMs) {
-          await new Promise<void>((r) => setTimeout(r, this.detectionCooldownMs - sinceLast));
-        }
-      }
-      this.lastCallAt = Date.now();
-
       this.pool.beginRequest(cookie.source);
       try {
-        const response = await this.client.send(prompt, cookie, {
-          model: this.model,
-          enableBuiltinTools: false,
-        });
+        const response = await this.client.send(prompt, cookie, { model: this.model });
         const result = this.parseResponse(response, url, digest);
         this.pool.markSuccess(cookie.source);
         
@@ -205,10 +183,6 @@ export class ElementDetector {
         return { ...result, cached: false };
       } catch (err) {
         lastError = err as Error;
-        if (err instanceof ClaudePayloadError && err.classification === "provider_payload") {
-          // Permanent payload rejection — do not burn other cookies retrying the same prompt
-          break;
-        }
         this.pool.markFailure(cookie.source);
         if (err instanceof ClaudeAuthError) {
           this.pool.markInvalid(cookie.source, "auth_failed");
@@ -219,10 +193,6 @@ export class ElementDetector {
           this.excludeSet.add(cookie.source);
         } else {
           this.excludeSet.add(cookie.source);
-        }
-        if (attempt + 1 < this.maxRetries) {
-          const backoffMs = Math.min(2000, 150 * Math.pow(2, attempt) + Math.floor(Math.random() * 100));
-          await new Promise<void>((r) => setTimeout(r, backoffMs));
         }
       } finally {
         this.pool.endRequest(cookie.source);
@@ -250,10 +220,10 @@ export class ElementDetector {
     // plan below is the payload we came for.
     const products: DetectedProduct[] = Array.isArray(data.products)
       ? (data.products
-        .filter((p: any) => p && typeof p === "object" && p.is_sold_out !== true)
+        .filter((p: any) => p && typeof p === "object")
         .map((p: any) => ({
-          selector: String(p.selector ?? p.card_selector ?? ""),
-          text: String(p.text ?? p.title ?? ""),
+          selector: String(p.selector ?? ""),
+          text: String(p.text ?? ""),
           url: sanitizeProductPath(String(p.url ?? "").split("?")[0] ?? ""),
         }))
         .filter((p: DetectedProduct) => plausiblyNavigable(p.url)))
@@ -262,17 +232,10 @@ export class ElementDetector {
     const seen = new Set<string>();
     const unique = products.filter(p => { if (seen.has(p.url)) return false; seen.add(p.url); return true; });
 
-    const aiAtcValid =
-      data.add_to_cart &&
-      typeof data.add_to_cart === "object" &&
-      Boolean(data.add_to_cart.selector) &&
-      data.add_to_cart.is_enabled !== false;
-    const atc = aiAtcValid
+    const localAtc = localDetect(digest).addToCart;
+    const atc = (data.add_to_cart && typeof data.add_to_cart === "object" && data.add_to_cart.selector)
       ? { selector: String(data.add_to_cart.selector ?? ""), text: String(data.add_to_cart.text ?? "") }
-      : (() => {
-          const localAtc = localDetect(digest).addToCart;
-          return localAtc ? { selector: localAtc.selector, text: localAtc.text } : null;
-        })();
+      : (localAtc ? { selector: localAtc.selector, text: localAtc.text } : null);
 
     const isSoldOut = data.is_sold_out === true;
     const formSelector = typeof data.form_selector === "string" && data.form_selector.trim()

@@ -20,7 +20,6 @@ import type { ParsedCookieFile, StoredCookie } from "./cookies.js";
 import { buildProfileCookies, cookieDomains } from "./cookies.js";
 import { validateProxy } from "./proxy.js";
 import { resolveGeoFromFilename } from "./geo.js";
-import { isRestrictedStorefrontUrl } from "../config.js";
 
 /** Viewports a new profile can be assigned. */
 const VIEWPORT_POOL: ReadonlyArray<{ width: number; height: number }> = [
@@ -47,17 +46,8 @@ export interface CreateProfileInput {
   headed?: boolean;
   /** Mobile/desktop device emulation. Omitted/null = desktop. */
   device?: import("./types.js").ProfileDevice | null;
-  /** Browser kernel; omitted/null = follow config.browser.provider. */
-  browserProvider?: BrowserProviderInput;
-  /** Existing BitBrowser profile to drive; omitted/empty = auto-create on first launch. */
-  bitBrowserId?: string | null;
   notes?: string;
 }
-
-export type BrowserProviderInput = "builtin" | "bitbrowser" | null;
-
-/** BitBrowser profile ids are opaque hex/uuid-ish tokens; anything else is a paste error. */
-const BITBROWSER_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
 
 /** Fields the dashboard is allowed to edit on an existing profile. */
 export interface UpdateProfileInput {
@@ -73,10 +63,6 @@ export interface UpdateProfileInput {
   storefront?: string | null;
   /** Mobile/desktop device emulation. null clears to desktop. */
   device?: import("./types.js").ProfileDevice | null;
-  /** null clears back to config.browser.provider. */
-  browserProvider?: BrowserProviderInput;
-  /** null/empty unlinks; a value links an operator-owned BitBrowser profile. */
-  bitBrowserId?: string | null;
   notes?: string;
 }
 
@@ -198,21 +184,11 @@ export class ProfileStore {
     // Reuse the update-path validation so a created-with-storefront profile
     // is normalised (scheme added, trailing slash dropped) exactly the same
     // way an edited one is.
-    const patch: UpdateProfileInput = {
-      ...(input.storefront !== undefined && input.storefront !== null ? { storefront: input.storefront } : {}),
-      ...(input.atcMinutes !== undefined && input.atcMinutes !== null ? { atcMinutes: input.atcMinutes } : {}),
-      ...(input.browserProvider !== undefined ? { browserProvider: input.browserProvider } : {}),
-      ...(input.bitBrowserId !== undefined ? { bitBrowserId: input.bitBrowserId } : {}),
-    };
-    if (Object.keys(patch).length > 0) {
-      try {
-        this.update(profile.id, patch);
-      } catch (err) {
-        // A rejected field must not leave a half-created profile in the list.
-        this.data.profiles = this.data.profiles.filter((p) => p.id !== profile.id);
-        this.write();
-        throw err;
-      }
+    if (input.storefront !== undefined && input.storefront !== null) {
+      this.update(profile.id, { storefront: input.storefront });
+    }
+    if (input.atcMinutes !== undefined && input.atcMinutes !== null) {
+      this.update(profile.id, { atcMinutes: input.atcMinutes });
     }
 
     this.write();
@@ -273,33 +249,6 @@ export class ProfileStore {
     }
     if (patch.headed !== undefined) profile.headed = patch.headed;
 
-    if (patch.browserProvider !== undefined) {
-      if (patch.browserProvider === null) delete profile.browserProvider;
-      else if (patch.browserProvider === "builtin" || patch.browserProvider === "bitbrowser") {
-        profile.browserProvider = patch.browserProvider;
-      } else {
-        throw new Error(`Invalid browser provider: ${String(patch.browserProvider)} (expected builtin or bitbrowser)`);
-      }
-    }
-
-    if (patch.bitBrowserId !== undefined) {
-      const next = typeof patch.bitBrowserId === "string" ? patch.bitBrowserId.trim() : "";
-      if (next && !BITBROWSER_ID_PATTERN.test(next)) {
-        throw new Error(`Invalid BitBrowser profile ID: "${next}"`);
-      }
-      if (next !== (profile.bitBrowserId ?? "")) {
-        if (next) {
-          // Pasted by the operator: theirs to keep, so never deleted with this profile.
-          profile.bitBrowserId = next;
-          profile.bitBrowserManaged = false;
-        } else {
-          delete profile.bitBrowserId;
-          delete profile.bitBrowserManaged;
-        }
-        delete profile.bitBrowserProxySig;
-      }
-    }
-
     if (patch.storefront !== undefined) {
       const url = typeof patch.storefront === "string" ? patch.storefront.trim() : "";
       if (!url) {
@@ -314,10 +263,6 @@ export class ProfileStore {
         }
         if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
           throw new Error(`Storefront must be an http(s) URL: ${url}`);
-        }
-        const ssrfCheck = isRestrictedStorefrontUrl(parsed.toString());
-        if (ssrfCheck.restricted) {
-          throw new Error(`Invalid storefront URL: ${ssrfCheck.reason}`);
         }
         // Normalised without trailing slash, matching how the global
         // storefront is stored.
@@ -393,33 +338,6 @@ export class ProfileStore {
   clearCookies(id: string): Profile {
     const profile = this.require(id);
     delete profile.cookies;
-    this.write();
-    return profile;
-  }
-
-  /**
-   * Remember which BitBrowser profile backs this one, after a launch created
-   * or re-synced it. Undefined when the profile was deleted mid-launch.
-   */
-  recordBitBrowserLink(
-    id: string,
-    link: { bitBrowserId: string; managed: boolean; proxySig?: string },
-  ): Profile | undefined {
-    const profile = this.get(id);
-    if (!profile) return undefined;
-    profile.bitBrowserId = link.bitBrowserId;
-    profile.bitBrowserManaged = link.managed;
-    if (link.proxySig) profile.bitBrowserProxySig = link.proxySig;
-    else delete profile.bitBrowserProxySig;
-    this.write();
-    return profile;
-  }
-
-  setPendingCookieWrite(id: string, pending: boolean): Profile | undefined {
-    const profile = this.get(id);
-    if (!profile) return undefined;
-    if (pending) profile.pendingCookieWrite = true;
-    else delete profile.pendingCookieWrite;
     this.write();
     return profile;
   }

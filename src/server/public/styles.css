@@ -854,22 +854,6 @@ main { padding: 16px 18px 24px; }
 }
 .device-model:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
 
-/* Browser engine picker (Built-in Chromium / BitBrowser). */
-.engine-select {
-  width: 100%;
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  padding: 8px 10px;
-  color: var(--text);
-  font: inherit; font-size: 12px;
-}
-.engine-select:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
-.field[data-bit-only][hidden] { display: none; }
-.badge--bit { border-color: rgba(167,139,250,.45); color: #c4b5fd; background: rgba(167,139,250,.1); }
-#bitbrowser-badge[data-tone="ok"]  { background: rgba(167,139,250,.15); color: #c4b5fd; border: 1px solid rgba(167,139,250,.35); }
-#bitbrowser-badge[data-tone="bad"] { background: rgba(248,113,113,.12); color: #fca5a5; border: 1px solid rgba(248,113,113,.3); }
-
 /* Desktop icon is dimmed copper to match a laptop; phones give a little glow. */
 .device-chip[data-kind="iphone"].is-on, .device-chip[data-kind="android"].is-on { background: var(--glow-accent); }
 

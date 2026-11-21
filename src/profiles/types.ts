@@ -138,22 +138,6 @@ export interface Profile {
   atcMinutes?: number | null;
   /** Mobile/desktop device emulation. Undefined = desktop (default). */
   device?: ProfileDevice;
-  /** Browser kernel for this profile. Undefined = follow config.browser.provider. */
-  browserProvider?: "builtin" | "bitbrowser";
-  /** The profile's id inside the BitBrowser app (provider "bitbrowser"). */
-  bitBrowserId?: string;
-  /**
-   * SiteViewer created the BitBrowser profile itself, so it is deleted along
-   * with this one. An id the operator pasted in is only ever unlinked.
-   */
-  bitBrowserManaged?: boolean;
-  /** Hash of the proxy last pushed to the BitBrowser profile; a change triggers a re-sync. */
-  bitBrowserProxySig?: string;
-  /**
-   * An imported jar has not been hard-written into the browser yet. Set when
-   * cookies arrive while no BitBrowser window is open; cleared on next launch.
-   */
-  pendingCookieWrite?: boolean;
   notes?: string;
   stats: ProfileStats;
 }

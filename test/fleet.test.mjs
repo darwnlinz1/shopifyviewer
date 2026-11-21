@@ -54,7 +54,7 @@ after(async () => {
   await orchestrator?.shutdown().catch(() => undefined);
   await dashboard?.close().catch(() => undefined);
   shop && (await shop.close());
-  workDir && rmSync(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+  workDir && rmSync(workDir, { recursive: true, force: true });
 });
 
 /**
@@ -81,12 +81,8 @@ async function runFleet(count) {
       navigationTimeoutMs: 15_000,
     },
     logging: { dir: join(workDir, "logs"), console: false, jsonl: false },
-    ai: { cookiesDir: join(workDir, "cookies") },
-    behavior: { ...loadConfig().behavior, pageEngagementMs: { min: 2_000, max: 3_000 } },
   });
 
-  if (orchestrator) await orchestrator.shutdown().catch(() => undefined);
-  if (dashboard) await dashboard.close().catch(() => undefined);
   orchestrator = new Orchestrator(config);
   dashboard = await startDashboard(orchestrator, 0, "127.0.0.1");
 
@@ -177,9 +173,7 @@ test("10 concurrent profiles browse, stream, and close cleanly", { skip }, async
     fleet.eventLoopLagMs < 1_000,
     `event loop stalled ${fleet.eventLoopLagMs}ms under 10 streams`,
   );
-  // Ten Chromium processes writing their profile stores on the way out; on a
-  // machine already running other browsers this lands just past 30s.
-  assert.ok(fleet.closeWallMs < 45_000, `closing 10 browsers took ${fleet.closeWallMs}ms`);
+  assert.ok(fleet.closeWallMs < 30_000, `closing 10 browsers took ${fleet.closeWallMs}ms`);
 });
 
 test("20 concurrent profiles still hold together", { skip }, async () => {

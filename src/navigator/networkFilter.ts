@@ -29,19 +29,21 @@ export const BLOCKED_PATTERNS: readonly string[] = [
   "*.avi*",
   "*.mkv*",
   "*.mov*",
+  "*.woff2*",
+  "*.woff*",
+  "*.ttf*",
+  "*.eot*",
+  "*.gif*",
   "*.mp3*",
   "*.ogg*",
 ];
 
 export async function setupNetworkFilter(page: Page): Promise<void> {
   if (page.isClosed()) return;
-  if ((page as any).__networkFilterAttached) return;
-  (page as any).__networkFilterAttached = true;
   try {
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("Network.enable").catch(() => {});
     await cdp.send("Network.setBlockedURLs", { urls: [...BLOCKED_PATTERNS] }).catch(() => {});
-    await cdp.detach().catch(() => {});
   } catch {
     // If CDP session cannot be attached, proceed gracefully
   }

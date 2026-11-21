@@ -1240,7 +1240,7 @@ export class PageNavigator {
       await el.scrollIntoViewIfNeeded({ timeout: 3_000 }).catch(() => undefined);
       await sleep(this.rng.int(200, 500));
       try {
-        const box = await el.boundingBox({ timeout: 2_000 });
+        const box = await el.boundingBox();
         if (!box) continue;
         const startX = box.x + this.rng.int(4, Math.min(20, Math.floor(box.width * 0.15)));
         const startY = box.y + this.rng.int(2, Math.min(12, Math.floor(box.height * 0.2)));
@@ -1352,9 +1352,7 @@ function round(value: number | null | undefined): number | null {
 
 /** Open the working page for a session, reusing the profile's initial tab. */
 export async function openSessionPage(context: BrowserContext): Promise<Page> {
-  // The BitBrowser console tab must stay open (closing it kills the window)
-  // and must not be the tab the visit drives.
-  const existing = context.pages().find((p) => !/console\.bitbrowser\.net/i.test(p.url()));
+  const existing = context.pages()[0];
   const page = existing ?? (await context.newPage());
   return page;
 }

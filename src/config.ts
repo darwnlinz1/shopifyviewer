@@ -14,40 +14,9 @@ export interface Range {
   max: number;
 }
 
-/**
- * Which browser kernel drives a session.
- *
- *   builtin     the local Chrome/Edge/Ungoogled-Chromium, fingerprint shaped by
- *               our own init scripts
- *   bitbrowser  a BitBrowser profile opened through its Local API; the C++
- *               kernel owns the fingerprint and no JS patches are injected
- */
-export type BrowserProvider = "builtin" | "bitbrowser";
-
-export interface BitBrowserConfig {
-  /** BitBrowser Local API base URL (Settings → Local API). */
-  apiUrl: string;
-  /** Chromium kernel for profiles SiteViewer creates. */
-  coreVersion?: string;
-  /** Group new profiles are filed under; required when signed in as a sub-account. */
-  groupId?: string;
-  /** Create a BitBrowser profile on first launch when a profile has no bitBrowserId. */
-  autoCreateProfile?: boolean;
-  /** Local API token, only when "Authentication Control" is on (sent as x-api-key). */
-  apiKey?: string;
-  /** Minimum gap between two Local API calls; the app rejects bursts. */
-  minRequestIntervalMs?: number;
-  /** Existing BitBrowser profile IDs for CLI runs (slot N uses profileIds[N % length]). */
-  profileIds?: string[];
-}
-
 export interface BrowserConfig {
   /** Run Chromium headless. Headed is closer to a real browsing session. */
   headless: boolean;
-  /** Default kernel for profiles that do not pick one themselves. */
-  provider?: BrowserProvider;
-  /** BitBrowser Local API settings, used by provider "bitbrowser". */
-  bitbrowser?: BitBrowserConfig;
   /** Directory holding one persistent Chromium profile per session slot. */
   profileDir: string;
   /**
@@ -174,40 +143,7 @@ export interface BehaviorConfig {
    * than editing six ranges and hoping they stay in proportion.
    */
   speedFactor: number;
-  /** Pre-checkout choreography timing; see src/behavior/choreography.ts. */
-  choreography?: ChoreographyConfig;
 }
-
-/**
- * Timing of the pre-checkout visit, scaled to the add-to-cart mark.
- *
- * The visit before the mark is split into discovery (first 20%), product
- * comparison (only when the mark leaves room for it) and a deep look at the
- * product that gets bought (last 45%, capped).
- */
-export interface ChoreographyConfig {
-  /** Open A → back → open B only when the ATC mark is at least this far in. */
-  compareMinAtcMs: number;
-  /** Ceiling on the deep product-page phase before the ATC mark. */
-  deepPhaseMaxMs: number;
-  /** Variant exploration starts this long before the ATC mark. */
-  exploreVariantsLeadMs: Range;
-  /** Dwell on each gallery image while flipping through media. */
-  mediaDwellMs: Range;
-  /** Time spent reviewing the cart after a verified add-to-cart. */
-  inspectCartMs: Range;
-  /** With every target ATC done, park on the cart this long before the end. */
-  checkoutReadyLeadMs: number;
-}
-
-export const DEFAULT_CHOREOGRAPHY: ChoreographyConfig = {
-  compareMinAtcMs: 120_000,
-  deepPhaseMaxMs: 180_000,
-  exploreVariantsLeadMs: { min: 15_000, max: 40_000 },
-  mediaDwellMs: { min: 800, max: 2_200 },
-  inspectCartMs: { min: 5_000, max: 12_000 },
-  checkoutReadyLeadMs: 20_000,
-};
 
 export interface SafetyConfig {
   /**
@@ -249,7 +185,6 @@ export interface SimulatorConfig {
   behavior: BehaviorConfig;
   safety: SafetyConfig;
   logging: LoggingConfig;
-  ai?: AiConfig;
 }
 
 export const DEFAULT_CONFIG: SimulatorConfig = {
@@ -259,13 +194,6 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
   seedCollections: ["/collections/all"],
   browser: {
     headless: true,
-    provider: "builtin",
-    bitbrowser: {
-      apiUrl: "http://127.0.0.1:54345",
-      coreVersion: "136",
-      autoCreateProfile: true,
-      minRequestIntervalMs: 350,
-    },
     profileDir: "./tempprofolio",
     persistProfiles: true,
     proxies: [],
@@ -332,7 +260,6 @@ export const DEFAULT_CONFIG: SimulatorConfig = {
       */
     maxActionsPerPage: 8,
     speedFactor: 1,
-    choreography: DEFAULT_CHOREOGRAPHY,
   },
   safety: {
     allowedHosts: [],
@@ -370,29 +297,6 @@ function merge<T>(base: T, patch: unknown): T {
   return out as T;
 }
 
-/** Reject cloud metadata endpoints and invalid 0.0.0.0 targets (SSRF guard). */
-export function isRestrictedStorefrontUrl(rawUrl: string): { restricted: boolean; reason?: string } {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    return { restricted: true, reason: "Invalid URL" };
-  }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (
-    host === "169.254.169.254" ||
-    host === "metadata.google.internal" ||
-    host === "metadata.goog" ||
-    host === "100.100.100.200" ||
-    host === "0.0.0.0" ||
-    host.startsWith("169.254.") ||
-    host.startsWith("fe80:")
-  ) {
-    return { restricted: true, reason: `Restricted internal/metadata host "${host}" is not allowed` };
-  }
-  return { restricted: false };
-}
-
 /** Normalise the storefront URL and derive the host allowlist when unset. */
 function finalise(config: SimulatorConfig): SimulatorConfig {
   const storefront = config.storefront.trim().replace(/\/+$/, "");
@@ -409,10 +313,6 @@ function finalise(config: SimulatorConfig): SimulatorConfig {
     throw new Error(
       `Invalid storefront URL: ${config.storefront}. Expected e.g. https://example.com`,
     );
-  }
-  const check = isRestrictedStorefrontUrl(storefront);
-  if (check.restricted) {
-    throw new Error(`Invalid storefront URL: ${check.reason}`);
   }
   const allowedHosts =
     config.safety.allowedHosts.length > 0
@@ -484,10 +384,6 @@ export interface AiConfig {
   maxRetries: number;
   advanceActionTimeMs: number;
   detectionCooldownMs: number;
-  /** Tier 0 selector memory, keyed by hostname + page type. */
-  recipeCachePath?: string;
-  /** Tier 1 buy-box confidence below which the AI tier is consulted. */
-  tier1ConfidenceThreshold?: number;
 }
 
 export const DEFAULT_AI_CONFIG: AiConfig = {
@@ -497,8 +393,6 @@ export const DEFAULT_AI_CONFIG: AiConfig = {
   maxRetries: 3,
   advanceActionTimeMs: 6 * 60 * 1000,  // 6 minutes (base ATC mark)
   detectionCooldownMs: 500,               // 500ms between AI calls
-  recipeCachePath: "./data/domain-recipes.json",
-  tier1ConfidenceThreshold: 0.8,
 };
 
 /** Extended config with AI layer support. */

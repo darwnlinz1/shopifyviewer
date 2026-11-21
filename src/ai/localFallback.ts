@@ -13,7 +13,7 @@ import type { DetectedProduct, DetectedAddToCart } from "./elementDetector.js";
 
 /** Routes that are never products even when a card-like context wraps them. */
 const NEVER_PRODUCT =
-  /(\.(png|jpe?g|gif|svg|webp|css|js|ico|pdf)$)|(^(mailto:|tel:|javascript:))|(gift[-_]?card|gift[-_]?certificate|e[-_]?gift)|(\/(cookie[-_]?consent|privacy|terms|account|login|search|wishlist)\/?$)/i;
+  /(\.(png|jpe?g|gif|svg|webp|css|js|ico|pdf)$)|(^(mailto:|tel:|javascript:))/i;
 
 /**
  * Markup leakage cut. Product handles are plain slugs; a space, pipe, quote
@@ -31,7 +31,6 @@ export function sanitizeProductPath(path: string): string {
 const PRODUCT_TAIL = /\/products?\/([^/?#]+)\/?$/;
 
 export function hasProductSlug(path: string): boolean {
-  if (NEVER_PRODUCT.test(path)) return false;
   const m = PRODUCT_TAIL.exec(path);
   return !!m && /^[a-z0-9._~-]+$/i.test(m[1] ?? "");
 }
@@ -72,13 +71,9 @@ export function localDetect(digest: string): LocalDetection {
     if (section !== "links") continue;
 
     const fields = line.split(" | ");
-    const rawHref = fields[0] ?? "";
-    const path = sanitizeProductPath((rawHref.split("?")[0] ?? ""));
-    const sfccTile = (/\.html\/?$/i.test(path) && (/product[-_ ]?tile|product-name/i.test(line) || /\d{6,}\.html$/i.test(path))) && !NEVER_PRODUCT.test(path);
-    const pid = /(?:\?|&)pid=([^&\s|]+)/i.exec(rawHref);
-    const productUrl = pid ? rawHref.split(" ")[0] : path;
-    if ((!looksLikeProductPath(path) && !sfccTile && !pid) || products.has(productUrl)) continue;
-    products.set(productUrl, { selector: "", url: productUrl, text: (fields[1] ?? "").trim() });
+    const path = sanitizeProductPath(((fields[0] ?? "").split("?")[0] ?? ""));
+    if (!looksLikeProductPath(path) || products.has(path)) continue;
+    products.set(path, { selector: "", url: path, text: (fields[1] ?? "").trim() });
   }
 
   return { products: [...products.values()], addToCart: findAddToCart(digest) };

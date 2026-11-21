@@ -49,44 +49,27 @@ export class Screencast {
 
   constructor(private readonly page: Page) {}
 
-  /**
-   * Mark the feed ready. Built-in Chromium captures one frame immediately so
-   * the dashboard tile is live. BitBrowser must pass `{ eager: false }`:
-   * Page.startScreencast on an unwatched kernel window closes the browser
-   * during the first navigation.
-   */
-  async start(opts?: { eager?: boolean }): Promise<void> {
+  /** Attach to the page and begin streaming at thumbnail quality. */
+  async start(): Promise<void> {
     if (this.started || this.closed) return;
     this.started = true;
-    this.navListener = (frame: any) => {
-      if (frame === this.page.mainFrame() && !this.closed && this.listeners.size > 0) {
-        void this.restart();
-      }
-    };
-    this.page.on("framenavigated", this.navListener);
-    if (opts?.eager !== false || this.listeners.size > 0) await this.applyMode();
-  }
 
-  private async ensureCdp(): Promise<boolean> {
-    if (this.cdp || this.closed) return !!this.cdp;
-    let attachTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       this.cdp = await Promise.race([
         this.page.context().newCDPSession(this.page),
-        new Promise<never>((_, reject) => {
-          attachTimer = setTimeout(() => reject(new Error("screencast attach timed out")), 10_000);
-        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("screencast attach timed out")), 10_000),
+        ),
       ]);
     } catch {
       this.cdp = null;
-      return false;
-    } finally {
-      if (attachTimer) clearTimeout(attachTimer);
+      return;
     }
+
     this.cdp.on("Page.screencastFrame", (event: any) => {
       const { data, sessionId } = event as { data: string; sessionId: number };
-      this.cdp?.send("Page.screencastFrameAck", { sessionId }).catch(() => undefined);
       this.latest = Buffer.from(data, "base64");
+
       for (const listener of this.listeners) {
         try {
           listener(this.latest);
@@ -94,15 +77,20 @@ export class Screencast {
           // A broken pipe on one viewer must not stop the others.
         }
       }
-      if (this.listeners.size === 0) {
-        this.cdp?.send("Page.stopScreencast").catch(() => undefined);
-      }
+
+      this.cdp?.send("Page.screencastFrameAck", { sessionId }).catch(() => undefined);
     });
-    return true;
+
+    this.navListener = (frame: any) => {
+      if (frame === this.page.mainFrame() && this.listeners.size > 0) {
+        void this.restart();
+      }
+    };
+    this.page.on("framenavigated", this.navListener);
   }
 
   private async applyMode(): Promise<void> {
-    if (this.closed || !(await this.ensureCdp()) || !this.cdp) return;
+    if (!this.cdp || this.closed) return;
     const settings = MODES[this.mode];
     await this.cdp
       .send("Page.startScreencast", {
@@ -160,7 +148,7 @@ export class Screencast {
         if (this.fullViewers === 0) void this.setMode("thumb");
       }
       if (this.listeners.size === 0) {
-        // Stop C++ JPEG encoding in Chromium to drop CPU to 0% when unwatched
+        // Stop C++ JPEG encoding in Chromium to drop CPU to 0%
         this.cdp?.send("Page.stopScreencast").catch(() => undefined);
       }
     };

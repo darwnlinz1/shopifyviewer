@@ -10,12 +10,35 @@
 import type { BrowserContext, Page, CDPSession } from "rebrowser-playwright";
 import os from "node:os";
 
-// ── 1. Non-Destructive Clean-Realm Stylesheet ──
-// Preserves CSS transitions (so SPA cart drawers/modals fire transitionend),
-// preserves web font metrics (offsetWidth/measureText), and emits zero branded DOM IDs.
+// ── 1. Universal Ultra-Low-CPU Stylesheet ──
 export const ULTRA_LOW_CPU_CSS = `
-video[autoplay], svg animate, svg animateTransform, svg animateMotion {
-  animation-play-state: paused;
+*, *::before, *::after {
+  -webkit-animation: none !important;
+  animation: none !important;
+  animation-duration: 0s !important;
+  animation-iteration-count: 1 !important;
+  animation-play-state: paused !important;
+
+  -webkit-transition: none !important;
+  transition: none !important;
+  transition-duration: 0s !important;
+
+  scroll-behavior: auto !important;
+  filter: none !important;
+  -webkit-filter: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+video, audio, svg animate, svg animateTransform, svg animateMotion {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+*, *::before, *::after, input, button, select, textarea {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
 }
 `;
 
@@ -86,9 +109,16 @@ export const RUNTIME_CPU_INIT_SCRIPT = `(() => {
   };
 })();`;
 
-// ── 3. High-Efficiency Blocked Patterns (Heavy Videos & 3rd-Party Ad/Heatmap Trackers Only) ──
-// Webfonts (.woff2/.ttf) are intentionally NOT blocked so icon fonts and font-metrics probes remain 100% authentic.
+// ── 3. High-Efficiency Blocked Patterns (Fonts, Videos, Gifs, Heavy Trackers) ──
 export const RUNTIME_BLOCKED_PATTERNS: readonly string[] = [
+  "*.woff*",
+  "*.woff2*",
+  "*.ttf*",
+  "*.otf*",
+  "*.eot*",
+  "*fonts.googleapis.com*",
+  "*fonts.gstatic.com*",
+  "*use.typekit.net*",
   "*.mp4*",
   "*.webm*",
   "*.ogg*",
@@ -97,6 +127,8 @@ export const RUNTIME_BLOCKED_PATTERNS: readonly string[] = [
   "*.m4v*",
   "*.mov*",
   "*.avi*",
+  "*.gif*",
+  "*.lottie*",
   "*.glb*",
   "*.gltf*",
   "*connect.facebook.net*",
@@ -125,25 +157,24 @@ export function setWindowsProcessEcoPriority(pid: number): void {
   }
 }
 
-/** Applies clean-realm network tracker filtering and active focus/visibility emulation to context and all pages */
+/** Applies multi-layered CPU optimizations to context and all pages */
 export async function applyRuntimeCpuOptimizations(context: BrowserContext): Promise<void> {
   const setupPage = async (page: Page) => {
     if (page.isClosed()) return;
-    if (!(page as any).__networkFilterAttached) {
-      (page as any).__networkFilterAttached = true;
-      try {
-        const cdp = await context.newCDPSession(page);
-        await cdp.send("Network.enable").catch(() => {});
-        await cdp.send("Network.setBlockedURLs", {
-          urls: [...RUNTIME_BLOCKED_PATTERNS],
-        }).catch(() => {});
-        // Maintain active focus and visible page lifecycle state even when running in background/headless
-        await cdp.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
-        await cdp.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
-        // Detach temporary CDP session to keep IPC channels clear and avoid stalling context.close()
-        await cdp.detach().catch(() => {});
-      } catch {}
-    }
+    try {
+      const cdp = await context.newCDPSession(page);
+      await cdp.send("Network.enable").catch(() => {});
+      await cdp.send("Network.setBlockedURLs", {
+        urls: [...RUNTIME_BLOCKED_PATTERNS],
+      }).catch(() => {});
+      // Detach temporary CDP session to keep IPC channels clear
+      await cdp.detach().catch(() => {});
+    } catch {}
+
+    // Inject low-CPU CSS
+    page.on("domcontentloaded", () => {
+      page.addStyleTag({ content: ULTRA_LOW_CPU_CSS }).catch(() => {});
+    });
   };
 
   context.on("page", (p) => { void setupPage(p); });
